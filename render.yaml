@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: tpp-trading-server
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: DISCORD_CHANNEL_WATCHLIST
+        sync: false
+      - key: DISCORD_CHANNEL_DAY_SIGNALS
+        sync: false
+      - key: DISCORD_CHANNEL_SWING_SIGNALS
+        sync: false
+      - key: DISCORD_CHANNEL_RECAPS
+        sync: false
+      - key: DISCORD_CHANNEL_LONGTERM
+        sync: false
+    healthCheckPath: /health
