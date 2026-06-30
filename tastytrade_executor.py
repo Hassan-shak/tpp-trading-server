@@ -1,6 +1,7 @@
 """
 The Portfolio Plug — Tastytrade Execution Layer
-Auto-authenticates on startup using username/password session auth.
+Uses OAuth2 refresh-token flow: exchanges refresh token for short-lived access
+tokens automatically. Refresh tokens never expire — set up once, works forever.
 Paper trading mode by default — set TASTYTRADE_PAPER_TRADING=false to go live.
 """
 
@@ -9,7 +10,6 @@ import logging
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from decimal import Decimal
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -17,92 +17,92 @@ ET = ZoneInfo("America/New_York")
 # ── Config ────────────────────────────────────────────────────────────────────
 PAPER_TRADING     = os.environ.get("TASTYTRADE_PAPER_TRADING", "true").lower() == "true"
 ACCOUNT_NUMBER    = os.environ.get("TASTYTRADE_ACCOUNT_NUMBER", "")
-TT_USERNAME       = os.environ.get("TASTYTRADE_USERNAME", "")
-TT_PASSWORD       = os.environ.get("TASTYTRADE_PASSWORD", "")
+CLIENT_ID         = os.environ.get("TASTYTRADE_CLIENT_ID", "")
+CLIENT_SECRET     = os.environ.get("TASTYTRADE_CLIENT_SECRET", "")
+REFRESH_TOKEN     = os.environ.get("TASTYTRADE_REFRESH_TOKEN", "")
 
-# Tastytrade uses same base URL for both paper and live — paper is account-level
 BASE_URL = "https://api.tastytrade.com"
 
-# Token storage
+# Token storage — access tokens last 15 min, refreshed automatically
 _token_store = {
-    "session_token": None,
+    "access_token": None,
     "expires_at": None,
 }
 
 # ── Authentication ─────────────────────────────────────────────────────────────
 
-def authenticate() -> bool:
-    """Login with username/password and get a session token."""
-    if not TT_USERNAME or not TT_PASSWORD:
-        log.warning("Tastytrade credentials not set — set TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD")
+def refresh_access_token() -> bool:
+    """Exchange the refresh token for a new short-lived access token."""
+    if not REFRESH_TOKEN or not CLIENT_ID or not CLIENT_SECRET:
+        log.warning("Tastytrade OAuth credentials not fully set (CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN)")
         return False
 
     try:
         resp = requests.post(
-            f"{BASE_URL}/sessions",
-            json={
-                "login": TT_USERNAME,
-                "password": TT_PASSWORD,
-                "remember-me": True,
+            f"{BASE_URL}/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": REFRESH_TOKEN,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
             },
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
 
-        if resp.status_code == 201:
-            data = resp.json().get("data", {})
-            token = data.get("session-token")
-            if token:
-                _token_store["session_token"] = token
-                # Sessions last 24 hours — refresh after 23
-                _token_store["expires_at"] = datetime.now(ET).timestamp() + (23 * 3600)
+        if resp.status_code == 200:
+            data = resp.json()
+            access_token = data.get("access_token")
+            expires_in = data.get("expires_in", 900)  # default 15 min
+
+            if access_token:
+                _token_store["access_token"] = access_token
+                # Refresh 1 minute before actual expiry for safety margin
+                _token_store["expires_at"] = datetime.now(ET).timestamp() + expires_in - 60
                 mode = "PAPER" if PAPER_TRADING else "LIVE"
-                log.info(f"✅ Tastytrade authenticated — {mode} mode | Account: {ACCOUNT_NUMBER}")
+                log.info(f"✅ Tastytrade access token refreshed — {mode} mode | Account: {ACCOUNT_NUMBER}")
                 return True
             else:
-                log.error("No session token in response")
+                log.error(f"No access_token in refresh response: {resp.text[:200]}")
                 return False
         else:
-            log.error(f"Tastytrade auth failed: {resp.status_code} — {resp.text[:200]}")
+            log.error(f"Token refresh failed: {resp.status_code} — {resp.text[:300]}")
             return False
 
     except Exception as e:
-        log.error(f"Tastytrade auth error: {e}")
+        log.error(f"Token refresh error: {e}")
         return False
 
 def get_headers() -> dict:
-    """Get auth headers, re-authenticating if token expired."""
-    # Check if token needs refresh
+    """Get auth headers, refreshing access token if needed."""
     expires_at = _token_store.get("expires_at", 0)
-    if not _token_store.get("session_token") or datetime.now(ET).timestamp() > expires_at:
-        log.info("Session token expired or missing — re-authenticating...")
-        authenticate()
+    if not _token_store.get("access_token") or datetime.now(ET).timestamp() > expires_at:
+        log.info("Access token expired or missing — refreshing...")
+        refresh_access_token()
 
-    token = _token_store.get("session_token")
+    token = _token_store.get("access_token")
     if not token:
         raise RuntimeError("Tastytrade not authenticated")
 
     return {
-        "Authorization": token,
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
 def is_authenticated() -> bool:
-    """Check if we have a valid session."""
-    if not _token_store.get("session_token"):
-        return False
+    """Check if we have a valid access token, refreshing if needed."""
     expires_at = _token_store.get("expires_at", 0)
-    if datetime.now(ET).timestamp() > expires_at:
-        return authenticate()
+    if not _token_store.get("access_token") or datetime.now(ET).timestamp() > expires_at:
+        return refresh_access_token()
     return True
 
 def save_tokens(access_token, refresh_token, expires_in):
-    """Stub for OAuth compatibility — not used in session auth."""
+    """Stub for compatibility — not used in refresh-token flow."""
     pass
 
-# ── Auto-authenticate on import ───────────────────────────────────────────────
-if TT_USERNAME and TT_PASSWORD:
-    authenticate()
+# ── Get initial access token on import ────────────────────────────────────────
+if REFRESH_TOKEN and CLIENT_ID and CLIENT_SECRET:
+    refresh_access_token()
 
 # ── Option Chain & Contract Lookup ────────────────────────────────────────────
 
@@ -154,7 +154,6 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
     option_type = "call" if direction == "CALL" else "put"
 
     try:
-        # Get option chain
         resp = requests.get(
             f"{BASE_URL}/option-chains/{ticker}/nested",
             headers=get_headers()
@@ -169,7 +168,6 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
             log.warning(f"Empty option chain for {ticker}")
             return None
 
-        # Find the target expiration
         target_expiry = None
         for item in chain_items:
             for exp in item.get("expirations", []):
@@ -180,7 +178,6 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
                 break
 
         if not target_expiry:
-            # Try nearest available expiry
             all_expiries = []
             for item in chain_items:
                 for exp in item.get("expirations", []):
@@ -194,7 +191,6 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
                 log.warning(f"No expirations found for {ticker}")
                 return None
 
-        # Get current price
         current_price = get_current_price(ticker)
         if not current_price:
             log.error(f"Cannot get price for {ticker}")
@@ -202,13 +198,11 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
 
         log.info(f"Searching {ticker} {direction} contracts — current price: ${current_price:.2f}, expiry: {expiry}")
 
-        # Find best contract in premium range
         best_contract = None
         min_premium = 0.75 if trade_type == "DAY" else 1.00
         max_premium = 1.50 if trade_type == "DAY" else 3.50
 
         strikes = target_expiry.get("strikes", [])
-        # Sort strikes for directional scanning
         if direction == "CALL":
             strikes = sorted(strikes, key=lambda x: float(x.get("strike-price", 0)))
         else:
@@ -221,13 +215,11 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
             if not contract_symbol:
                 continue
 
-            # Filter for OTM only
             if direction == "CALL" and strike_price <= current_price:
                 continue
             if direction == "PUT" and strike_price >= current_price:
                 continue
 
-            # Get quote for this contract
             try:
                 quote_resp = requests.get(
                     f"{BASE_URL}/market-data/quotes",
@@ -251,7 +243,6 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
                 mid = (bid + ask) / 2
                 spread_pct = (ask - bid) / ask * 100
 
-                # Check spread and premium
                 if spread_pct > 5:
                     continue
 
@@ -313,7 +304,6 @@ def place_order(contract: dict, quantity: int = 1) -> dict | None:
 
         url = f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/orders"
 
-        # Always do a dry run first
         dry_resp = requests.post(
             f"{url}/dry-run",
             headers=get_headers(),
@@ -326,7 +316,6 @@ def place_order(contract: dict, quantity: int = 1) -> dict | None:
 
         log.info(f"Dry run passed for {contract['symbol']}")
 
-        # Place the actual order
         resp = requests.post(url, headers=get_headers(), json=order_payload)
 
         if resp.status_code in (200, 201):
