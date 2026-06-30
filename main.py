@@ -31,6 +31,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+log.info(f"📦 Module main.py imported — process PID {os.getpid()}")
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -419,6 +420,8 @@ def zones():
     return jsonify({
         "zones": volume_profile.get_all_zones(),
         "tickers_tracked": list(SWING_TICKERS),
+        "worker_pid": os.getpid(),
+        "scheduler_started": _scheduler_started,
     }), 200
 
 @app.route("/zones/refresh", methods=["POST"])
@@ -431,6 +434,9 @@ def refresh_zones():
     return jsonify({"status": "refreshed", "results": results}), 200
 
 # ── DAILY ZONE SCHEDULER (runs automatically, no manual input required) ───────
+_scheduler_started = False
+_scheduler_lock = threading.Lock()
+
 def zone_scheduler_loop():
     """
     Background thread that recalculates Volume Profile zones once per day,
@@ -441,10 +447,12 @@ def zone_scheduler_loop():
     # Run once immediately on startup so zones are available right away
     try:
         log.info("🔄 Running initial Volume Profile zone calculation on startup...")
-        volume_profile.update_all_zones(list(SWING_TICKERS))
+        results = volume_profile.update_all_zones(list(SWING_TICKERS))
+        log.info(f"🔄 Initial zone calculation results: {results}")
+        log.info(f"🔄 Zone store now contains: {list(volume_profile.get_all_zones().keys())}")
         last_run_date = datetime.now(ET).date()
     except Exception as e:
-        log.error(f"Initial zone calculation failed: {e}")
+        log.error(f"Initial zone calculation failed: {e}", exc_info=True)
 
     while True:
         try:
@@ -456,13 +464,33 @@ def zone_scheduler_loop():
                 last_run_date = now_et.date()
                 log.info("✅ Daily Volume Profile zones updated automatically.")
         except Exception as e:
-            log.error(f"Zone scheduler error: {e}")
+            log.error(f"Zone scheduler error: {e}", exc_info=True)
 
         time_module.sleep(300)  # check every 5 minutes
 
-# Start the background scheduler thread when the server boots
-zone_thread = threading.Thread(target=zone_scheduler_loop, daemon=True)
-zone_thread.start()
+def ensure_scheduler_started():
+    """
+    Idempotent scheduler starter — guaranteed to run exactly once, inside the
+    actual gunicorn worker process that's serving requests (not at module import
+    time, which can run in a transient pre-fork process gunicorn discards).
+    """
+    global _scheduler_started
+    with _scheduler_lock:
+        if not _scheduler_started:
+            _scheduler_started = True
+            log.info(f"🚀 Starting zone scheduler in worker PID {os.getpid()}")
+            thread = threading.Thread(target=zone_scheduler_loop, daemon=True)
+            thread.start()
+
+@app.before_request
+def _start_scheduler_on_first_request():
+    """Guarantees the scheduler thread is running in the actual serving process."""
+    if not _scheduler_started:
+        ensure_scheduler_started()
+
+# Also attempt immediate start for cases where gunicorn doesn't go through before_request
+# (e.g. direct `python main.py` runs) — ensure_scheduler_started() is idempotent and safe to call twice
+ensure_scheduler_started()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
