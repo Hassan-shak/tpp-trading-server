@@ -12,12 +12,12 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 from anthropic import Anthropic
 from tastytrade_executor import (
-    save_tokens, is_authenticated, find_option_contract,
+    is_authenticated, find_option_contract,
     place_order, close_position, get_positions, get_account_balance,
-    CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, BASE_URL, PAPER_TRADING
+    BASE_URL, PAPER_TRADING
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -250,67 +250,7 @@ def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict 
 
     return order
 
-# ── OAUTH ENDPOINTS ───────────────────────────────────────────────────────────
 
-@app.route("/oauth/start")
-def oauth_start():
-    """Redirect to Tastytrade OAuth login page."""
-    auth_url = (
-        f"{BASE_URL}/oauth2/authorize"
-        f"?client_id={CLIENT_ID}"
-        f"&redirect_uri={REDIRECT_URI}"
-        f"&response_type=code"
-        f"&scope=read+trade+openid"
-    )
-    return redirect(auth_url)
-
-@app.route("/oauth/callback")
-def oauth_callback():
-    """Handle OAuth callback and exchange code for tokens."""
-    code = request.args.get("code")
-    error = request.args.get("error")
-
-    if error:
-        log.error(f"OAuth error: {error}")
-        return jsonify({"error": error}), 400
-
-    if not code:
-        return jsonify({"error": "No authorization code received"}), 400
-
-    # Exchange code for tokens
-    try:
-        resp = requests.post(
-            f"{BASE_URL}/oauth2/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "redirect_uri": REDIRECT_URI,
-            }
-        )
-
-        if resp.status_code == 200:
-            data = resp.json()
-            save_tokens(
-                data["access_token"],
-                data.get("refresh_token", ""),
-                data.get("expires_in", 3600)
-            )
-            mode = "PAPER TRADING" if PAPER_TRADING else "LIVE TRADING"
-            log.info(f"Tastytrade authenticated successfully — {mode}")
-            return jsonify({
-                "status": "authenticated",
-                "mode": mode,
-                "message": f"Tastytrade connected in {mode} mode. The system is now fully live."
-            }), 200
-        else:
-            log.error(f"Token exchange failed: {resp.text}")
-            return jsonify({"error": "Token exchange failed", "details": resp.text}), 400
-
-    except Exception as e:
-        log.error(f"OAuth callback error: {e}")
-        return jsonify({"error": str(e)}), 500
 
 # ── MAIN WEBHOOK ENDPOINT ─────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
