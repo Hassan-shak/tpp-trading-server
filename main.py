@@ -8,6 +8,8 @@ import os
 import json
 import hmac
 import logging
+import threading
+import time as time_module
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -19,6 +21,7 @@ from tastytrade_executor import (
     place_order, close_position, get_positions, get_account_balance,
     BASE_URL, PAPER_TRADING
 )
+import volume_profile
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -119,6 +122,17 @@ def analyze_with_claude(alert_data: dict, analysis_type: str) -> str:
                 "CONNECTED (LIVE)" if (is_authenticated() and not PAPER_TRADING) else \
                 "NOT CONNECTED"
 
+    ticker = alert_data.get("ticker", "").upper()
+    zones = volume_profile.get_zones(ticker)
+    if zones:
+        zone_text = f"""
+VOLUME PROFILE ZONES FOR {ticker} (auto-calculated, last updated {zones.get('updated_at', 'unknown')}):
+1H — Point of Control: {zones.get('1H', {}).get('poc', 'N/A')} | Demand Zone: {zones.get('1H', {}).get('demand', 'N/A')} | Supply Zone: {zones.get('1H', {}).get('supply', 'N/A')}
+4H — Point of Control: {zones.get('4H', {}).get('poc', 'N/A')} | Demand Zone: {zones.get('4H', {}).get('demand', 'N/A')} | Supply Zone: {zones.get('4H', {}).get('supply', 'N/A')}
+"""
+    else:
+        zone_text = f"\nVOLUME PROFILE ZONES FOR {ticker}: NOT AVAILABLE this session — treat any zone-dependent confirmation (Rules 1, 2, 5, 6) as UNCONFIRMED.\n"
+
     context = f"""
 CURRENT TIME (ET): {now_et.strftime('%A, %B %d, %Y %I:%M %p ET')}
 DAY OF WEEK: {now_et.strftime('%A')}
@@ -126,7 +140,7 @@ SESSION TRADE COUNT TODAY: {session['trade_count']}
 CONSECUTIVE LOSSES TODAY: {session['consecutive_losses']}
 CIRCUIT BREAKER ACTIVE: {session['circuit_breaker']}
 TASTYTRADE STATUS: {tt_status}
-
+{zone_text}
 INCOMING ALERT DATA:
 {json.dumps(alert_data, indent=2)}
 
@@ -134,9 +148,10 @@ ANALYSIS TYPE REQUESTED: {analysis_type}
 
 Based on my complete trading playbook and all rules in your system prompt:
 1. Run the full 5-category pre-flight checklist against this alert
-2. Determine if this is a valid trade signal, watchlist note, or no-trade
-3. If valid: format the exact Discord message in Junior's voice
-4. If not valid: explain briefly why
+2. Check the alert against the 3-Screen Confluence System (Rules 1-6) — use the Volume Profile zone data above for any rule requiring zone alignment
+3. Determine if this is a valid trade signal, watchlist note, or no-trade
+4. If valid: format the exact Discord message in Junior's voice
+5. If not valid: explain briefly why
 
 IMPORTANT: Start your response with exactly one of these tags on the first line:
 - TRADE_VALID: (if this should be executed)
@@ -396,6 +411,58 @@ def health():
 @app.route("/status", methods=["GET"])
 def status():
     return health()
+
+# ── VOLUME PROFILE ZONES ───────────────────────────────────────────────────────
+@app.route("/zones", methods=["GET"])
+def zones():
+    """Debug endpoint — view current auto-calculated Volume Profile zones for all tickers."""
+    return jsonify({
+        "zones": volume_profile.get_all_zones(),
+        "tickers_tracked": list(SWING_TICKERS),
+    }), 200
+
+@app.route("/zones/refresh", methods=["POST"])
+def refresh_zones():
+    """Manually trigger an immediate zone recalculation (also runs automatically every morning)."""
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    results = volume_profile.update_all_zones(list(SWING_TICKERS))
+    return jsonify({"status": "refreshed", "results": results}), 200
+
+# ── DAILY ZONE SCHEDULER (runs automatically, no manual input required) ───────
+def zone_scheduler_loop():
+    """
+    Background thread that recalculates Volume Profile zones once per day,
+    every morning before market open. Runs forever as long as the server is up.
+    No human interaction needed — this is what makes Rules 1, 2, 5, 6 fully autonomous.
+    """
+    last_run_date = None
+    # Run once immediately on startup so zones are available right away
+    try:
+        log.info("🔄 Running initial Volume Profile zone calculation on startup...")
+        volume_profile.update_all_zones(list(SWING_TICKERS))
+        last_run_date = datetime.now(ET).date()
+    except Exception as e:
+        log.error(f"Initial zone calculation failed: {e}")
+
+    while True:
+        try:
+            now_et = datetime.now(ET)
+            # Refresh once per day at/after 8:00 AM ET, before pre-market prep completes at 9:15
+            if now_et.time() >= dtime(8, 0) and now_et.date() != last_run_date:
+                log.info("🔄 Running daily Volume Profile zone calculation...")
+                volume_profile.update_all_zones(list(SWING_TICKERS))
+                last_run_date = now_et.date()
+                log.info("✅ Daily Volume Profile zones updated automatically.")
+        except Exception as e:
+            log.error(f"Zone scheduler error: {e}")
+
+        time_module.sleep(300)  # check every 5 minutes
+
+# Start the background scheduler thread when the server boots
+zone_thread = threading.Thread(target=zone_scheduler_loop, daemon=True)
+zone_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
