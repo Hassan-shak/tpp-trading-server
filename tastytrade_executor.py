@@ -1,268 +1,299 @@
 """
 The Portfolio Plug — Tastytrade Execution Layer
-Handles authentication, option chain lookup, order placement, and position monitoring.
+Auto-authenticates on startup using username/password session auth.
 Paper trading mode by default — set TASTYTRADE_PAPER_TRADING=false to go live.
 """
 
 import os
 import logging
 import requests
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 log = logging.getLogger(__name__)
-
 ET = ZoneInfo("America/New_York")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PAPER_TRADING     = os.environ.get("TASTYTRADE_PAPER_TRADING", "true").lower() == "true"
-CLIENT_ID         = os.environ.get("TASTYTRADE_CLIENT_ID", "")
-CLIENT_SECRET     = os.environ.get("TASTYTRADE_CLIENT_SECRET", "")
 ACCOUNT_NUMBER    = os.environ.get("TASTYTRADE_ACCOUNT_NUMBER", "")
-REDIRECT_URI      = os.environ.get("TASTYTRADE_REDIRECT_URI", "https://tpp-trading-server.onrender.com/oauth/callback")
+TT_USERNAME       = os.environ.get("TASTYTRADE_USERNAME", "")
+TT_PASSWORD       = os.environ.get("TASTYTRADE_PASSWORD", "")
 
-# API base URLs
-PAPER_BASE  = "https://api.cert.tastyworks.com"   # sandbox/paper trading
-LIVE_BASE   = "https://api.tastytrade.com"          # live trading
-BASE_URL    = PAPER_BASE if PAPER_TRADING else LIVE_BASE
+# Tastytrade uses same base URL for both paper and live — paper is account-level
+BASE_URL = "https://api.tastytrade.com"
 
-# Token storage (in-memory — resets on server restart)
+# Token storage
 _token_store = {
-    "access_token": None,
-    "refresh_token": None,
+    "session_token": None,
     "expires_at": None,
 }
 
 # ── Authentication ─────────────────────────────────────────────────────────────
 
+def authenticate() -> bool:
+    """Login with username/password and get a session token."""
+    if not TT_USERNAME or not TT_PASSWORD:
+        log.warning("Tastytrade credentials not set — set TASTYTRADE_USERNAME and TASTYTRADE_PASSWORD")
+        return False
+
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/sessions",
+            json={
+                "login": TT_USERNAME,
+                "password": TT_PASSWORD,
+                "remember-me": True,
+            },
+            headers={"Content-Type": "application/json"}
+        )
+
+        if resp.status_code == 201:
+            data = resp.json().get("data", {})
+            token = data.get("session-token")
+            if token:
+                _token_store["session_token"] = token
+                # Sessions last 24 hours — refresh after 23
+                _token_store["expires_at"] = datetime.now(ET).timestamp() + (23 * 3600)
+                mode = "PAPER" if PAPER_TRADING else "LIVE"
+                log.info(f"✅ Tastytrade authenticated — {mode} mode | Account: {ACCOUNT_NUMBER}")
+                return True
+            else:
+                log.error("No session token in response")
+                return False
+        else:
+            log.error(f"Tastytrade auth failed: {resp.status_code} — {resp.text[:200]}")
+            return False
+
+    except Exception as e:
+        log.error(f"Tastytrade auth error: {e}")
+        return False
+
 def get_headers() -> dict:
-    """Get auth headers, refreshing token if needed."""
-    token = _token_store.get("access_token")
+    """Get auth headers, re-authenticating if token expired."""
+    # Check if token needs refresh
+    expires_at = _token_store.get("expires_at", 0)
+    if not _token_store.get("session_token") or datetime.now(ET).timestamp() > expires_at:
+        log.info("Session token expired or missing — re-authenticating...")
+        authenticate()
+
+    token = _token_store.get("session_token")
     if not token:
-        raise RuntimeError("Tastytrade not authenticated. Visit /oauth/start to authenticate.")
+        raise RuntimeError("Tastytrade not authenticated")
+
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": token,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
-def save_tokens(access_token: str, refresh_token: str, expires_in: int):
-    """Store tokens in memory."""
-    _token_store["access_token"] = access_token
-    _token_store["refresh_token"] = refresh_token
-    _token_store["expires_at"] = datetime.now(ET).timestamp() + expires_in
-    log.info(f"Tastytrade tokens saved. Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}")
-
-def refresh_access_token() -> bool:
-    """Refresh the access token using the refresh token."""
-    refresh_token = _token_store.get("refresh_token")
-    if not refresh_token:
-        return False
-    try:
-        resp = requests.post(
-            f"{BASE_URL}/oauth2/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-            }
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            save_tokens(data["access_token"], data.get("refresh_token", refresh_token), data.get("expires_in", 3600))
-            return True
-    except Exception as e:
-        log.error(f"Token refresh failed: {e}")
-    return False
-
 def is_authenticated() -> bool:
-    """Check if we have a valid token."""
-    if not _token_store.get("access_token"):
+    """Check if we have a valid session."""
+    if not _token_store.get("session_token"):
         return False
     expires_at = _token_store.get("expires_at", 0)
-    # Refresh if expiring in next 5 minutes
-    if datetime.now(ET).timestamp() > expires_at - 300:
-        return refresh_access_token()
+    if datetime.now(ET).timestamp() > expires_at:
+        return authenticate()
     return True
 
-# ── Option Chain Lookup ────────────────────────────────────────────────────────
+def save_tokens(access_token, refresh_token, expires_in):
+    """Stub for OAuth compatibility — not used in session auth."""
+    pass
+
+# ── Auto-authenticate on import ───────────────────────────────────────────────
+if TT_USERNAME and TT_PASSWORD:
+    authenticate()
+
+# ── Option Chain & Contract Lookup ────────────────────────────────────────────
 
 def get_expiry_date(trade_type: str = "DAY") -> str:
-    """
-    Calculate the correct expiry date based on Junior's playbook rules.
-    DAY trades: current week Friday (or next week on Fri/Thu-after-11)
-    SWING trades: ~30-90 days out
-    """
+    """Calculate correct expiry based on Junior's playbook rules."""
     now = datetime.now(ET)
     weekday = now.weekday()  # 0=Mon, 4=Fri
 
     if trade_type == "DAY":
-        # Find this week's Friday
         days_to_friday = (4 - weekday) % 7
         if days_to_friday == 0:
-            # Today is Friday — use next week's Friday (no 0DTE)
-            days_to_friday = 7
-        elif weekday == 3:
-            # Thursday — use next week if after 11 AM
-            if now.hour >= 11:
-                days_to_friday += 7
+            days_to_friday = 7  # Never 0DTE on Fridays
+        elif weekday == 3 and now.hour >= 11:
+            days_to_friday += 7  # Thursday after 11 AM — use next week
         target = now + timedelta(days=days_to_friday)
     else:
-        # Swing: ~45 days out
         target = now + timedelta(days=45)
 
     return target.strftime("%Y-%m-%d")
 
+def get_current_price(ticker: str) -> float | None:
+    """Get current market price for a ticker."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/market-data/quotes",
+            headers=get_headers(),
+            params={"symbols[]": ticker}
+        )
+        if resp.status_code == 200:
+            items = resp.json().get("data", {}).get("items", [])
+            if items:
+                last = items[0].get("last") or items[0].get("mark")
+                return float(last) if last else None
+    except Exception as e:
+        log.error(f"Price fetch error for {ticker}: {e}")
+    return None
+
 def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -> dict | None:
     """
     Find the best option contract matching Junior's playbook rules:
-    - Day trades: $0.75-$1.50 premium, slightly OTM, tight spread
-    - Returns contract details or None if no suitable contract found
+    - Day trades: $0.75-$1.50 premium, slightly OTM, spread < 5%
+    - Swing trades: $1.00-$3.50 premium, ~45 DTE
     """
     if not is_authenticated():
         log.error("Cannot find contract — not authenticated")
         return None
 
     expiry = get_expiry_date(trade_type)
-    option_type = "C" if direction == "CALL" else "P"
+    option_type = "call" if direction == "CALL" else "put"
 
     try:
         # Get option chain
-        url = f"{BASE_URL}/option-chains/{ticker}/nested"
-        resp = requests.get(url, headers=get_headers())
+        resp = requests.get(
+            f"{BASE_URL}/option-chains/{ticker}/nested",
+            headers=get_headers()
+        )
 
         if resp.status_code != 200:
-            log.error(f"Option chain fetch failed: {resp.status_code}")
+            log.error(f"Option chain fetch failed for {ticker}: {resp.status_code}")
             return None
 
-        chain_data = resp.json().get("data", {}).get("items", [])
-        if not chain_data:
+        chain_items = resp.json().get("data", {}).get("items", [])
+        if not chain_items:
+            log.warning(f"Empty option chain for {ticker}")
             return None
 
-        # Find the correct expiration
+        # Find the target expiration
         target_expiry = None
-        for item in chain_data:
+        for item in chain_items:
             for exp in item.get("expirations", []):
                 if exp.get("expiration-date") == expiry:
                     target_expiry = exp
                     break
+            if target_expiry:
+                break
 
         if not target_expiry:
-            log.warning(f"No expiry found for {ticker} on {expiry}")
-            return None
+            # Try nearest available expiry
+            all_expiries = []
+            for item in chain_items:
+                for exp in item.get("expirations", []):
+                    all_expiries.append(exp)
+            if all_expiries:
+                all_expiries.sort(key=lambda x: x.get("expiration-date", ""))
+                target_expiry = all_expiries[0]
+                expiry = target_expiry.get("expiration-date")
+                log.info(f"Using nearest expiry for {ticker}: {expiry}")
+            else:
+                log.warning(f"No expirations found for {ticker}")
+                return None
 
-        # Get current price to find OTM strikes
-        price_url = f"{BASE_URL}/market-data/quotes"
-        price_resp = requests.get(price_url, headers=get_headers(), params={"symbols[]": ticker})
-        current_price = None
-        if price_resp.status_code == 200:
-            quotes = price_resp.json().get("data", {}).get("items", [])
-            if quotes:
-                current_price = float(quotes[0].get("last", 0))
-
+        # Get current price
+        current_price = get_current_price(ticker)
         if not current_price:
-            log.error(f"Could not get current price for {ticker}")
+            log.error(f"Cannot get price for {ticker}")
             return None
 
-        # Find best contract in $0.75-$1.50 range
+        log.info(f"Searching {ticker} {direction} contracts — current price: ${current_price:.2f}, expiry: {expiry}")
+
+        # Find best contract in premium range
         best_contract = None
-        for strike_data in target_expiry.get("strikes", []):
+        min_premium = 0.75 if trade_type == "DAY" else 1.00
+        max_premium = 1.50 if trade_type == "DAY" else 3.50
+
+        strikes = target_expiry.get("strikes", [])
+        # Sort strikes for directional scanning
+        if direction == "CALL":
+            strikes = sorted(strikes, key=lambda x: float(x.get("strike-price", 0)))
+        else:
+            strikes = sorted(strikes, key=lambda x: float(x.get("strike-price", 0)), reverse=True)
+
+        for strike_data in strikes:
             strike_price = float(strike_data.get("strike-price", 0))
-            contract_symbol = strike_data.get("call" if option_type == "C" else "put", "")
+            contract_symbol = strike_data.get(option_type, "")
 
             if not contract_symbol:
                 continue
 
-            # For calls: want strike slightly above current price (OTM)
-            # For puts: want strike slightly below current price (OTM)
-            if option_type == "C" and strike_price <= current_price:
+            # Filter for OTM only
+            if direction == "CALL" and strike_price <= current_price:
                 continue
-            if option_type == "P" and strike_price >= current_price:
+            if direction == "PUT" and strike_price >= current_price:
                 continue
 
             # Get quote for this contract
-            quote_resp = requests.get(
-                f"{BASE_URL}/market-data/quotes",
-                headers=get_headers(),
-                params={"symbols[]": contract_symbol}
-            )
+            try:
+                quote_resp = requests.get(
+                    f"{BASE_URL}/market-data/quotes",
+                    headers=get_headers(),
+                    params={"symbols[]": contract_symbol}
+                )
 
-            if quote_resp.status_code != 200:
-                continue
+                if quote_resp.status_code != 200:
+                    continue
 
-            quotes = quote_resp.json().get("data", {}).get("items", [])
-            if not quotes:
-                continue
+                quotes = quote_resp.json().get("data", {}).get("items", [])
+                if not quotes:
+                    continue
 
-            bid = float(quotes[0].get("bid", 0))
-            ask = float(quotes[0].get("ask", 0))
-            mid = (bid + ask) / 2
+                bid = float(quotes[0].get("bid", 0) or 0)
+                ask = float(quotes[0].get("ask", 0) or 0)
 
-            if bid <= 0 or ask <= 0:
-                continue
+                if bid <= 0 or ask <= 0:
+                    continue
 
-            # Check spread percentage
-            spread_pct = (ask - bid) / ask * 100 if ask > 0 else 100
-            if spread_pct > 5:
-                continue  # Spread too wide
+                mid = (bid + ask) / 2
+                spread_pct = (ask - bid) / ask * 100
 
-            # Check premium in range $0.75-$1.50 (day trade)
-            if trade_type == "DAY":
-                if 0.75 <= mid <= 1.50:
+                # Check spread and premium
+                if spread_pct > 5:
+                    continue
+
+                if min_premium <= mid <= max_premium:
                     best_contract = {
                         "symbol": contract_symbol,
                         "strike": strike_price,
                         "expiry": expiry,
                         "direction": direction,
-                        "bid": bid,
-                        "ask": ask,
-                        "mid": mid,
+                        "bid": round(bid, 2),
+                        "ask": round(ask, 2),
+                        "mid": round(mid, 2),
                         "spread_pct": round(spread_pct, 2),
                         "ticker": ticker,
+                        "current_price": current_price,
                     }
-                    break  # First valid OTM contract in range
-            else:
-                # Swing: $1.00-$3.50
-                if 1.00 <= mid <= 3.50:
-                    best_contract = {
-                        "symbol": contract_symbol,
-                        "strike": strike_price,
-                        "expiry": expiry,
-                        "direction": direction,
-                        "bid": bid,
-                        "ask": ask,
-                        "mid": mid,
-                        "spread_pct": round(spread_pct, 2),
-                        "ticker": ticker,
-                    }
+                    log.info(f"Found contract: {contract_symbol} strike=${strike_price} mid=${mid:.2f} spread={spread_pct:.1f}%")
                     break
 
-        if best_contract:
-            log.info(f"Found contract: {best_contract['symbol']} @ ${best_contract['mid']:.2f}")
-        else:
-            log.warning(f"No suitable contract found for {ticker} {direction} on {expiry}")
+            except Exception as e:
+                log.error(f"Quote fetch error for {contract_symbol}: {e}")
+                continue
+
+        if not best_contract:
+            log.warning(f"No contract found for {ticker} {direction} in ${min_premium}-${max_premium} range on {expiry}")
 
         return best_contract
 
     except Exception as e:
-        log.error(f"Error finding contract: {e}")
+        log.error(f"Contract search error: {e}")
         return None
 
 # ── Order Placement ────────────────────────────────────────────────────────────
 
 def place_order(contract: dict, quantity: int = 1) -> dict | None:
-    """
-    Place a market order for the specified contract.
-    Uses limit order at ask price to ensure fill.
-    """
+    """Place a limit buy order at the ask price."""
     if not is_authenticated():
         log.error("Cannot place order — not authenticated")
         return None
 
-    if PAPER_TRADING:
-        log.info(f"PAPER TRADE: Would buy {quantity}x {contract['symbol']} @ ${contract['ask']:.2f}")
+    mode = "PAPER" if PAPER_TRADING else "LIVE"
+    log.info(f"[{mode}] Placing order: {quantity}x {contract['symbol']} @ ${contract['ask']:.2f}")
 
     try:
         order_payload = {
@@ -281,29 +312,27 @@ def place_order(contract: dict, quantity: int = 1) -> dict | None:
         }
 
         url = f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/orders"
-        if PAPER_TRADING:
-            # Dry run first
-            dry_resp = requests.post(
-                f"{url}/dry-run",
-                headers=get_headers(),
-                json=order_payload
-            )
-            log.info(f"Dry run response: {dry_resp.status_code} — {dry_resp.text[:200]}")
 
-            if dry_resp.status_code not in (200, 201):
-                log.error(f"Dry run failed: {dry_resp.text}")
-                return None
+        # Always do a dry run first
+        dry_resp = requests.post(
+            f"{url}/dry-run",
+            headers=get_headers(),
+            json=order_payload
+        )
 
-            # In paper trading mode — place the actual paper order
-            resp = requests.post(url, headers=get_headers(), json=order_payload)
-        else:
-            # Live trading
-            resp = requests.post(url, headers=get_headers(), json=order_payload)
+        if dry_resp.status_code not in (200, 201):
+            log.error(f"Dry run failed: {dry_resp.status_code} — {dry_resp.text[:300]}")
+            return None
+
+        log.info(f"Dry run passed for {contract['symbol']}")
+
+        # Place the actual order
+        resp = requests.post(url, headers=get_headers(), json=order_payload)
 
         if resp.status_code in (200, 201):
             order_data = resp.json().get("data", {}).get("order", {})
             order_id = order_data.get("id", "unknown")
-            log.info(f"Order placed: {order_id} — {contract['symbol']} x{quantity}")
+            log.info(f"Order placed successfully: ID={order_id}")
             return {
                 "order_id": order_id,
                 "symbol": contract["symbol"],
@@ -313,7 +342,7 @@ def place_order(contract: dict, quantity: int = 1) -> dict | None:
                 "paper": PAPER_TRADING,
             }
         else:
-            log.error(f"Order failed: {resp.status_code} — {resp.text}")
+            log.error(f"Order failed: {resp.status_code} — {resp.text[:300]}")
             return None
 
     except Exception as e:
@@ -321,29 +350,26 @@ def place_order(contract: dict, quantity: int = 1) -> dict | None:
         return None
 
 def close_position(symbol: str, quantity: int) -> dict | None:
-    """
-    Close an open position with a market sell.
-    """
+    """Close an open position."""
     if not is_authenticated():
         return None
 
     try:
-        # Get current bid to sell at market
         quote_resp = requests.get(
             f"{BASE_URL}/market-data/quotes",
             headers=get_headers(),
             params={"symbols[]": symbol}
         )
-        bid = 0
+        bid = 0.01
         if quote_resp.status_code == 200:
-            quotes = quote_resp.json().get("data", {}).get("items", [])
-            if quotes:
-                bid = float(quotes[0].get("bid", 0))
+            items = quote_resp.json().get("data", {}).get("items", [])
+            if items:
+                bid = float(items[0].get("bid", 0.01) or 0.01)
 
         order_payload = {
             "time-in-force": "Day",
             "order-type": "Limit",
-            "price": str(round(bid, 2)) if bid > 0 else "0.01",
+            "price": str(round(bid, 2)),
             "price-effect": "Credit",
             "legs": [
                 {
@@ -355,15 +381,18 @@ def close_position(symbol: str, quantity: int) -> dict | None:
             ]
         }
 
-        url = f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/orders"
-        resp = requests.post(url, headers=get_headers(), json=order_payload)
+        resp = requests.post(
+            f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/orders",
+            headers=get_headers(),
+            json=order_payload
+        )
 
         if resp.status_code in (200, 201):
             order_data = resp.json().get("data", {}).get("order", {})
             log.info(f"Position closed: {symbol} x{quantity}")
             return {"status": "closed", "symbol": symbol, "order_id": order_data.get("id")}
         else:
-            log.error(f"Close order failed: {resp.status_code} — {resp.text}")
+            log.error(f"Close failed: {resp.status_code} — {resp.text[:200]}")
             return None
 
     except Exception as e:
@@ -375,8 +404,10 @@ def get_positions() -> list:
     if not is_authenticated():
         return []
     try:
-        url = f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/positions"
-        resp = requests.get(url, headers=get_headers())
+        resp = requests.get(
+            f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/positions",
+            headers=get_headers()
+        )
         if resp.status_code == 200:
             return resp.json().get("data", {}).get("items", [])
         return []
@@ -389,8 +420,10 @@ def get_account_balance() -> dict:
     if not is_authenticated():
         return {}
     try:
-        url = f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/balances"
-        resp = requests.get(url, headers=get_headers())
+        resp = requests.get(
+            f"{BASE_URL}/accounts/{ACCOUNT_NUMBER}/balances",
+            headers=get_headers()
+        )
         if resp.status_code == 200:
             return resp.json().get("data", {})
         return {}
