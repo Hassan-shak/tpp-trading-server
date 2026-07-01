@@ -95,7 +95,12 @@ def in_dead_zone() -> bool:
 # ── Discord helper ────────────────────────────────────────────────────────────
 DISCORD_API = "https://discord.com/api/v10"
 
+DISCORD_POSTING_ENABLED = os.environ.get("DISCORD_POSTING_ENABLED", "true").lower() == "true"
+
 def post_discord(channel_id: str, message: str) -> bool:
+    if not DISCORD_POSTING_ENABLED:
+        log.info(f"Discord posting disabled — suppressed message to channel {channel_id}")
+        return False
     url = f"{DISCORD_API}/channels/{channel_id}/messages"
     headers = {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
