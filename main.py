@@ -22,6 +22,7 @@ from tastytrade_executor import (
     BASE_URL, PAPER_TRADING
 )
 import volume_profile
+import alpaca_stream
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -439,41 +440,8 @@ _scheduler_lock = threading.Lock()
 
 # ── AUTOMATED JOB 1: Daily Watchlist ─────────────────────────────────────────
 def fetch_premarket_data(ticker: str) -> dict:
-    """Pull premarket price, gap, and volume data for a ticker."""
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        resp = requests.get(
-            url,
-            params={"range": "2d", "interval": "1m"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10
-        )
-        if resp.status_code != 200:
-            return {}
-        result = resp.json().get("chart", {}).get("result", [None])[0]
-        if not result:
-            return {}
-        quotes = result["indicators"]["quote"][0]
-        closes = [c for c in quotes.get("close", []) if c]
-        volumes = [v for v in quotes.get("volume", []) if v]
-        if len(closes) < 2:
-            return {}
-        prev_close = closes[-2] if len(closes) >= 2 else closes[-1]
-        current   = closes[-1]
-        gap_pct   = round((current - prev_close) / prev_close * 100, 2)
-        avg_vol   = sum(volumes[-20:]) / max(len(volumes[-20:]), 1)
-        cur_vol   = volumes[-1] if volumes else 0
-        vol_ratio = round(cur_vol / avg_vol, 1) if avg_vol else 0
-        return {
-            "ticker": ticker,
-            "price": round(current, 2),
-            "prev_close": round(prev_close, 2),
-            "gap_pct": gap_pct,
-            "volume_ratio": vol_ratio,
-        }
-    except Exception as e:
-        log.error(f"Pre-market data fetch error for {ticker}: {e}")
-        return {}
+    """Pull premarket price, gap, and volume data from Alpaca real-time stream."""
+    return alpaca_stream.get_premarket_data(ticker)
 
 def post_daily_watchlist():
     """Generate and post the morning watchlist to #daily-watchlist."""
@@ -551,33 +519,7 @@ def scan_for_visual_patterns():
             continue
 
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-            resp = requests.get(
-                url,
-                params={"range": "1d", "interval": "1m"},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8
-            )
-            if resp.status_code != 200:
-                continue
-
-            result = resp.json().get("chart", {}).get("result", [None])[0]
-            if not result:
-                continue
-
-            quotes = result["indicators"]["quote"][0]
-            # Get last 30 candles
-            closes  = quotes.get("close", [])[-30:]
-            highs   = quotes.get("high", [])[-30:]
-            lows    = quotes.get("low", [])[-30:]
-            volumes = quotes.get("volume", [])[-30:]
-
-            # Filter None values
-            candles = [
-                {"c": c, "h": h, "l": l, "v": v}
-                for c, h, l, v in zip(closes, highs, lows, volumes)
-                if all(x is not None for x in [c, h, l, v])
-            ]
+            candles = alpaca_stream.get_candles(ticker, limit=30)
             if len(candles) < 10:
                 continue
 
@@ -615,7 +557,6 @@ Be conservative. Only flag genuinely high-probability developing setups, not noi
             log.info(f"Pattern scan {ticker}: {result_text[:80]}")
 
             if result_text.startswith("WATCHLIST:"):
-                # Post as a watchlist alert — not a trade, just a heads-up
                 msg = f"👀 **Pattern Alert** — {result_text.replace('WATCHLIST: ', '')}\n\n_Developing setup — confirm your confirmations before entering. Not a trade signal._"
                 post_discord(CHANNEL_DAY_SIGNALS, msg)
                 _pattern_scan_cooldown[ticker] = now_et
@@ -693,6 +634,15 @@ def zone_scheduler_loop():
     last_zone_date     = None
     last_watchlist_date = None
     last_recap_date     = None
+
+    # Start Alpaca real-time stream first — backfills history then opens WebSocket
+    try:
+        alpaca_stream.start()
+        log.info("✅ Alpaca real-time stream started")
+        # Give it a moment to backfill before calculating zones
+        time_module.sleep(5)
+    except Exception as e:
+        log.error(f"Alpaca stream start failed: {e}", exc_info=True)
 
     # Run zone calculation immediately on startup
     try:
