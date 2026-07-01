@@ -437,34 +437,302 @@ def refresh_zones():
 _scheduler_started = False
 _scheduler_lock = threading.Lock()
 
+# ── AUTOMATED JOB 1: Daily Watchlist ─────────────────────────────────────────
+def fetch_premarket_data(ticker: str) -> dict:
+    """Pull premarket price, gap, and volume data for a ticker."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        resp = requests.get(
+            url,
+            params={"range": "2d", "interval": "1m"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            return {}
+        result = resp.json().get("chart", {}).get("result", [None])[0]
+        if not result:
+            return {}
+        quotes = result["indicators"]["quote"][0]
+        closes = [c for c in quotes.get("close", []) if c]
+        volumes = [v for v in quotes.get("volume", []) if v]
+        if len(closes) < 2:
+            return {}
+        prev_close = closes[-2] if len(closes) >= 2 else closes[-1]
+        current   = closes[-1]
+        gap_pct   = round((current - prev_close) / prev_close * 100, 2)
+        avg_vol   = sum(volumes[-20:]) / max(len(volumes[-20:]), 1)
+        cur_vol   = volumes[-1] if volumes else 0
+        vol_ratio = round(cur_vol / avg_vol, 1) if avg_vol else 0
+        return {
+            "ticker": ticker,
+            "price": round(current, 2),
+            "prev_close": round(prev_close, 2),
+            "gap_pct": gap_pct,
+            "volume_ratio": vol_ratio,
+        }
+    except Exception as e:
+        log.error(f"Pre-market data fetch error for {ticker}: {e}")
+        return {}
+
+def post_daily_watchlist():
+    """Generate and post the morning watchlist to #daily-watchlist."""
+    log.info("📋 Generating daily watchlist...")
+    zones   = volume_profile.get_all_zones()
+    tickers = list(DAY_TRADE_TICKERS)
+
+    # Fetch premarket data for all tickers
+    market_data = []
+    for t in tickers:
+        data = fetch_premarket_data(t)
+        if data:
+            z = zones.get(t, {})
+            data["demand_1h"] = z.get("1H", {}).get("demand")
+            data["supply_1h"] = z.get("1H", {}).get("supply")
+            data["poc_1h"]    = z.get("1H", {}).get("poc")
+            market_data.append(data)
+
+    if not market_data:
+        log.warning("No pre-market data available for watchlist")
+        return
+
+    # Ask Claude to write the watchlist in Junior's voice
+    prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — pre-market. You are Junior from The Portfolio Plug.
+
+Write the daily morning watchlist post for #daily-watchlist on Discord. Use your real voice — direct, confident, educational.
+
+PRE-MARKET DATA:
+{json.dumps(market_data, indent=2)}
+
+VOLUME PROFILE ZONES (1H demand/supply for reference):
+{json.dumps({t: zones.get(t, {}).get("1H") for t in tickers if zones.get(t)}, indent=2)}
+
+Your watchlist post must include:
+1. A short market context read (1-2 sentences on overall tone/direction today)
+2. For each ticker: current price, gap %, what level to watch (demand/supply zone or PMH/PML), and ONE sentence on what you're looking for
+3. Key time to watch: 9:30-10:00 AM window
+4. A closing line reminding members of the rules (1 trade, volume confirmation, no chasing)
+
+Keep it tight — members read this on their phone before market open. No fluff."""
+
+    try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        watchlist_msg = resp.content[0].text
+        post_discord(CHANNEL_WATCHLIST, watchlist_msg)
+        log.info("✅ Daily watchlist posted to Discord")
+    except Exception as e:
+        log.error(f"Watchlist generation error: {e}", exc_info=True)
+
+
+# ── AUTOMATED JOB 2: Pattern Scanner (every 5 min during trade window) ────────
+_pattern_scan_cooldown = {}  # ticker -> last signal time, prevents spam
+
+def scan_for_visual_patterns():
+    """
+    Fetches recent candle data for all tickers and asks Claude to identify
+    confluence setups forming — EMA approaches, pivot proximity, flag patterns,
+    divergence conditions. Posts valid setups to day-trade-signals as WATCHLIST alerts.
+    """
+    now_et = datetime.now(ET)
+    if not (dtime(9, 25) <= now_et.time() <= dtime(10, 30)):
+        return  # Only scan during the trade window
+
+    log.info("🔍 Running pattern scan...")
+    zones = volume_profile.get_all_zones()
+
+    for ticker in DAY_TRADE_TICKERS:
+        # Cooldown: don't re-scan same ticker within 10 minutes
+        last = _pattern_scan_cooldown.get(ticker)
+        if last and (now_et - last).total_seconds() < 600:
+            continue
+
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+            resp = requests.get(
+                url,
+                params={"range": "1d", "interval": "1m"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8
+            )
+            if resp.status_code != 200:
+                continue
+
+            result = resp.json().get("chart", {}).get("result", [None])[0]
+            if not result:
+                continue
+
+            quotes = result["indicators"]["quote"][0]
+            # Get last 30 candles
+            closes  = quotes.get("close", [])[-30:]
+            highs   = quotes.get("high", [])[-30:]
+            lows    = quotes.get("low", [])[-30:]
+            volumes = quotes.get("volume", [])[-30:]
+
+            # Filter None values
+            candles = [
+                {"c": c, "h": h, "l": l, "v": v}
+                for c, h, l, v in zip(closes, highs, lows, volumes)
+                if all(x is not None for x in [c, h, l, v])
+            ]
+            if len(candles) < 10:
+                continue
+
+            zone_data = zones.get(ticker, {})
+            prompt = f"""You are Junior's AI trading system. Analyze this 1-minute candle data for {ticker} and determine if any high-probability setup from the 3-Screen Confluence System is currently forming or has just triggered.
+
+LAST 30 CANDLES (most recent last):
+{json.dumps(candles[-20:], indent=2)}
+
+VOLUME PROFILE ZONES:
+1H: {zone_data.get('1H')}
+4H: {zone_data.get('4H')}
+
+Current time: {now_et.strftime('%I:%M %p ET')}
+
+Check for:
+1. Price approaching or bouncing off 8 EMA or 21 EMA (calculate approximate EMAs from the candle data)
+2. Price near a Volume Profile demand or supply zone listed above
+3. Flag/consolidation pattern forming after a strong move
+4. RSI divergence conditions (price making lower lows while momentum improving, or vice versa)
+5. PMH/PML proximity (highest high and lowest low of the first 15 candles = premarket levels)
+
+Respond with EXACTLY one of:
+- "NO_SETUP: [brief reason]" if nothing significant is forming
+- "WATCHLIST: [ticker] [direction] — [1 sentence describing the setup and what to watch for]"
+
+Be conservative. Only flag genuinely high-probability developing setups, not noise."""
+
+            scan_resp = anthropic.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=150,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result_text = scan_resp.content[0].text.strip()
+            log.info(f"Pattern scan {ticker}: {result_text[:80]}")
+
+            if result_text.startswith("WATCHLIST:"):
+                # Post as a watchlist alert — not a trade, just a heads-up
+                msg = f"👀 **Pattern Alert** — {result_text.replace('WATCHLIST: ', '')}\n\n_Developing setup — confirm your confirmations before entering. Not a trade signal._"
+                post_discord(CHANNEL_DAY_SIGNALS, msg)
+                _pattern_scan_cooldown[ticker] = now_et
+                log.info(f"✅ Pattern alert posted for {ticker}")
+
+        except Exception as e:
+            log.error(f"Pattern scan error for {ticker}: {e}")
+
+
+# ── AUTOMATED JOB 3: End-of-Day Recap ────────────────────────────────────────
+def post_eod_recap():
+    """Generate and post an end-of-day recap to #profits-and-recaps."""
+    log.info("📊 Generating end-of-day recap...")
+
+    # Pull positions and balance from Tastytrade
+    positions = []
+    balance   = {}
+    try:
+        positions = get_positions()
+        balance   = get_account_balance()
+    except Exception as e:
+        log.error(f"Could not fetch Tastytrade data for recap: {e}")
+
+    # Pull today's session stats
+    trade_count       = session.get("trade_count", 0)
+    consecutive_loss  = session.get("consecutive_losses", 0)
+    circuit_breaker   = session.get("circuit_breaker", False)
+
+    prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — market just closed. You are Junior from The Portfolio Plug.
+
+Write the end-of-day recap post for #profits-and-recaps. Keep it real, educational, and in your voice.
+
+TODAY'S SESSION STATS:
+- Trades taken: {trade_count}
+- Consecutive losses at close: {consecutive_loss}
+- Circuit breaker triggered today: {circuit_breaker}
+- Open positions: {len(positions)}
+- Account balance data: {json.dumps(balance, indent=2) if balance else 'Not available'}
+
+OPEN POSITIONS:
+{json.dumps(positions, indent=2) if positions else 'None — flat going into tomorrow'}
+
+Your recap must include:
+1. One honest sentence about how today went overall
+2. If trades were taken: what the setup was, what worked or didn't
+3. If no trades: why the system stayed in cash (dead zone, no confirmation, etc.) — frame it as discipline, not failure
+4. Open positions if any: what you're holding and why
+5. What to watch for tomorrow (1-2 things)
+6. A closing line for the community
+
+Keep it under 300 words. No fluff — members respect honesty over hype."""
+
+    try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        recap_msg = resp.content[0].text
+        post_discord(CHANNEL_RECAPS, recap_msg)
+        log.info("✅ End-of-day recap posted to Discord")
+    except Exception as e:
+        log.error(f"EOD recap generation error: {e}", exc_info=True)
+
+
+# ── MASTER SCHEDULER LOOP ─────────────────────────────────────────────────────
 def zone_scheduler_loop():
     """
-    Background thread that recalculates Volume Profile zones once per day,
-    every morning before market open. Runs forever as long as the server is up.
-    No human interaction needed — this is what makes Rules 1, 2, 5, 6 fully autonomous.
+    Master background thread handling ALL automated daily jobs:
+    1. Volume Profile zone calculation (8:00 AM ET daily)
+    2. Daily watchlist post (8:30 AM ET daily)
+    3. Pattern scanner (every 5 min, 9:25-10:30 AM ET)
+    4. End-of-day recap (4:01 PM ET daily)
     """
-    last_run_date = None
-    # Run once immediately on startup so zones are available right away
+    last_zone_date     = None
+    last_watchlist_date = None
+    last_recap_date     = None
+
+    # Run zone calculation immediately on startup
     try:
         log.info("🔄 Running initial Volume Profile zone calculation on startup...")
         results = volume_profile.update_all_zones(list(SWING_TICKERS))
         log.info(f"🔄 Initial zone calculation results: {results}")
         log.info(f"🔄 Zone store now contains: {list(volume_profile.get_all_zones().keys())}")
-        last_run_date = datetime.now(ET).date()
+        last_zone_date = datetime.now(ET).date()
     except Exception as e:
         log.error(f"Initial zone calculation failed: {e}", exc_info=True)
 
     while True:
         try:
             now_et = datetime.now(ET)
-            # Refresh once per day at/after 8:00 AM ET, before pre-market prep completes at 9:15
-            if now_et.time() >= dtime(8, 0) and now_et.date() != last_run_date:
+            today  = now_et.date()
+            t      = now_et.time()
+
+            # JOB 1: Volume Profile zones — 8:00 AM ET
+            if t >= dtime(8, 0) and today != last_zone_date:
                 log.info("🔄 Running daily Volume Profile zone calculation...")
                 volume_profile.update_all_zones(list(SWING_TICKERS))
-                last_run_date = now_et.date()
+                last_zone_date = today
                 log.info("✅ Daily Volume Profile zones updated automatically.")
+
+            # JOB 2: Daily watchlist — 8:30 AM ET
+            if t >= dtime(8, 30) and today != last_watchlist_date:
+                post_daily_watchlist()
+                last_watchlist_date = today
+
+            # JOB 3: Pattern scanner — every loop tick during trade window (5 min sleep below)
+            if dtime(9, 25) <= t <= dtime(10, 30):
+                scan_for_visual_patterns()
+
+            # JOB 4: End-of-day recap — 4:01 PM ET
+            if t >= dtime(16, 1) and today != last_recap_date:
+                post_eod_recap()
+                last_recap_date = today
+
         except Exception as e:
-            log.error(f"Zone scheduler error: {e}", exc_info=True)
+            log.error(f"Master scheduler error: {e}", exc_info=True)
 
         time_module.sleep(300)  # check every 5 minutes
 
