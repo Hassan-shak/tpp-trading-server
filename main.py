@@ -636,9 +636,33 @@ def zone_scheduler_loop():
     3. Pattern scanner (every 5 min, 9:25-10:30 AM ET)
     4. End-of-day recap (4:01 PM ET daily)
     """
-    last_zone_date     = None
-    last_watchlist_date = None
-    last_recap_date     = None
+    SCHEDULER_STATE_FILE = "/tmp/tpp_scheduler_state.json"
+
+    def load_scheduler_state() -> dict:
+        try:
+            if os.path.exists(SCHEDULER_STATE_FILE):
+                with open(SCHEDULER_STATE_FILE, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def save_scheduler_state(state: dict):
+        try:
+            with open(SCHEDULER_STATE_FILE, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            log.error(f"Failed to save scheduler state: {e}")
+
+    # Load persisted state so restarts/redeploys don't re-fire jobs already done today
+    _state = load_scheduler_state()
+    today_str = datetime.now(ET).date().isoformat()
+
+    last_zone_date      = datetime.fromisoformat(_state["zone_date"]).date() if _state.get("zone_date") else None
+    last_watchlist_date = datetime.fromisoformat(_state["watchlist_date"]).date() if _state.get("watchlist_date") else None
+    last_recap_date     = datetime.fromisoformat(_state["recap_date"]).date() if _state.get("recap_date") else None
+
+    log.info(f"📅 Scheduler state loaded — zones: {last_zone_date}, watchlist: {last_watchlist_date}, recap: {last_recap_date}")
 
     # Start Alpaca real-time stream first — backfills history then opens WebSocket
     try:
@@ -670,12 +694,14 @@ def zone_scheduler_loop():
                 log.info("🔄 Running daily Volume Profile zone calculation...")
                 volume_profile.update_all_zones(list(SWING_TICKERS))
                 last_zone_date = today
+                save_scheduler_state({"zone_date": today.isoformat(), "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": last_recap_date.isoformat() if last_recap_date else None})
                 log.info("✅ Daily Volume Profile zones updated automatically.")
 
             # JOB 2: Daily watchlist — 8:30 AM ET
             if t >= dtime(8, 30) and today != last_watchlist_date:
                 post_daily_watchlist()
                 last_watchlist_date = today
+                save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": today.isoformat(), "recap_date": last_recap_date.isoformat() if last_recap_date else None})
 
             # JOB 3: Pattern scanner — every loop tick during trade window (5 min sleep below)
             if dtime(9, 25) <= t <= dtime(10, 30):
@@ -685,6 +711,7 @@ def zone_scheduler_loop():
             if t >= dtime(16, 1) and today != last_recap_date:
                 post_eod_recap()
                 last_recap_date = today
+                save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": today.isoformat()})
 
         except Exception as e:
             log.error(f"Master scheduler error: {e}", exc_info=True)
