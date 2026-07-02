@@ -651,22 +651,57 @@ def zone_scheduler_loop():
     4. End-of-day recap (4:01 PM ET daily)
     """
     SCHEDULER_STATE_FILE = "/tmp/tpp_scheduler_state.json"
+    # Also check zone file for state — zones file persists across deploys
+    ZONE_FILE = "/tmp/tpp_zones.json"
 
     def load_scheduler_state() -> dict:
+        # Try dedicated state file first
         try:
             if os.path.exists(SCHEDULER_STATE_FILE):
                 with open(SCHEDULER_STATE_FILE, "r") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    if data:
+                        return data
+        except Exception:
+            pass
+        # Fallback: check zones file — if zones were updated today, mark zone job done
+        try:
+            if os.path.exists(ZONE_FILE):
+                with open(ZONE_FILE, "r") as f:
+                    zones = json.load(f)
+                # Check embedded scheduler state
+                meta = zones.get("__scheduler_state__", {})
+                if meta:
+                    return meta
+                # Check zone update dates as proxy
+                today_iso = datetime.now(ET).date().isoformat()
+                for key, val in zones.items():
+                    if key.startswith("__"):
+                        continue
+                    updated = val.get("updated_at", "")
+                    if today_iso in updated:
+                        return {"zone_date": today_iso, "watchlist_date": None, "recap_date": None}
         except Exception:
             pass
         return {}
 
     def save_scheduler_state(state: dict):
+        # Save to dedicated state file
         try:
             with open(SCHEDULER_STATE_FILE, "w") as f:
                 json.dump(state, f)
         except Exception as e:
             log.error(f"Failed to save scheduler state: {e}")
+        # Also embed in zones file as backup
+        try:
+            if os.path.exists(ZONE_FILE):
+                with open(ZONE_FILE, "r") as f:
+                    zones = json.load(f)
+                zones["__scheduler_state__"] = state
+                with open(ZONE_FILE, "w") as f:
+                    json.dump(zones, f)
+        except Exception as e:
+            log.error(f"Failed to embed scheduler state in zones file: {e}")
 
     # Load persisted state so restarts/redeploys don't re-fire jobs already done today
     _state = load_scheduler_state()
