@@ -679,32 +679,21 @@ def zone_scheduler_loop():
     log.info(f"📅 Scheduler state loaded — zones: {last_zone_date}, watchlist: {last_watchlist_date}, recap: {last_recap_date}")
 
     # Start Alpaca real-time stream first — backfills history then opens WebSocket
+    # Backfill runs in background — does NOT block server startup
     try:
         alpaca_stream.start()
-        log.info("✅ Alpaca real-time stream started")
-        # Wait for backfill to complete — 8 tickers × 90 days needs real time
-        log.info("⏳ Waiting for Alpaca backfill to complete...")
-        for i in range(24):  # wait up to 2 minutes (24 × 5s)
-            time_module.sleep(5)
-            candle_counts = {t: len(alpaca_stream.get_candles(t, limit=500)) for t in list(SWING_TICKERS)}
-            ready = sum(1 for c in candle_counts.values() if c > 100)
-            log.info(f"⏳ Backfill progress: {ready}/{len(SWING_TICKERS)} tickers ready {candle_counts}")
-            if ready >= len(SWING_TICKERS):
-                log.info("✅ All tickers backfilled — proceeding")
-                break
-        else:
-            log.warning("⚠️ Backfill timeout — proceeding with available data")
+        log.info("✅ Alpaca real-time stream started — backfill running in background")
+        # Brief pause to let connection establish
+        time_module.sleep(3)
     except Exception as e:
         log.error(f"Alpaca stream start failed: {e}", exc_info=True)
 
-    # Run zone calculation on startup ONLY if no recent zone data exists on disk
-    # (avoids redundant recalculation on every deploy)
+    # Run zone calculation on startup ONLY if no fresh zone data exists on disk
     try:
         existing_zones = volume_profile.get_all_zones()
         now_et_boot = datetime.now(ET)
         zones_are_fresh = False
         if existing_zones:
-            # Check if any zone was updated today
             for ticker_data in existing_zones.values():
                 updated_at_str = ticker_data.get("updated_at", "")
                 if updated_at_str:
@@ -720,13 +709,9 @@ def zone_scheduler_loop():
             log.info("✅ Zone data from today already exists on disk — skipping startup recalculation")
             last_zone_date = now_et_boot.date()
         else:
-            log.info("🔄 Running initial Volume Profile zone calculation on startup...")
-            results = volume_profile.update_all_zones(list(SWING_TICKERS))
-            log.info(f"🔄 Initial zone calculation results: {results}")
-            log.info(f"🔄 Zone store now contains: {list(volume_profile.get_all_zones().keys())}")
-            last_zone_date = now_et_boot.date()
+            log.info("🔄 No fresh zones found — will calculate at 8:00 AM ET or next scheduled window")
     except Exception as e:
-        log.error(f"Initial zone calculation failed: {e}", exc_info=True)
+        log.error(f"Zone startup check failed: {e}", exc_info=True)
 
     while True:
         try:
@@ -754,13 +739,12 @@ def zone_scheduler_loop():
                 save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": today.isoformat(), "recap_date": last_recap_date.isoformat() if last_recap_date else None})
 
             # JOB 3: Pattern scanner — every loop tick during trade window (weekdays only)
-            # Only runs if Alpaca has enough candle data (>100 bars per ticker)
             if not is_weekend and dtime(9, 25) <= t <= dtime(10, 30):
                 candles_ready = sum(1 for tk in DAY_TRADE_TICKERS if len(alpaca_stream.get_candles(tk, limit=101)) > 100)
-                if candles_ready >= len(DAY_TRADE_TICKERS):
+                if candles_ready >= len(DAY_TRADE_TICKERS) // 2:  # at least half ready
                     scan_for_visual_patterns()
                 else:
-                    log.info(f"⏳ Pattern scanner skipped — only {candles_ready}/{len(DAY_TRADE_TICKERS)} tickers have enough candle data")
+                    log.info(f"⏳ Pattern scanner skipped — only {candles_ready}/{len(DAY_TRADE_TICKERS)} tickers ready")
 
             # JOB 4: End-of-day recap — 4:01 PM ET (weekdays only)
             # Fire window: 4:01–4:30 PM only — prevents restarts after hours re-firing
