@@ -23,6 +23,7 @@ from tastytrade_executor import (
 )
 import volume_profile
 import alpaca_stream
+import alpaca_executor
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -227,49 +228,47 @@ def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
 
 # ── Execute trade via Tastytrade ──────────────────────────────────────────────
 def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict | None:
-    """Find contract and place order via Tastytrade API."""
-    if not is_authenticated():
-        log.warning("Tastytrade not authenticated — signal posted to Discord only, no execution")
+    """Find contract and place paper order via Alpaca."""
+    ticker        = alert_data.get("ticker", "").upper()
+    current_price = alpaca_stream.get_latest_price(ticker) or float(alert_data.get("price", 0))
+
+    if not alpaca_executor.is_available():
+        log.warning("Alpaca paper trading unavailable — signal posted to Discord only")
         return None
 
-    ticker = alert_data.get("ticker", "").upper()
-    trade_type = "DAY" if analysis_type == "DAY_SIGNAL" else "SWING"
-
-    contract = find_option_contract(ticker, direction, trade_type)
+    contract = alpaca_executor.find_option_contract(ticker, direction, current_price)
     if not contract:
-        log.warning(f"No suitable contract found for {ticker} {direction}")
+        log.warning(f"No suitable Alpaca contract found for {ticker} {direction}")
         post_discord(CHANNEL_RECAPS,
-            f"⚠️ Signal identified for {ticker} {direction} but no contract met our criteria "
-            f"(budget or spread requirements). No order placed.")
+            f"⚠️ Signal identified for {ticker} {direction} but no contract met criteria "
+            f"($0.75-$1.50, spread <5%). No order placed.")
         return None
 
-    # Place the order — 1 contract default (members size to their own account)
-    order = place_order(contract, quantity=1)
+    order = alpaca_executor.place_order(contract, quantity=1)
     if not order:
-        log.error("Order placement failed")
+        log.error("Alpaca order placement failed")
         return None
 
-    # Track the position
     active_positions[contract["symbol"]] = {
-        "order_id": order["order_id"],
+        "order_id": order.get("id"),
         "entry_price": contract["ask"],
         "quantity": 1,
         "ticker": ticker,
         "direction": direction,
         "opened_at": datetime.now(ET).isoformat(),
-        "paper": PAPER_TRADING,
+        "paper": True,
+        "broker": "alpaca",
     }
 
-    # Post fill confirmation to #profits-and-recaps
-    mode_tag = "📋 PAPER TRADE" if PAPER_TRADING else "✅ ORDER FILLED"
     fill_msg = (
-        f"{mode_tag} @everyone\n"
-        f"Mine filled at {contract['ask']:.2f}\n"
+        f"📋 PAPER TRADE @everyone\n"
+        f"Filled at ${contract['ask']:.2f}\n"
         f"Contract: {contract['symbol']}\n"
+        f"Strike: {contract['strike']} | Expiry: {contract['expiry']}\n"
         f"Spread: {contract['spread_pct']}%"
     )
     post_discord(CHANNEL_RECAPS, fill_msg)
-
+    log.info(f"✅ Alpaca paper trade executed: {contract['symbol']} @ {contract['ask']}")
     return order
 
 
