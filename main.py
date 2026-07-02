@@ -705,8 +705,8 @@ def zone_scheduler_loop():
                 save_scheduler_state({"zone_date": today.isoformat(), "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": last_recap_date.isoformat() if last_recap_date else None})
                 log.info("✅ Daily Volume Profile zones updated automatically.")
 
-            # JOB 2: Daily watchlist — 8:30 AM ET (weekdays only)
-            if not is_weekend and t >= dtime(8, 30) and today != last_watchlist_date:
+            # JOB 2: Daily watchlist — 9:15 AM ET (weekdays only)
+            if not is_weekend and t >= dtime(9, 15) and today != last_watchlist_date:
                 post_daily_watchlist()
                 last_watchlist_date = today
                 save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": today.isoformat(), "recap_date": last_recap_date.isoformat() if last_recap_date else None})
