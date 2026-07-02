@@ -651,48 +651,91 @@ def zone_scheduler_loop():
     4. End-of-day recap (4:01 PM ET daily)
     """
     SCHEDULER_STATE_FILE = "/tmp/tpp_scheduler_state.json"
-    # Also check zone file for state — zones file persists across deploys
     ZONE_FILE = "/tmp/tpp_zones.json"
+    RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+    RENDER_SERVICE_ID = "srv-d91fh10k1i2s73arkh20"
 
     def load_scheduler_state() -> dict:
-        # Try dedicated state file first
+        """Load state — tries Render env vars first (survive deploys), then local file."""
+        # Primary: read from environment variables set by Render API
+        state = {}
+        zone_date = os.environ.get("SCHEDULER_ZONE_DATE")
+        watchlist_date = os.environ.get("SCHEDULER_WATCHLIST_DATE")
+        recap_date = os.environ.get("SCHEDULER_RECAP_DATE")
+        if zone_date:
+            state["zone_date"] = zone_date
+        if watchlist_date:
+            state["watchlist_date"] = watchlist_date
+        if recap_date:
+            state["recap_date"] = recap_date
+        if state:
+            log.info(f"📅 Loaded scheduler state from env vars: {state}")
+            return state
+
+        # Fallback: local file (works between restarts within same deploy)
         try:
             if os.path.exists(SCHEDULER_STATE_FILE):
                 with open(SCHEDULER_STATE_FILE, "r") as f:
                     data = json.load(f)
                     if data:
+                        log.info(f"📅 Loaded scheduler state from file: {data}")
                         return data
         except Exception:
             pass
-        # Fallback: check zones file — if zones were updated today, mark zone job done
+
+        # Last fallback: check zone file update dates
         try:
             if os.path.exists(ZONE_FILE):
                 with open(ZONE_FILE, "r") as f:
                     zones = json.load(f)
-                # Check embedded scheduler state
                 meta = zones.get("__scheduler_state__", {})
                 if meta:
                     return meta
-                # Check zone update dates as proxy
                 today_iso = datetime.now(ET).date().isoformat()
                 for key, val in zones.items():
                     if key.startswith("__"):
                         continue
-                    updated = val.get("updated_at", "")
-                    if today_iso in updated:
+                    if today_iso in val.get("updated_at", ""):
                         return {"zone_date": today_iso, "watchlist_date": None, "recap_date": None}
         except Exception:
             pass
         return {}
 
     def save_scheduler_state(state: dict):
-        # Save to dedicated state file
+        """Save state to local file AND push to Render env vars for deploy persistence."""
+        # Always save locally first (fast)
         try:
             with open(SCHEDULER_STATE_FILE, "w") as f:
                 json.dump(state, f)
         except Exception as e:
-            log.error(f"Failed to save scheduler state: {e}")
-        # Also embed in zones file as backup
+            log.error(f"Failed to save scheduler state locally: {e}")
+
+        # Push to Render API (survives deploys)
+        if RENDER_API_KEY:
+            try:
+                env_vars = []
+                if state.get("zone_date"):
+                    env_vars.append({"key": "SCHEDULER_ZONE_DATE", "value": state["zone_date"]})
+                if state.get("watchlist_date"):
+                    env_vars.append({"key": "SCHEDULER_WATCHLIST_DATE", "value": state["watchlist_date"]})
+                if state.get("recap_date"):
+                    env_vars.append({"key": "SCHEDULER_RECAP_DATE", "value": state["recap_date"]})
+
+                if env_vars:
+                    resp = requests.put(
+                        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+                        headers={"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"},
+                        json=env_vars,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        log.info(f"✅ Scheduler state persisted to Render env vars: {state}")
+                    else:
+                        log.warning(f"⚠️ Render API state save failed: {resp.status_code} — using local file only")
+            except Exception as e:
+                log.error(f"Render API state save error: {e}")
+
+        # Also embed in zones file as tertiary backup
         try:
             if os.path.exists(ZONE_FILE):
                 with open(ZONE_FILE, "r") as f:
@@ -700,8 +743,8 @@ def zone_scheduler_loop():
                 zones["__scheduler_state__"] = state
                 with open(ZONE_FILE, "w") as f:
                     json.dump(zones, f)
-        except Exception as e:
-            log.error(f"Failed to embed scheduler state in zones file: {e}")
+        except Exception:
+            pass
 
     # Load persisted state so restarts/redeploys don't re-fire jobs already done today
     _state = load_scheduler_state()
