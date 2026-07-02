@@ -698,7 +698,8 @@ def zone_scheduler_loop():
             is_weekend = now_et.weekday() >= 5
 
             # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only)
-            if not is_weekend and t >= dtime(8, 0) and today != last_zone_date:
+            # Fire window: 8:00–8:30 AM only (not triggered by late restarts)
+            if not is_weekend and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
                 log.info("🔄 Running daily Volume Profile zone calculation...")
                 volume_profile.update_all_zones(list(SWING_TICKERS))
                 last_zone_date = today
@@ -706,7 +707,8 @@ def zone_scheduler_loop():
                 log.info("✅ Daily Volume Profile zones updated automatically.")
 
             # JOB 2: Daily watchlist — 9:15 AM ET (weekdays only)
-            if not is_weekend and t >= dtime(9, 15) and today != last_watchlist_date:
+            # Fire window: 9:15–9:45 AM only
+            if not is_weekend and dtime(9, 15) <= t <= dtime(9, 45) and today != last_watchlist_date:
                 post_daily_watchlist()
                 last_watchlist_date = today
                 save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": today.isoformat(), "recap_date": last_recap_date.isoformat() if last_recap_date else None})
@@ -716,7 +718,8 @@ def zone_scheduler_loop():
                 scan_for_visual_patterns()
 
             # JOB 4: End-of-day recap — 4:01 PM ET (weekdays only)
-            if not is_weekend and t >= dtime(16, 1) and today != last_recap_date:
+            # Fire window: 4:01–4:30 PM only — prevents restarts after hours re-firing
+            if not is_weekend and dtime(16, 1) <= t <= dtime(16, 30) and today != last_recap_date:
                 post_eod_recap()
                 last_recap_date = today
                 save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": today.isoformat()})
