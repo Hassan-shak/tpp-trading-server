@@ -28,8 +28,8 @@ ALPACA_REST_URL   = "https://data.alpaca.markets/v2"
 _candle_store = {}
 _store_lock   = threading.Lock()
 
-# Keep max 500 bars per ticker (~8 hours of 1-min bars)
-MAX_BARS = 500
+# Keep ~90 trading days of 1-min bars (90 days × 390 bars/day ≈ 35,100 — rounded up)
+MAX_BARS = 40000
 
 TICKERS = ["SPY", "QQQ", "NVDA", "TSLA", "AMZN", "MSFT", "META", "GOOG"]
 
@@ -43,29 +43,41 @@ def _headers():
 
 # ── REST: backfill historical bars on startup ──────────────────────────────────
 def backfill_historical(ticker: str, days: int = 90):
-    """Pull last N days of 1-minute bars via REST to seed the candle store."""
+    """Pull last N days of 1-minute bars via REST (paginated) to seed the candle store."""
     try:
         end   = datetime.now(ET).strftime("%Y-%m-%dT%H:%M:%SZ")
         start = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         url   = f"{ALPACA_REST_URL}/stocks/{ticker}/bars"
-        params = {
-            "timeframe": "1Min",
-            "start": start,
-            "end": end,
-            "limit": 10000,
-            "feed": "sip",
-            "sort": "asc",
-        }
-        resp = requests.get(url, headers=_headers(), params=params, timeout=15)
-        if resp.status_code != 200:
-            log.error(f"Alpaca REST backfill failed for {ticker}: {resp.status_code} {resp.text}")
-            return
 
-        bars = resp.json().get("bars", [])
+        all_bars   = []
+        page_token = None
+        for _ in range(10):  # max 10 pages (100K bars) as a safety cap
+            params = {
+                "timeframe": "1Min",
+                "start": start,
+                "end": end,
+                "limit": 10000,
+                "feed": "sip",
+                "sort": "asc",
+            }
+            if page_token:
+                params["page_token"] = page_token
+
+            resp = requests.get(url, headers=_headers(), params=params, timeout=20)
+            if resp.status_code != 200:
+                log.error(f"Alpaca REST backfill failed for {ticker}: {resp.status_code} {resp.text}")
+                break
+
+            data = resp.json()
+            all_bars.extend(data.get("bars", []))
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
         with _store_lock:
             if ticker not in _candle_store:
                 _candle_store[ticker] = deque(maxlen=MAX_BARS)
-            for bar in bars:
+            for bar in all_bars:
                 _candle_store[ticker].append({
                     "t": bar["t"],
                     "o": bar["o"],
@@ -74,7 +86,7 @@ def backfill_historical(ticker: str, days: int = 90):
                     "c": bar["c"],
                     "v": bar["v"],
                 })
-        log.info(f"✅ Backfilled {len(bars)} bars for {ticker}")
+        log.info(f"✅ Backfilled {len(all_bars)} bars for {ticker}")
 
     except Exception as e:
         log.error(f"Backfill error for {ticker}: {e}", exc_info=True)

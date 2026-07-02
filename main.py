@@ -688,26 +688,29 @@ def zone_scheduler_loop():
             today  = now_et.date()
             t      = now_et.time()
 
-            # JOB 1: Volume Profile zones — 8:00 AM ET
-            if t >= dtime(8, 0) and today != last_zone_date:
+            # Skip market-facing jobs on weekends (Sat=5, Sun=6)
+            is_weekend = now_et.weekday() >= 5
+
+            # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only)
+            if not is_weekend and t >= dtime(8, 0) and today != last_zone_date:
                 log.info("🔄 Running daily Volume Profile zone calculation...")
                 volume_profile.update_all_zones(list(SWING_TICKERS))
                 last_zone_date = today
                 save_scheduler_state({"zone_date": today.isoformat(), "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": last_recap_date.isoformat() if last_recap_date else None})
                 log.info("✅ Daily Volume Profile zones updated automatically.")
 
-            # JOB 2: Daily watchlist — 8:30 AM ET
-            if t >= dtime(8, 30) and today != last_watchlist_date:
+            # JOB 2: Daily watchlist — 8:30 AM ET (weekdays only)
+            if not is_weekend and t >= dtime(8, 30) and today != last_watchlist_date:
                 post_daily_watchlist()
                 last_watchlist_date = today
                 save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": today.isoformat(), "recap_date": last_recap_date.isoformat() if last_recap_date else None})
 
-            # JOB 3: Pattern scanner — every loop tick during trade window (5 min sleep below)
-            if dtime(9, 25) <= t <= dtime(10, 30):
+            # JOB 3: Pattern scanner — every loop tick during trade window (weekdays only)
+            if not is_weekend and dtime(9, 25) <= t <= dtime(10, 30):
                 scan_for_visual_patterns()
 
-            # JOB 4: End-of-day recap — 4:01 PM ET
-            if t >= dtime(16, 1) and today != last_recap_date:
+            # JOB 4: End-of-day recap — 4:01 PM ET (weekdays only)
+            if not is_weekend and t >= dtime(16, 1) and today != last_recap_date:
                 post_eod_recap()
                 last_recap_date = today
                 save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": today.isoformat()})
