@@ -81,13 +81,9 @@ def reset_session_if_new_day():
 
 # ── Day-of-week checks ────────────────────────────────────────────────────────
 
-def is_friday() -> bool:
-    """Friday (weekday=4) is a no-trading, no-Discord day."""
-    return datetime.now(ET).weekday() == 4
-
-def is_weekend() -> bool:
-    """Saturday (5) or Sunday (6)."""
-    return datetime.now(ET).weekday() >= 5
+def is_off_day() -> bool:
+    """Friday (4), Saturday (5), and Sunday (6) are all off days — no trading, no Discord."""
+    return datetime.now(ET).weekday() >= 4
 
 # ── Time window checks ────────────────────────────────────────────────────────
 
@@ -119,7 +115,7 @@ def post_discord(channel_id: str, message: str) -> bool:
         return False
 
     # ── FRIDAY BLOCK ──────────────────────────────────────────────────────────
-    if is_friday():
+    if is_off_day():
         log.info("Friday — Discord posting suppressed (no-trading day)")
         return False
 
@@ -275,11 +271,11 @@ def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
     reset_session_if_new_day()
 
     # ── FRIDAY BLOCK ──────────────────────────────────────────────────────────
-    if is_friday():
+    if is_off_day():
         return False, "FRIDAY: No trading day — system offline"
 
     # ── WEEKEND BLOCK ─────────────────────────────────────────────────────────
-    if is_weekend():
+    if is_off_day():
         return False, "WEEKEND: Market closed"
 
     ticker = alert_data.get("ticker", "").upper()
@@ -484,7 +480,7 @@ def health():
         "status": "online",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
-        "is_friday_no_trade": is_friday(),
+        "is_off_day": is_off_day(),
         "in_day_trade_window": in_day_trade_window(),
         "in_swing_window": in_swing_window(),
         "paper_trading": PAPER_TRADING,
@@ -534,7 +530,7 @@ def fetch_premarket_data(ticker: str) -> dict:
 def post_daily_watchlist():
     """Generate and post the morning watchlist to #daily-watchlist."""
     # Never post on Friday or weekends
-    if is_friday() or is_weekend():
+    if is_off_day():
         log.info("Friday/weekend — watchlist suppressed")
         return
 
@@ -591,7 +587,7 @@ _pattern_scan_cooldown = {}
 
 def scan_for_visual_patterns():
     """Scan for confluence setups — only runs on trading days (not Fri/weekend)."""
-    if is_friday() or is_weekend():
+    if is_off_day():
         return
 
     now_et = datetime.now(ET)
@@ -657,7 +653,7 @@ Be conservative. Only flag genuinely high-probability developing setups, not noi
 # ── AUTOMATED JOB 3: End-of-Day Recap ────────────────────────────────────────
 def post_eod_recap():
     """Generate and post an end-of-day recap. Suppressed on Friday/weekends."""
-    if is_friday() or is_weekend():
+    if is_off_day():
         log.info("Friday/weekend — EOD recap suppressed")
         return
 
@@ -847,10 +843,10 @@ def zone_scheduler_loop():
             t      = now_et.time()
 
             # Skip market-facing jobs on weekends AND Fridays
-            no_trade_day = is_weekend() or is_friday()
+            no_trade_day = is_off_day()
 
             # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only, including Friday for zone data)
-            if not is_weekend() and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
+            if not is_off_day() and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
                 log.info("🔄 Running daily Volume Profile zone calculation...")
                 volume_profile.update_all_zones(list(SWING_TICKERS))
                 last_zone_date = today
