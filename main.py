@@ -415,6 +415,79 @@ def webhook():
     post_discord(channel_id, claude_response)
     return jsonify({"status": "posted"}), 200
 
+# ── TEST TRADE (TEMPORARY — disable by removing TEST_MODE env var on Render) ──
+@app.route("/test-trade", methods=["POST"])
+def test_trade():
+    """
+    Bypasses ALL time and session gates for end-to-end pipeline testing.
+    Only active when TEST_MODE=true is set in Render environment variables.
+    To permanently disable: delete TEST_MODE from Render env vars.
+    """
+    if os.environ.get("TEST_MODE", "").lower() != "true":
+        return jsonify({"error": "Test mode not enabled"}), 403
+
+    data = request.get_json(force=True)
+    if not data:
+        return jsonify({"error": "Empty payload"}), 400
+
+    if not hmac.compare_digest(data.get("secret", ""), WEBHOOK_SECRET):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    log.info(f"🧪 TEST TRADE triggered: {json.dumps(data)}")
+
+    # Default to a safe SPY CALL if no data provided
+    test_payload = {
+        "ticker": data.get("ticker", "SPY"),
+        "price": data.get("price", 750.00),
+        "volume": data.get("volume", 50000),
+        "high": data.get("high", 751.00),
+        "low": data.get("low", 749.50),
+        "time": datetime.now(ET).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "interval": "1",
+        "alert_type": data.get("alert_type", "EMA8_CROSS_UP"),
+        "direction": data.get("direction", "CALL"),
+        "secret": WEBHOOK_SECRET,
+    }
+
+    # Run through Claude analysis (real AI decision, just no time gate)
+    try:
+        claude_response = analyze_with_claude(test_payload, "DAY_SIGNAL")
+        log.info(f"🧪 Claude test response: {claude_response[:300]}")
+    except Exception as e:
+        log.error(f"Claude error in test: {e}")
+        return jsonify({"error": f"Claude failed: {str(e)}"}), 500
+
+    first_line      = claude_response.split("\n")[0].strip().upper()
+    discord_message = "\n".join(claude_response.split("\n")[1:]).strip()
+
+    # Force TRADE_VALID if Claude says NO_TRADE (test mode override)
+    force_trade = data.get("force", False)
+    if force_trade or first_line.startswith("TRADE_VALID"):
+        direction = test_payload["direction"]
+        order = execute_trade(test_payload, direction, "DAY_SIGNAL")
+        if order:
+            return jsonify({
+                "status": "test_trade_executed",
+                "claude_decision": first_line,
+                "order": order,
+                "discord_message": discord_message,
+            }), 200
+        else:
+            return jsonify({
+                "status": "test_signal_only",
+                "claude_decision": first_line,
+                "note": "Claude approved but Alpaca execution failed — check alpaca_executor",
+                "discord_message": discord_message,
+            }), 200
+
+    return jsonify({
+        "status": "test_no_trade",
+        "claude_decision": first_line,
+        "reason": discord_message[:200],
+        "tip": "Add 'force': true to the payload to bypass Claude and force an Alpaca order",
+    }), 200
+
+
 # ── KILL SWITCH ───────────────────────────────────────────────────────────────
 @app.route("/kill", methods=["POST"])
 def kill_switch():
