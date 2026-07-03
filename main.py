@@ -12,7 +12,6 @@ import threading
 import time as time_module
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-
 import requests
 from flask import Flask, request, jsonify
 from anthropic import Anthropic
@@ -39,14 +38,14 @@ log.info(f"📦 Module main.py imported — process PID {os.getpid()}")
 anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 # ── Config from environment ───────────────────────────────────────────────────
-WEBHOOK_SECRET        = os.environ["WEBHOOK_SECRET"]
-DISCORD_BOT_TOKEN     = os.environ["DISCORD_BOT_TOKEN"]
-DISCORD_GUILD_ID      = os.environ["DISCORD_GUILD_ID"]
-CHANNEL_WATCHLIST     = os.environ["DISCORD_CHANNEL_WATCHLIST"]
-CHANNEL_DAY_SIGNALS   = os.environ["DISCORD_CHANNEL_DAY_SIGNALS"]
+WEBHOOK_SECRET      = os.environ["WEBHOOK_SECRET"]
+DISCORD_BOT_TOKEN   = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_GUILD_ID    = os.environ["DISCORD_GUILD_ID"]
+CHANNEL_WATCHLIST   = os.environ["DISCORD_CHANNEL_WATCHLIST"]
+CHANNEL_DAY_SIGNALS = os.environ["DISCORD_CHANNEL_DAY_SIGNALS"]
 CHANNEL_SWING_SIGNALS = os.environ["DISCORD_CHANNEL_SWING_SIGNALS"]
-CHANNEL_RECAPS        = os.environ["DISCORD_CHANNEL_RECAPS"]
-CHANNEL_LONGTERM      = os.environ["DISCORD_CHANNEL_LONGTERM"]
+CHANNEL_RECAPS      = os.environ["DISCORD_CHANNEL_RECAPS"]
+CHANNEL_LONGTERM    = os.environ["DISCORD_CHANNEL_LONGTERM"]
 
 ET = ZoneInfo("America/New_York")
 
@@ -80,8 +79,25 @@ def reset_session_if_new_day():
         })
         log.info(f"Session reset for {today}")
 
+# ── Day-of-week checks ────────────────────────────────────────────────────────
+
+def is_friday() -> bool:
+    """Friday (weekday=4) is a no-trading, no-Discord day."""
+    return datetime.now(ET).weekday() == 4
+
+def is_weekend() -> bool:
+    """Saturday (5) or Sunday (6)."""
+    return datetime.now(ET).weekday() >= 5
+
 # ── Time window checks ────────────────────────────────────────────────────────
+
 def in_day_trade_window() -> bool:
+    """
+    Day-trade entries: 9:30 AM – 11:00 AM ET.
+    The system prompt's '10 AM lockout' (Rule 6) is enforced by Claude via the
+    session trade count — NOT by a hard time gate here.  Claude knows to stop
+    scanning after 10 AM if no A+ setup has fired.
+    """
     now = datetime.now(ET).time()
     return dtime(9, 30) <= now <= dtime(11, 0)
 
@@ -95,13 +111,18 @@ def in_dead_zone() -> bool:
 
 # ── Discord helper ────────────────────────────────────────────────────────────
 DISCORD_API = "https://discord.com/api/v10"
-
 DISCORD_POSTING_ENABLED = os.environ.get("DISCORD_POSTING_ENABLED", "true").lower() == "true"
 
 def post_discord(channel_id: str, message: str) -> bool:
     if not DISCORD_POSTING_ENABLED:
         log.info(f"Discord posting disabled — suppressed message to channel {channel_id}")
         return False
+
+    # ── FRIDAY BLOCK ──────────────────────────────────────────────────────────
+    if is_friday():
+        log.info("Friday — Discord posting suppressed (no-trading day)")
+        return False
+
     url = f"{DISCORD_API}/channels/{channel_id}/messages"
     headers = {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
@@ -125,13 +146,25 @@ def get_system_prompt() -> str:
 # ── Claude analysis ───────────────────────────────────────────────────────────
 def analyze_with_claude(alert_data: dict, analysis_type: str) -> str:
     system_prompt = get_system_prompt()
+
     now_et = datetime.now(ET)
+
+    # Parse the alert's own timestamp so Claude reasons about ALERT time, not processing time
+    alert_time_raw = alert_data.get("time", "")
+    try:
+        alert_dt_utc = datetime.fromisoformat(alert_time_raw.replace("Z", "+00:00"))
+        alert_dt_et  = alert_dt_utc.astimezone(ET)
+        alert_time_et_str = alert_dt_et.strftime("%I:%M %p ET")
+    except Exception:
+        alert_time_et_str = "unknown (parse error)"
+
     tt_status = "CONNECTED (PAPER)" if (is_authenticated() and PAPER_TRADING) else \
-                "CONNECTED (LIVE)" if (is_authenticated() and not PAPER_TRADING) else \
+                "CONNECTED (LIVE)"  if (is_authenticated() and not PAPER_TRADING) else \
                 "NOT CONNECTED"
 
     ticker = alert_data.get("ticker", "").upper()
-    zones = volume_profile.get_zones(ticker)
+    zones  = volume_profile.get_zones(ticker)
+
     if zones:
         zone_text = f"""
 VOLUME PROFILE ZONES FOR {ticker} (auto-calculated, last updated {zones.get('updated_at', 'unknown')}):
@@ -151,13 +184,29 @@ VOLUME PROFILE ZONES FOR {ticker} (auto-calculated, last updated {zones.get('upd
         candle_text = f"\nRECENT CANDLES FOR {ticker}: Not yet available (Alpaca backfill in progress).\n"
 
     context = f"""
-CURRENT TIME (ET): {now_et.strftime('%A, %B %d, %Y %I:%M %p ET')}
+CURRENT SERVER TIME (ET): {now_et.strftime('%A, %B %d, %Y %I:%M %p ET')}
+ALERT TRIGGER TIME (ET):  {alert_time_et_str}   ← USE THIS for time-window checks, not server time
 DAY OF WEEK: {now_et.strftime('%A')}
+
+IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
+- Day trade entries are valid between 9:30 AM ET and 11:00 AM ET ONLY.
+  Use the ALERT TRIGGER TIME above for this check, not server processing time.
+- Dead zone (NO trades of any kind): 11:00 AM ET – 3:00 PM ET
+- Swing window: 3:00 PM ET – 4:00 PM ET
+- Friday is a NO-TRADING day — respond NO_TRADE for all signals.
+- Weekend (Sat/Sun) — respond NO_TRADE.
+- The 10 AM LOCKOUT in the playbook (Rule 6) means: if NO trade has been executed
+  by 10:00 AM and no A+ setup is printing, STOP scanning. It does NOT mean all
+  signals after 10 AM are automatically rejected — signals between 10:00 AM and
+  11:00 AM are still valid if they meet all other criteria.
+
 SESSION TRADE COUNT TODAY: {session['trade_count']}
 CONSECUTIVE LOSSES TODAY: {session['consecutive_losses']}
 CIRCUIT BREAKER ACTIVE: {session['circuit_breaker']}
 TASTYTRADE STATUS: {tt_status}
+
 {zone_text}{candle_text}
+
 INCOMING ALERT DATA:
 {json.dumps(alert_data, indent=2)}
 
@@ -165,10 +214,11 @@ ANALYSIS TYPE REQUESTED: {analysis_type}
 
 Based on my complete trading playbook and all rules in your system prompt:
 1. Run the full 5-category pre-flight checklist against this alert
-2. Check the alert against the 3-Screen Confluence System (Rules 1-6) — use the Volume Profile zone data above for any rule requiring zone alignment
-3. Determine if this is a valid trade signal, watchlist note, or no-trade
-4. If valid: format the exact Discord message in Junior's voice
-5. If not valid: explain briefly why
+2. Use the ALERT TRIGGER TIME (not server time) for all time-window checks
+3. Check the alert against the 3-Screen Confluence System (Rules 1-6)
+4. Determine if this is a valid trade signal, watchlist note, or no-trade
+5. If valid: format the exact Discord message in Junior's voice
+6. If not valid: explain briefly why (1-2 sentences max, no lengthy breakdowns)
 
 IMPORTANT: Start your response with exactly one of these tags on the first line:
 - TRADE_VALID: (if this should be executed)
@@ -176,6 +226,7 @@ IMPORTANT: Start your response with exactly one of these tags on the first line:
 - WATCHLIST: (if this is a watchlist update only)
 
 Then on the next lines, write the Discord message exactly as Junior would post it.
+Keep NO_TRADE explanations to 1-2 sentences.
 """
 
     response = anthropic.messages.create(
@@ -222,26 +273,39 @@ def determine_analysis_type(alert_data: dict) -> str:
 # ── Pre-flight gate ───────────────────────────────────────────────────────────
 def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
     reset_session_if_new_day()
+
+    # ── FRIDAY BLOCK ──────────────────────────────────────────────────────────
+    if is_friday():
+        return False, "FRIDAY: No trading day — system offline"
+
+    # ── WEEKEND BLOCK ─────────────────────────────────────────────────────────
+    if is_weekend():
+        return False, "WEEKEND: Market closed"
+
     ticker = alert_data.get("ticker", "").upper()
 
     if session["circuit_breaker"]:
         return False, "CIRCUIT_BREAKER: Two consecutive losses — system shut down"
+
     if session["kill_switch_active"]:
         return False, f"KILL_SWITCH: {session['kill_switch_reason']}"
+
     if session["trade_count"] >= 3:
         return False, "TRADE_CAP: Maximum 3 trades reached for today"
+
     if in_dead_zone():
         return False, "DEAD_ZONE: No trades between 11:00 AM – 3:00 PM ET"
 
     analysis_type = determine_analysis_type(alert_data)
     if analysis_type == "NO_TRADE_WINDOW":
         return False, "OUT_OF_WINDOW: Alert received outside trading windows"
+
     if analysis_type == "DAY_SIGNAL" and ticker not in DAY_TRADE_TICKERS:
         return False, f"INVALID_TICKER: {ticker} not on approved day-trade list"
 
     return True, "PASS"
 
-# ── Execute trade via Tastytrade ──────────────────────────────────────────────
+# ── Execute trade via Alpaca ──────────────────────────────────────────────────
 def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict | None:
     """Find contract and place paper order via Alpaca."""
     ticker        = alert_data.get("ticker", "").upper()
@@ -265,14 +329,14 @@ def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict 
         return None
 
     active_positions[contract["symbol"]] = {
-        "order_id": order.get("id"),
+        "order_id":   order.get("id"),
         "entry_price": contract["ask"],
-        "quantity": 1,
-        "ticker": ticker,
-        "direction": direction,
-        "opened_at": datetime.now(ET).isoformat(),
-        "paper": True,
-        "broker": "alpaca",
+        "quantity":   1,
+        "ticker":     ticker,
+        "direction":  direction,
+        "opened_at":  datetime.now(ET).isoformat(),
+        "paper":      True,
+        "broker":     "alpaca",
     }
 
     fill_msg = (
@@ -285,8 +349,6 @@ def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict 
     post_discord(CHANNEL_RECAPS, fill_msg)
     log.info(f"✅ Alpaca paper trade executed: {contract['symbol']} @ {contract['ask']}")
     return order
-
-
 
 # ── MAIN WEBHOOK ENDPOINT ─────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
@@ -325,7 +387,7 @@ def webhook():
         return jsonify({"error": "Claude API failed"}), 500
 
     # Parse Claude's decision
-    first_line = claude_response.split("\n")[0].strip().upper()
+    first_line     = claude_response.split("\n")[0].strip().upper()
     discord_message = "\n".join(claude_response.split("\n")[1:]).strip()
 
     if first_line.startswith("NO_TRADE"):
@@ -341,7 +403,7 @@ def webhook():
         channel_id = route_to_channel(data.get("alert_type", ""), analysis_type)
         post_discord(channel_id, discord_message)
 
-        # Execute via Tastytrade
+        # Execute via Alpaca
         direction = data.get("direction", "CALL")
         if direction in ("CALL", "PUT"):
             order = execute_trade(data, direction, analysis_type)
@@ -363,8 +425,10 @@ def kill_switch():
     data = request.get_json(force=True)
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
+
     action = data.get("action", "activate")
     reason = data.get("reason", "Manual override")
+
     if action == "activate":
         session["kill_switch_active"] = True
         session["kill_switch_reason"] = reason
@@ -380,6 +444,7 @@ def log_loss():
     data = request.get_json(force=True)
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
+
     reset_session_if_new_day()
     session["consecutive_losses"] += 1
     if session["consecutive_losses"] >= 2:
@@ -387,6 +452,7 @@ def log_loss():
         msg = "🚨 TWO CONSECUTIVE LOSSES — System shutting down for the day. Capital protection mode active. See you tomorrow. @everyone"
         post_discord(CHANNEL_RECAPS, msg)
         return jsonify({"status": "circuit_breaker_triggered"}), 200
+
     return jsonify({"status": "loss_logged", "consecutive": session["consecutive_losses"]}), 200
 
 @app.route("/win", methods=["POST"])
@@ -394,6 +460,7 @@ def log_win():
     data = request.get_json(force=True)
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
+
     reset_session_if_new_day()
     session["consecutive_losses"] = 0
     return jsonify({"status": "win_logged"}), 200
@@ -416,6 +483,8 @@ def health():
     return jsonify({
         "status": "online",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
+        "day_of_week": now_et.strftime("%A"),
+        "is_friday_no_trade": is_friday(),
         "in_day_trade_window": in_day_trade_window(),
         "in_swing_window": in_swing_window(),
         "paper_trading": PAPER_TRADING,
@@ -446,16 +515,16 @@ def zones():
 
 @app.route("/zones/refresh", methods=["POST"])
 def refresh_zones():
-    """Manually trigger an immediate zone recalculation (also runs automatically every morning)."""
+    """Manually trigger an immediate zone recalculation."""
     data = request.get_json(force=True, silent=True) or {}
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
     results = volume_profile.update_all_zones(list(SWING_TICKERS))
     return jsonify({"status": "refreshed", "results": results}), 200
 
-# ── DAILY ZONE SCHEDULER (runs automatically, no manual input required) ───────
+# ── DAILY ZONE SCHEDULER ───────────────────────────────────────────────────────
 _scheduler_started = False
-_scheduler_lock = threading.Lock()
+_scheduler_lock    = threading.Lock()
 
 # ── AUTOMATED JOB 1: Daily Watchlist ─────────────────────────────────────────
 def fetch_premarket_data(ticker: str) -> dict:
@@ -464,11 +533,15 @@ def fetch_premarket_data(ticker: str) -> dict:
 
 def post_daily_watchlist():
     """Generate and post the morning watchlist to #daily-watchlist."""
+    # Never post on Friday or weekends
+    if is_friday() or is_weekend():
+        log.info("Friday/weekend — watchlist suppressed")
+        return
+
     log.info("📋 Generating daily watchlist...")
-    zones   = volume_profile.get_all_zones()
+    zones  = volume_profile.get_all_zones()
     tickers = list(DAY_TRADE_TICKERS)
 
-    # Fetch premarket data for all tickers
     market_data = []
     for t in tickers:
         data = fetch_premarket_data(t)
@@ -483,7 +556,6 @@ def post_daily_watchlist():
         log.warning("No pre-market data available for watchlist")
         return
 
-    # Ask Claude to write the watchlist in Junior's voice
     prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — pre-market. You are Junior from The Portfolio Plug.
 
 Write the daily morning watchlist post for #daily-watchlist on Discord. Use your real voice — direct, confident, educational.
@@ -514,25 +586,22 @@ Keep it tight — members read this on their phone before market open. No fluff.
     except Exception as e:
         log.error(f"Watchlist generation error: {e}", exc_info=True)
 
-
-# ── AUTOMATED JOB 2: Pattern Scanner (every 5 min during trade window) ────────
-_pattern_scan_cooldown = {}  # ticker -> last signal time, prevents spam
+# ── AUTOMATED JOB 2: Pattern Scanner ─────────────────────────────────────────
+_pattern_scan_cooldown = {}
 
 def scan_for_visual_patterns():
-    """
-    Fetches recent candle data for all tickers and asks Claude to identify
-    confluence setups forming — EMA approaches, pivot proximity, flag patterns,
-    divergence conditions. Posts valid setups to day-trade-signals as WATCHLIST alerts.
-    """
+    """Scan for confluence setups — only runs on trading days (not Fri/weekend)."""
+    if is_friday() or is_weekend():
+        return
+
     now_et = datetime.now(ET)
     if not (dtime(9, 25) <= now_et.time() <= dtime(10, 30)):
-        return  # Only scan during the trade window
+        return
 
     log.info("🔍 Running pattern scan...")
     zones = volume_profile.get_all_zones()
 
     for ticker in DAY_TRADE_TICKERS:
-        # Cooldown: don't re-scan same ticker within 10 minutes
         last = _pattern_scan_cooldown.get(ticker)
         if last and (now_et - last).total_seconds() < 600:
             continue
@@ -543,6 +612,7 @@ def scan_for_visual_patterns():
                 continue
 
             zone_data = zones.get(ticker, {})
+
             prompt = f"""You are Junior's AI trading system. Analyze this 1-minute candle data for {ticker} and determine if any high-probability setup from the 3-Screen Confluence System is currently forming or has just triggered.
 
 LAST 30 CANDLES (most recent last):
@@ -555,11 +625,11 @@ VOLUME PROFILE ZONES:
 Current time: {now_et.strftime('%I:%M %p ET')}
 
 Check for:
-1. Price approaching or bouncing off 8 EMA or 21 EMA (calculate approximate EMAs from the candle data)
-2. Price near a Volume Profile demand or supply zone listed above
+1. Price approaching or bouncing off 8 EMA or 21 EMA
+2. Price near a Volume Profile demand or supply zone
 3. Flag/consolidation pattern forming after a strong move
-4. RSI divergence conditions (price making lower lows while momentum improving, or vice versa)
-5. PMH/PML proximity (highest high and lowest low of the first 15 candles = premarket levels)
+4. RSI divergence conditions
+5. PMH/PML proximity
 
 Respond with EXACTLY one of:
 - "NO_SETUP: [brief reason]" if nothing significant is forming
@@ -584,25 +654,26 @@ Be conservative. Only flag genuinely high-probability developing setups, not noi
         except Exception as e:
             log.error(f"Pattern scan error for {ticker}: {e}")
 
-
 # ── AUTOMATED JOB 3: End-of-Day Recap ────────────────────────────────────────
 def post_eod_recap():
-    """Generate and post an end-of-day recap to #profits-and-recaps."""
+    """Generate and post an end-of-day recap. Suppressed on Friday/weekends."""
+    if is_friday() or is_weekend():
+        log.info("Friday/weekend — EOD recap suppressed")
+        return
+
     log.info("📊 Generating end-of-day recap...")
 
-    # Pull positions and balance from Tastytrade
-    positions = []
-    balance   = {}
+    positions_data = []
+    balance = {}
     try:
-        positions = get_positions()
-        balance   = get_account_balance()
+        positions_data = get_positions()
+        balance        = get_account_balance()
     except Exception as e:
         log.error(f"Could not fetch Tastytrade data for recap: {e}")
 
-    # Pull today's session stats
-    trade_count       = session.get("trade_count", 0)
-    consecutive_loss  = session.get("consecutive_losses", 0)
-    circuit_breaker   = session.get("circuit_breaker", False)
+    trade_count      = session.get("trade_count", 0)
+    consecutive_loss = session.get("consecutive_losses", 0)
+    circuit_breaker  = session.get("circuit_breaker", False)
 
     prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — market just closed. You are Junior from The Portfolio Plug.
 
@@ -612,21 +683,21 @@ TODAY'S SESSION STATS:
 - Trades taken: {trade_count}
 - Consecutive losses at close: {consecutive_loss}
 - Circuit breaker triggered today: {circuit_breaker}
-- Open positions: {len(positions)}
+- Open positions: {len(positions_data)}
 - Account balance data: {json.dumps(balance, indent=2) if balance else 'Not available'}
 
 OPEN POSITIONS:
-{json.dumps(positions, indent=2) if positions else 'None — flat going into tomorrow'}
+{json.dumps(positions_data, indent=2) if positions_data else 'None — flat going into tomorrow'}
 
 Your recap must include:
 1. One honest sentence about how today went overall
 2. If trades were taken: what the setup was, what worked or didn't
-3. If no trades: why the system stayed in cash (dead zone, no confirmation, etc.) — frame it as discipline, not failure
+3. If no trades: why the system stayed in cash — frame it as discipline, not failure
 4. Open positions if any: what you're holding and why
 5. What to watch for tomorrow (1-2 things)
 6. A closing line for the community
 
-Keep it under 300 words. No fluff — members respect honesty over hype."""
+Keep it under 300 words. No fluff."""
 
     try:
         resp = anthropic.messages.create(
@@ -640,50 +711,40 @@ Keep it under 300 words. No fluff — members respect honesty over hype."""
     except Exception as e:
         log.error(f"EOD recap generation error: {e}", exc_info=True)
 
-
 # ── MASTER SCHEDULER LOOP ─────────────────────────────────────────────────────
 def zone_scheduler_loop():
     """
     Master background thread handling ALL automated daily jobs:
     1. Volume Profile zone calculation (8:00 AM ET daily)
-    2. Daily watchlist post (8:30 AM ET daily)
-    3. Pattern scanner (every 5 min, 9:25-10:30 AM ET)
-    4. End-of-day recap (4:01 PM ET daily)
+    2. Daily watchlist post (9:15 AM ET, weekdays excluding Friday)
+    3. Pattern scanner (every 5 min, 9:25-10:30 AM ET, weekdays excluding Friday)
+    4. End-of-day recap (4:01 PM ET, weekdays excluding Friday)
     """
     SCHEDULER_STATE_FILE = "/tmp/tpp_scheduler_state.json"
-    ZONE_FILE = "/tmp/tpp_zones.json"
-    RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
-    RENDER_SERVICE_ID = "srv-d91fh10k1i2s73arkh20"
+    ZONE_FILE            = "/tmp/tpp_zones.json"
+    RENDER_API_KEY       = os.environ.get("RENDER_API_KEY", "")
+    RENDER_SERVICE_ID    = "srv-d91fh10k1i2s73arkh20"
 
     def load_scheduler_state() -> dict:
-        """Load state — tries Render env vars first (survive deploys), then local file."""
-        # Primary: read from environment variables set by Render API
         state = {}
-        zone_date = os.environ.get("SCHEDULER_ZONE_DATE")
+        zone_date      = os.environ.get("SCHEDULER_ZONE_DATE")
         watchlist_date = os.environ.get("SCHEDULER_WATCHLIST_DATE")
-        recap_date = os.environ.get("SCHEDULER_RECAP_DATE")
-        if zone_date:
-            state["zone_date"] = zone_date
-        if watchlist_date:
-            state["watchlist_date"] = watchlist_date
-        if recap_date:
-            state["recap_date"] = recap_date
+        recap_date     = os.environ.get("SCHEDULER_RECAP_DATE")
+        if zone_date:      state["zone_date"]      = zone_date
+        if watchlist_date: state["watchlist_date"] = watchlist_date
+        if recap_date:     state["recap_date"]     = recap_date
         if state:
             log.info(f"📅 Loaded scheduler state from env vars: {state}")
             return state
-
-        # Fallback: local file (works between restarts within same deploy)
         try:
             if os.path.exists(SCHEDULER_STATE_FILE):
                 with open(SCHEDULER_STATE_FILE, "r") as f:
                     data = json.load(f)
-                    if data:
-                        log.info(f"📅 Loaded scheduler state from file: {data}")
-                        return data
+                if data:
+                    log.info(f"📅 Loaded scheduler state from file: {data}")
+                    return data
         except Exception:
             pass
-
-        # Last fallback: check zone file update dates
         try:
             if os.path.exists(ZONE_FILE):
                 with open(ZONE_FILE, "r") as f:
@@ -702,25 +763,21 @@ def zone_scheduler_loop():
         return {}
 
     def save_scheduler_state(state: dict):
-        """Save state to local file AND push to Render env vars for deploy persistence."""
-        # Always save locally first (fast)
         try:
             with open(SCHEDULER_STATE_FILE, "w") as f:
                 json.dump(state, f)
         except Exception as e:
             log.error(f"Failed to save scheduler state locally: {e}")
 
-        # Push to Render API (survives deploys)
         if RENDER_API_KEY:
             try:
                 env_vars = []
                 if state.get("zone_date"):
-                    env_vars.append({"key": "SCHEDULER_ZONE_DATE", "value": state["zone_date"]})
+                    env_vars.append({"key": "SCHEDULER_ZONE_DATE",      "value": state["zone_date"]})
                 if state.get("watchlist_date"):
                     env_vars.append({"key": "SCHEDULER_WATCHLIST_DATE", "value": state["watchlist_date"]})
                 if state.get("recap_date"):
-                    env_vars.append({"key": "SCHEDULER_RECAP_DATE", "value": state["recap_date"]})
-
+                    env_vars.append({"key": "SCHEDULER_RECAP_DATE",     "value": state["recap_date"]})
                 if env_vars:
                     resp = requests.put(
                         f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
@@ -731,11 +788,10 @@ def zone_scheduler_loop():
                     if resp.status_code == 200:
                         log.info(f"✅ Scheduler state persisted to Render env vars: {state}")
                     else:
-                        log.warning(f"⚠️ Render API state save failed: {resp.status_code} — using local file only")
+                        log.warning(f"⚠️ Render API state save failed: {resp.status_code}")
             except Exception as e:
                 log.error(f"Render API state save error: {e}")
 
-        # Also embed in zones file as tertiary backup
         try:
             if os.path.exists(ZONE_FILE):
                 with open(ZONE_FILE, "r") as f:
@@ -746,30 +802,24 @@ def zone_scheduler_loop():
         except Exception:
             pass
 
-    # Load persisted state so restarts/redeploys don't re-fire jobs already done today
     _state = load_scheduler_state()
-    today_str = datetime.now(ET).date().isoformat()
-
-    last_zone_date      = datetime.fromisoformat(_state["zone_date"]).date() if _state.get("zone_date") else None
+    last_zone_date      = datetime.fromisoformat(_state["zone_date"]).date()      if _state.get("zone_date")      else None
     last_watchlist_date = datetime.fromisoformat(_state["watchlist_date"]).date() if _state.get("watchlist_date") else None
-    last_recap_date     = datetime.fromisoformat(_state["recap_date"]).date() if _state.get("recap_date") else None
+    last_recap_date     = datetime.fromisoformat(_state["recap_date"]).date()     if _state.get("recap_date")     else None
 
     log.info(f"📅 Scheduler state loaded — zones: {last_zone_date}, watchlist: {last_watchlist_date}, recap: {last_recap_date}")
 
-    # Start Alpaca real-time stream first — backfills history then opens WebSocket
-    # Backfill runs in background — does NOT block server startup
     try:
         alpaca_stream.start()
         log.info("✅ Alpaca real-time stream started — backfill running in background")
-        # Brief pause to let connection establish
         time_module.sleep(3)
     except Exception as e:
         log.error(f"Alpaca stream start failed: {e}", exc_info=True)
 
-    # Run zone calculation on startup ONLY if no fresh zone data exists on disk
+    # Run zone calculation on startup only if no fresh zone data exists
     try:
         existing_zones = volume_profile.get_all_zones()
-        now_et_boot = datetime.now(ET)
+        now_et_boot    = datetime.now(ET)
         zones_are_fresh = False
         if existing_zones:
             for ticker_data in existing_zones.values():
@@ -782,12 +832,11 @@ def zone_scheduler_loop():
                             break
                     except Exception:
                         pass
-
         if zones_are_fresh:
-            log.info("✅ Zone data from today already exists on disk — skipping startup recalculation")
+            log.info("✅ Zone data from today already exists — skipping startup recalculation")
             last_zone_date = now_et_boot.date()
         else:
-            log.info("🔄 No fresh zones found — will calculate at 8:00 AM ET or next scheduled window")
+            log.info("🔄 No fresh zones found — will calculate at 8:00 AM ET")
     except Exception as e:
         log.error(f"Zone startup check failed: {e}", exc_info=True)
 
@@ -797,39 +846,48 @@ def zone_scheduler_loop():
             today  = now_et.date()
             t      = now_et.time()
 
-            # Skip market-facing jobs on weekends (Sat=5, Sun=6)
-            is_weekend = now_et.weekday() >= 5
+            # Skip market-facing jobs on weekends AND Fridays
+            no_trade_day = is_weekend() or is_friday()
 
-            # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only)
-            # Fire window: 8:00–8:30 AM only (not triggered by late restarts)
-            if not is_weekend and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
+            # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only, including Friday for zone data)
+            if not is_weekend() and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
                 log.info("🔄 Running daily Volume Profile zone calculation...")
                 volume_profile.update_all_zones(list(SWING_TICKERS))
                 last_zone_date = today
-                save_scheduler_state({"zone_date": today.isoformat(), "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": last_recap_date.isoformat() if last_recap_date else None})
+                save_scheduler_state({
+                    "zone_date":      today.isoformat(),
+                    "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None,
+                    "recap_date":     last_recap_date.isoformat()     if last_recap_date     else None,
+                })
                 log.info("✅ Daily Volume Profile zones updated automatically.")
 
-            # JOB 2: Daily watchlist — 9:15 AM ET (weekdays only)
-            # Fire window: 9:15–9:45 AM only
-            if not is_weekend and dtime(9, 15) <= t <= dtime(9, 45) and today != last_watchlist_date:
+            # JOB 2: Daily watchlist — 9:15 AM ET (weekdays, NOT Friday)
+            if not no_trade_day and dtime(9, 15) <= t <= dtime(9, 45) and today != last_watchlist_date:
                 post_daily_watchlist()
                 last_watchlist_date = today
-                save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": today.isoformat(), "recap_date": last_recap_date.isoformat() if last_recap_date else None})
+                save_scheduler_state({
+                    "zone_date":      last_zone_date.isoformat()      if last_zone_date      else None,
+                    "watchlist_date": today.isoformat(),
+                    "recap_date":     last_recap_date.isoformat()     if last_recap_date     else None,
+                })
 
-            # JOB 3: Pattern scanner — every loop tick during trade window (weekdays only)
-            if not is_weekend and dtime(9, 25) <= t <= dtime(10, 30):
+            # JOB 3: Pattern scanner — every loop tick during trade window (weekdays, NOT Friday)
+            if not no_trade_day and dtime(9, 25) <= t <= dtime(10, 30):
                 candles_ready = sum(1 for tk in DAY_TRADE_TICKERS if len(alpaca_stream.get_candles(tk, limit=101)) > 100)
-                if candles_ready >= len(DAY_TRADE_TICKERS) // 2:  # at least half ready
+                if candles_ready >= len(DAY_TRADE_TICKERS) // 2:
                     scan_for_visual_patterns()
                 else:
                     log.info(f"⏳ Pattern scanner skipped — only {candles_ready}/{len(DAY_TRADE_TICKERS)} tickers ready")
 
-            # JOB 4: End-of-day recap — 4:01 PM ET (weekdays only)
-            # Fire window: 4:01–4:30 PM only — prevents restarts after hours re-firing
-            if not is_weekend and dtime(16, 1) <= t <= dtime(16, 30) and today != last_recap_date:
+            # JOB 4: End-of-day recap — 4:01 PM ET (weekdays, NOT Friday)
+            if not no_trade_day and dtime(16, 1) <= t <= dtime(16, 30) and today != last_recap_date:
                 post_eod_recap()
                 last_recap_date = today
-                save_scheduler_state({"zone_date": last_zone_date.isoformat() if last_zone_date else None, "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None, "recap_date": today.isoformat()})
+                save_scheduler_state({
+                    "zone_date":      last_zone_date.isoformat()      if last_zone_date      else None,
+                    "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None,
+                    "recap_date":     today.isoformat(),
+                })
 
         except Exception as e:
             log.error(f"Master scheduler error: {e}", exc_info=True)
@@ -837,11 +895,6 @@ def zone_scheduler_loop():
         time_module.sleep(300)  # check every 5 minutes
 
 def ensure_scheduler_started():
-    """
-    Idempotent scheduler starter — guaranteed to run exactly once, inside the
-    actual gunicorn worker process that's serving requests (not at module import
-    time, which can run in a transient pre-fork process gunicorn discards).
-    """
     global _scheduler_started
     with _scheduler_lock:
         if not _scheduler_started:
@@ -852,12 +905,9 @@ def ensure_scheduler_started():
 
 @app.before_request
 def _start_scheduler_on_first_request():
-    """Guarantees the scheduler thread is running in the actual serving process."""
     if not _scheduler_started:
         ensure_scheduler_started()
 
-# Also attempt immediate start for cases where gunicorn doesn't go through before_request
-# (e.g. direct `python main.py` runs) — ensure_scheduler_started() is idempotent and safe to call twice
 ensure_scheduler_started()
 
 if __name__ == "__main__":
