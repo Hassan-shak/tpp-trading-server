@@ -1,8 +1,6 @@
 """
 The Portfolio Plug — Alpaca Paper Trading Executor
-Executes paper trades via Alpaca's REST API using the same API keys
-already configured for market data. Falls back to this when Tastytrade
-paper trading account has no funds.
+Executes paper trades via Alpaca's REST API.
 """
 
 import os
@@ -15,14 +13,15 @@ log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "")
-ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
+# Support both env var naming conventions
+ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_PAPER_URL  = "https://paper-api.alpaca.markets/v2"
 
 def _headers():
     return {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-KEY-ID":     ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
-        "Content-Type": "application/json",
+        "Content-Type":        "application/json",
     }
 
 def get_account() -> dict:
@@ -37,23 +36,33 @@ def get_account() -> dict:
         log.error(f"Alpaca account error: {e}")
         return {}
 
+def _next_valid_expiry() -> str:
+    """
+    Return the nearest upcoming Friday expiration that is at least 1 day away.
+    Skips same-day Friday (options expire worthless intraday risk).
+    Always returns a future Friday even on weekends or holidays.
+    """
+    today = datetime.now(ET).date()
+    days_until_friday = (4 - today.weekday()) % 7
+    # If today IS Friday or days_until = 0, jump to next week
+    if days_until_friday == 0:
+        days_until_friday = 7
+    expiry = today + timedelta(days=days_until_friday)
+    return expiry.strftime("%Y-%m-%d")
+
 def find_option_contract(ticker: str, direction: str, current_price: float) -> dict | None:
     """
     Find the best options contract matching playbook rules:
-    - Weekly expiration
+    - Weekly expiration (next Friday)
     - OTM but liquid
-    - Price $0.75-$1.50
+    - Price $0.75–$1.50
     - Spread < 5%
     """
     try:
-        # Get next Friday expiration
-        today = datetime.now(ET)
-        days_until_friday = (4 - today.weekday()) % 7
-        if days_until_friday == 0:
-            days_until_friday = 7
-        expiry = (today + timedelta(days=days_until_friday)).strftime("%Y-%m-%d")
+        expiry       = _next_valid_expiry()
+        option_type  = "call" if direction == "CALL" else "put"
 
-        option_type = "call" if direction == "CALL" else "put"
+        log.info(f"🔍 Searching Alpaca options: {ticker} {option_type} expiry={expiry} price={current_price}")
 
         # Get options chain
         resp = requests.get(
@@ -61,9 +70,9 @@ def find_option_contract(ticker: str, direction: str, current_price: float) -> d
             headers=_headers(),
             params={
                 "underlying_symbols": ticker,
-                "expiration_date": expiry,
-                "type": option_type,
-                "limit": 50,
+                "expiration_date":    expiry,
+                "type":               option_type,
+                "limit":              50,
             },
             timeout=10
         )
@@ -77,10 +86,12 @@ def find_option_contract(ticker: str, direction: str, current_price: float) -> d
             log.warning(f"No Alpaca options contracts found for {ticker} {expiry} {option_type}")
             return None
 
-        # Filter for OTM contracts in price range
+        log.info(f"Found {len(contracts)} raw contracts for {ticker}, filtering...")
+
         best = None
         for contract in contracts:
             strike = float(contract.get("strike_price", 0))
+
             # OTM check
             if option_type == "call" and strike <= current_price:
                 continue
@@ -88,22 +99,21 @@ def find_option_contract(ticker: str, direction: str, current_price: float) -> d
                 continue
 
             # Check bid/ask via snapshot
-            symbol = contract.get("symbol")
+            symbol    = contract.get("symbol")
             snap_resp = requests.get(
                 f"https://data.alpaca.markets/v1beta1/options/snapshots/{symbol}",
                 headers=_headers(),
                 timeout=5
             )
+
             if snap_resp.status_code != 200:
                 continue
 
-            snap = snap_resp.json().get("snapshots", {}).get(symbol, {})
-            greeks = snap.get("greeks", {})
+            snap  = snap_resp.json().get("snapshots", {}).get(symbol, {})
             quote = snap.get("latestQuote", {})
-
-            bid = float(quote.get("bp", 0))
-            ask = float(quote.get("ap", 0))
-            mid = (bid + ask) / 2
+            bid   = float(quote.get("bp", 0))
+            ask   = float(quote.get("ap", 0))
+            mid   = (bid + ask) / 2
 
             if mid < 0.75 or mid > 1.50:
                 continue
@@ -112,22 +122,23 @@ def find_option_contract(ticker: str, direction: str, current_price: float) -> d
             if spread_pct > 5:
                 continue
 
+            # Pick contract closest to $1.10 mid (sweet spot)
             if best is None or abs(mid - 1.10) < abs(float(best.get("mid", 0)) - 1.10):
                 best = {
-                    "symbol": symbol,
-                    "strike": strike,
-                    "expiry": expiry,
-                    "type": option_type,
-                    "bid": bid,
-                    "ask": ask,
-                    "mid": round(mid, 2),
+                    "symbol":     symbol,
+                    "strike":     strike,
+                    "expiry":     expiry,
+                    "type":       option_type,
+                    "bid":        bid,
+                    "ask":        ask,
+                    "mid":        round(mid, 2),
                     "spread_pct": round(spread_pct, 2),
                 }
 
         if best:
-            log.info(f"✅ Alpaca contract found: {best}")
+            log.info(f"✅ Alpaca contract selected: {best}")
         else:
-            log.warning(f"No suitable Alpaca contract found for {ticker}")
+            log.warning(f"No contract passed filters for {ticker} {option_type} — no trade placed")
 
         return best
 
@@ -139,10 +150,10 @@ def place_order(contract: dict, quantity: int = 1) -> dict | None:
     """Place a paper options order on Alpaca."""
     try:
         order_data = {
-            "symbol": contract["symbol"],
-            "qty": quantity,
-            "side": "buy",
-            "type": "limit",
+            "symbol":      contract["symbol"],
+            "qty":         quantity,
+            "side":        "buy",
+            "type":        "limit",
             "limit_price": str(contract["ask"]),
             "time_in_force": "day",
         }
@@ -178,10 +189,17 @@ def get_positions() -> list:
         return []
 
 def is_available() -> bool:
-    """Check if Alpaca paper trading is accessible."""
+    """Check if Alpaca paper trading is configured and accessible."""
+    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+        log.warning("Alpaca credentials missing — ALPACA_API_KEY or ALPACA_API_SECRET/ALPACA_SECRET_KEY not set")
+        return False
     try:
-        account = get_account()
+        account      = get_account()
         buying_power = float(account.get("buying_power", 0))
-        return buying_power > 0
+        if buying_power > 0:
+            log.info(f"✅ Alpaca available — buying power: ${buying_power:,.2f}")
+            return True
+        log.warning("Alpaca account has $0 buying power")
+        return False
     except Exception:
         return False
