@@ -18,10 +18,11 @@ from anthropic import Anthropic
 from tastytrade_executor import (
     is_authenticated, find_option_contract,
     place_order, close_position, get_positions, get_account_balance,
-    BASE_URL, PAPER_TRADING
+    wait_for_fill, BASE_URL, PAPER_TRADING
 )
 import volume_profile
 import alpaca_stream
+import position_manager
 # alpaca_executor kept for data streaming only (not execution)
 import alpaca_executor
 
@@ -78,6 +79,7 @@ def reset_session_if_new_day():
             "kill_switch_active": False,
             "kill_switch_reason": None,
         })
+        save_session_state()
         log.info(f"Session reset for {today}")
 
 # ── Day-of-week checks ────────────────────────────────────────────────────────
@@ -287,8 +289,8 @@ def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
     if session["kill_switch_active"]:
         return False, f"KILL_SWITCH: {session['kill_switch_reason']}"
 
-    if session["trade_count"] >= 3:
-        return False, "TRADE_CAP: Maximum 3 trades reached for today"
+    if session["trade_count"] >= 2:
+        return False, "TRADE_CAP: Maximum 2 trades reached for today"
 
     if in_dead_zone():
         return False, "DEAD_ZONE: No trades between 11:00 AM – 3:00 PM ET"
@@ -304,50 +306,54 @@ def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
 
 # ── Execute trade via Alpaca ──────────────────────────────────────────────────
 def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict | None:
-    """Find contract and place order via Tastytrade (paper or live based on TASTYTRADE_PAPER_TRADING env var)."""
-    ticker        = alert_data.get("ticker", "").upper()
+    """LIVE execution: MARKET entry -> confirmed fill -> broker-resting stop ->
+    hand off to position_manager exit engine. Discord signal ONLY after fill."""
+    ticker = alert_data.get("ticker", "").upper()
 
     if not is_authenticated():
         log.warning("Tastytrade not authenticated — signal posted to Discord only")
         return None
 
+    # One position at a time when unattended — never stack live risk
+    if position_manager.open_position_count() >= 1:
+        log.info("Position already open — skipping new entry (single-position rule)")
+        return None
+
     trade_type = "DAY" if analysis_type == "DAY_SIGNAL" else "SWING"
     contract   = find_option_contract(ticker, direction, trade_type)
-
     if not contract:
-        log.warning(f"No suitable Tastytrade contract found for {ticker} {direction}")
-        post_discord(CHANNEL_RECAPS,
-            f"⚠️ Signal identified for {ticker} {direction} but no contract met criteria "
-            f"($0.75-$1.50, spread <5%). No order placed.")
+        log.warning(f"No suitable contract found for {ticker} {direction}")
         return None
 
+    # MARKET order entry (playbook rule: instant fill)
     order = place_order(contract, quantity=1)
     if not order:
-        log.error("Tastytrade order placement failed")
+        log.error("Entry order rejected by Tastytrade")
         return None
 
-    mode = "PAPER" if PAPER_TRADING else "LIVE"
-    active_positions[contract["symbol"]] = {
-        "order_id":   order.get("order_id"),
-        "entry_price": contract["ask"],
-        "quantity":   1,
-        "ticker":     ticker,
-        "direction":  direction,
-        "opened_at":  datetime.now(ET).isoformat(),
-        "paper":      PAPER_TRADING,
-        "broker":     "tastytrade",
-    }
+    fill = wait_for_fill(order["order_id"], timeout_sec=60)
+    if not fill or not fill.get("fill_price"):
+        log.error("Entry not filled within 60s — cancelled, no position (fail closed)")
+        return None
 
-    fill_msg = (
-        f"📋 {'PAPER' if PAPER_TRADING else '🔴 LIVE'} TRADE @everyone\n"
-        f"Filled at ${contract['ask']:.2f}\n"
-        f"Contract: {contract['symbol']}\n"
-        f"Strike: {contract['strike']} | Expiry: {contract['expiry']}\n"
-        f"Spread: {contract['spread_pct']}% | Mode: {mode}"
-    )
-    post_discord(CHANNEL_RECAPS, fill_msg)
-    log.info(f"✅ Tastytrade {mode} trade executed: {contract['symbol']} @ {contract['ask']}")
-    return order
+    entry_price = fill["fill_price"]
+
+    # Protective stop + monitoring BEFORE we announce anything
+    position_manager.register(contract["symbol"], ticker, direction, entry_price, 1, trade_type)
+
+    session["trade_count"] += 1
+    save_session_state()
+
+    # Exact playbook signal format, only after a confirmed fill
+    expiry_dt = datetime.fromisoformat(contract["expiry"])
+    signal = (f"Buying {ticker} {expiry_dt.strftime('%B %-d').upper()} "
+              f"${contract['strike']:g} {direction} @ {entry_price:.2f} @everyone")
+    channel = CHANNEL_DAY_SIGNALS if trade_type == "DAY" else CHANNEL_SWING_SIGNALS
+    post_discord(channel, signal)
+
+    mode = "PAPER" if PAPER_TRADING else "LIVE"
+    log.info(f"✅ {mode} trade filled & protected: {contract['symbol']} @ {entry_price}")
+    return {"order_id": order["order_id"], "fill_price": entry_price, "symbol": contract["symbol"]}
 
 # ── MAIN WEBHOOK ENDPOINT ─────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
@@ -418,78 +424,57 @@ def webhook():
     post_discord(channel_id, claude_response)
     return jsonify({"status": "posted"}), 200
 
-# ── TEST TRADE (TEMPORARY — disable by removing TEST_MODE env var on Render) ──
-@app.route("/test-trade", methods=["POST"])
-def test_trade():
-    """
-    Bypasses ALL time and session gates for end-to-end pipeline testing.
-    Only active when TEST_MODE=true is set in Render environment variables.
-    To permanently disable: delete TEST_MODE from Render env vars.
-    """
-    if os.environ.get("TEST_MODE", "").lower() != "true":
-        return jsonify({"error": "Test mode not enabled"}), 403
+# ── SESSION PERSISTENCE (survives Render restarts) ───────────────────────────
+SESSION_FILE = "/tmp/tpp_session.json"
 
-    data = request.get_json(force=True)
-    if not data:
-        return jsonify({"error": "Empty payload"}), 400
+def save_session_state():
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump({**session, "date": str(session["date"])}, f)
+    except Exception as e:
+        log.error(f"Session save failed: {e}")
 
+def load_session_state():
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE) as f:
+                data = json.load(f)
+            if data.get("date") == str(datetime.now(ET).date()):
+                session.update({k: v for k, v in data.items() if k != "date"})
+                session["date"] = datetime.now(ET).date()
+                log.info(f"📂 Session state restored: trades={session['trade_count']} losses={session['consecutive_losses']} breaker={session['circuit_breaker']}")
+    except Exception as e:
+        log.error(f"Session load failed: {e}")
+
+# ── AUTO WIN/LOSS (fed by exit engine — no manual endpoints needed) ──────────
+def record_win(symbol: str):
+    reset_session_if_new_day()
+    session["consecutive_losses"] = 0
+    save_session_state()
+
+def record_loss(symbol: str):
+    reset_session_if_new_day()
+    session["consecutive_losses"] += 1
+    save_session_state()
+    if session["consecutive_losses"] >= 2 and not session["circuit_breaker"]:
+        session["circuit_breaker"] = True
+        save_session_state()
+        post_discord(CHANNEL_RECAPS,
+            "Two stops hit back to back — that's the market telling us to sit out. "
+            "Shutting it down for the day to protect capital. Hands in our pockets, back tomorrow. @everyone")
+
+# ── EMERGENCY FLATTEN (hit this from your phone) ─────────────────────────────
+@app.route("/flatten", methods=["POST"])
+def flatten():
+    data = request.get_json(force=True, silent=True) or {}
     if not hmac.compare_digest(data.get("secret", ""), WEBHOOK_SECRET):
         return jsonify({"error": "Unauthorized"}), 401
-
-    log.info(f"🧪 TEST TRADE triggered: {json.dumps(data)}")
-
-    # Default to a safe SPY CALL if no data provided
-    test_payload = {
-        "ticker": data.get("ticker", "SPY"),
-        "price": data.get("price", 750.00),
-        "volume": data.get("volume", 50000),
-        "high": data.get("high", 751.00),
-        "low": data.get("low", 749.50),
-        "time": datetime.now(ET).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "interval": "1",
-        "alert_type": data.get("alert_type", "EMA8_CROSS_UP"),
-        "direction": data.get("direction", "CALL"),
-        "secret": WEBHOOK_SECRET,
-    }
-
-    # Run through Claude analysis (real AI decision, just no time gate)
-    try:
-        claude_response = analyze_with_claude(test_payload, "DAY_SIGNAL")
-        log.info(f"🧪 Claude test response: {claude_response[:300]}")
-    except Exception as e:
-        log.error(f"Claude error in test: {e}")
-        return jsonify({"error": f"Claude failed: {str(e)}"}), 500
-
-    first_line      = claude_response.split("\n")[0].strip().upper()
-    discord_message = "\n".join(claude_response.split("\n")[1:]).strip()
-
-    # Force TRADE_VALID if Claude says NO_TRADE (test mode override)
-    force_trade = data.get("force", False)
-    if force_trade or first_line.startswith("TRADE_VALID"):
-        direction = test_payload["direction"]
-        order = execute_trade(test_payload, direction, "DAY_SIGNAL")
-        if order:
-            return jsonify({
-                "status": "test_trade_executed",
-                "claude_decision": first_line,
-                "order": order,
-                "discord_message": discord_message,
-            }), 200
-        else:
-            return jsonify({
-                "status": "test_signal_only",
-                "claude_decision": first_line,
-                "note": "Claude approved but Tastytrade execution failed — check tastytrade_executor logs",
-                "discord_message": discord_message,
-            }), 200
-
-    return jsonify({
-        "status": "test_no_trade",
-        "claude_decision": first_line,
-        "reason": discord_message[:200],
-        "tip": "Add 'force': true to the payload to bypass Claude and force an Alpaca order",
-    }), 200
-
+    session["kill_switch_active"] = True
+    session["kill_switch_reason"] = "Manual flatten"
+    save_session_state()
+    results = position_manager.flatten_all()
+    log.info(f"🧯 FLATTEN executed: {results}")
+    return jsonify({"status": "flattened", **results, "kill_switch": True}), 200
 
 # ── KILL SWITCH ───────────────────────────────────────────────────────────────
 @app.route("/kill", methods=["POST"])
@@ -542,6 +527,7 @@ def log_win():
 def positions():
     return jsonify({
         "active_positions": active_positions,
+        "managed_positions": position_manager.open_position_count(),
         "tastytrade_positions": get_positions(),
         "account_balance": get_account_balance(),
         "paper_trading": PAPER_TRADING,
@@ -980,6 +966,14 @@ def _start_scheduler_on_first_request():
     if not _scheduler_started:
         ensure_scheduler_started()
 
+position_manager.configure(
+    post_discord=post_discord,
+    channels={"day_signals": CHANNEL_DAY_SIGNALS, "swing_signals": CHANNEL_SWING_SIGNALS, "recaps": CHANNEL_RECAPS},
+    on_win=record_win,
+    on_loss=record_loss,
+)
+load_session_state()
+position_manager.start()
 ensure_scheduler_started()
 
 if __name__ == "__main__":
