@@ -108,6 +108,83 @@ def in_dead_zone() -> bool:
     now = datetime.now(ET).time()
     return dtime(11, 0) < now < dtime(15, 0)
 
+# ── BUILT-IN 2026 ECONOMIC CALENDAR (verified against Fed official schedule) ──
+# FOMC rate decisions: 2:00 PM ET — Kill Switch 2: FULL session halt
+FOMC_DECISION_DATES = {"2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"}
+# FOMC minutes: 2:00 PM ET, 3 weeks after each decision — blocks the 3-4 PM swing window
+FOMC_MINUTES_DATES  = {"2026-07-08", "2026-08-19", "2026-10-07", "2026-11-18", "2026-12-30"}
+US_MARKET_HOLIDAYS  = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+                       "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25"}
+
+def _nth_business_day(year: int, month: int, n: int):
+    """Nth business day of a month, skipping weekends and US market holidays."""
+    from datetime import date, timedelta
+    d, count = date(year, month, 1), 0
+    while True:
+        if d.weekday() < 5 and d.isoformat() not in US_MARKET_HOLIDAYS:
+            count += 1
+            if count == n:
+                return d
+        d += timedelta(days=1)
+
+def todays_scheduled_events() -> list:
+    """High-impact events scheduled for today, computed — never goes stale."""
+    now = datetime.now(ET)
+    today_iso = now.date().isoformat()
+    events = []
+    if today_iso in FOMC_DECISION_DATES:
+        events.append(("FOMC_RATE_DECISION", "full-day"))
+    if today_iso in FOMC_MINUTES_DATES:
+        events.append(("FOMC_MINUTES_2PM", "13:45-16:00"))
+    if now.date() == _nth_business_day(now.year, now.month, 1):
+        events.append(("ISM_MANUFACTURING_10AM", "09:45-10:15"))
+    if now.date() == _nth_business_day(now.year, now.month, 3):
+        events.append(("ISM_SERVICES_10AM", "09:45-10:15"))
+    return events
+
+def is_fomc_decision_day() -> bool:
+    return datetime.now(ET).date().isoformat() in FOMC_DECISION_DATES
+
+def in_report_blackout() -> bool:
+    """Code-enforced economic report blackouts (Kill Switch 1).
+    Env var REPORT_BLACKOUTS, comma-separated windows:
+      "2026-07-06:09:45-10:15"  -> applies only on that date
+      "09:45-10:15"             -> applies every trading day
+    """
+    now = datetime.now(ET)
+    # Built-in calendar first (automatic, every day, forever)
+    for _name, window in todays_scheduled_events():
+        if window == "full-day":
+            return True
+        s, e = window.split("-")
+        sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
+        if dtime(sh, sm) <= now.time() <= dtime(eh, em):
+            return True
+    # Then manual env var overrides for one-off events (Fed testimony, addresses, etc.)
+    raw = os.environ.get("REPORT_BLACKOUTS", "")
+    if not raw:
+        return False
+    today_iso = now.date().isoformat()
+    for win in raw.split(","):
+        win = win.strip()
+        if not win:
+            continue
+        try:
+            if win.count(":") == 3:                 # date-scoped
+                date_part, time_part = win.split(":", 1)
+                if date_part != today_iso:
+                    continue
+            else:
+                time_part = win
+            start_s, end_s = time_part.split("-")
+            sh, sm = map(int, start_s.split(":"))
+            eh, em = map(int, end_s.split(":"))
+            if dtime(sh, sm) <= now.time() <= dtime(eh, em):
+                return True
+        except Exception:
+            continue
+    return False
+
 # ── Discord helper ────────────────────────────────────────────────────────────
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_POSTING_ENABLED = os.environ.get("DISCORD_POSTING_ENABLED", "true").lower() == "true"
@@ -194,6 +271,8 @@ IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
 - Swing window: 3:00 PM ET – 4:00 PM ET
 - Friday is a NO-TRADING day — respond NO_TRADE for all signals.
 - Weekend (Sat/Sun) — respond NO_TRADE.
+- ECONOMIC REPORT BLACKOUTS are enforced by code before you ever see an alert;
+  if you receive an alert, no blackout is active. Do not invent report-based rejections.
 - The 10 AM LOCKOUT in the playbook (Rule 6) means: if NO trade has been executed
   by 10:00 AM and no A+ setup is printing, STOP scanning. It does NOT mean all
   signals after 10 AM are automatically rejected — signals between 10:00 AM and
@@ -291,6 +370,12 @@ def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
 
     if session["trade_count"] >= 2:
         return False, "TRADE_CAP: Maximum 2 trades reached for today"
+
+    if is_fomc_decision_day():
+        return False, "KILL_SWITCH_2: FOMC rate decision day — 100% cash, full trading halt"
+
+    if in_report_blackout():
+        return False, "REPORT_BLACKOUT: Economic data release window — no entries (Kill Switch 1)"
 
     if in_dead_zone():
         return False, "DEAD_ZONE: No trades between 11:00 AM – 3:00 PM ET"
@@ -544,6 +629,8 @@ def health():
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
         "in_day_trade_window": in_day_trade_window(),
+        "report_blackout_active": in_report_blackout(),
+        "todays_scheduled_events": [e[0] for e in todays_scheduled_events()],
         "in_swing_window": in_swing_window(),
         "paper_trading": PAPER_TRADING,
         "tastytrade_authenticated": is_authenticated(),
@@ -614,7 +701,8 @@ def post_daily_watchlist():
         log.warning("No pre-market data available for watchlist")
         return
 
-    prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — pre-market. You are Junior from The Portfolio Plug.
+    events_note = ", ".join(e[0].replace("_", " ").title() for e in todays_scheduled_events()) or "None"
+    prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — pre-market. You are Junior from The Portfolio Plug.\nHIGH-IMPACT EVENTS SCHEDULED TODAY: {events_note} (entries are auto-blocked around these — mention them naturally in the watchlist if any).
 
 Write the daily morning watchlist post for #daily-watchlist on Discord. Use your real voice — direct, confident, educational.
 
@@ -649,7 +737,7 @@ _pattern_scan_cooldown = {}
 
 def scan_for_visual_patterns():
     """Scan for confluence setups — only runs on trading days (not Fri/weekend)."""
-    if is_off_day():
+    if is_off_day() or in_report_blackout():
         return
 
     now_et = datetime.now(ET)
