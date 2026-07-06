@@ -361,13 +361,9 @@ def determine_analysis_type(alert_data: dict) -> str:
 def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
     reset_session_if_new_day()
 
-    # ── FRIDAY BLOCK ──────────────────────────────────────────────────────────
+    # ── OFF-DAY BLOCK (Fri/Sat/Sun) ──────────────────────────────────────────
     if is_off_day():
-        return False, "FRIDAY: No trading day — system offline"
-
-    # ── WEEKEND BLOCK ─────────────────────────────────────────────────────────
-    if is_off_day():
-        return False, "WEEKEND: Market closed"
+        return False, "OFF_DAY: Fri/Sat/Sun — no trading"
 
     ticker = alert_data.get("ticker", "").upper()
 
@@ -498,16 +494,12 @@ def webhook():
         return jsonify({"status": "watchlist_posted"}), 200
 
     if first_line.startswith("TRADE_VALID"):
-        # Post signal to Discord first
-        channel_id = route_to_channel(data.get("alert_type", ""), analysis_type)
-        post_discord(channel_id, discord_message)
-
-        # Execute via Alpaca
+        # Execute first — the confirmed-fill signal from execute_trade is the
+        # ONLY entry message the community sees (no unconfirmed announcements)
         direction = data.get("direction", "CALL")
         if direction in ("CALL", "PUT"):
             order = execute_trade(data, direction, analysis_type)
             if order:
-                session["trade_count"] += 1
                 log.info(f"Trade executed: {order}")
                 return jsonify({"status": "trade_executed", "order": order}), 200
 
@@ -634,6 +626,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
+        "code_version": "v2.1-final-2026-07-06",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
