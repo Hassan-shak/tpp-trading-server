@@ -626,7 +626,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.1-final-2026-07-06",
+        "code_version": "v2.2-pulse-2026-07-06",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -728,6 +728,59 @@ def get_scanned_blackouts() -> list:
     except Exception:
         pass
     return []
+
+# ── AUTOMATED JOB 0.5: Market Pulse (community engagement) ───────────────────
+PULSE_ENABLED            = os.environ.get("PULSE_ENABLED", "true").lower() == "true"
+PULSE_INTERVAL_MIN       = int(os.environ.get("PULSE_INTERVAL_MIN", "15"))       # active windows
+PULSE_DEADZONE_INTERVAL  = int(os.environ.get("PULSE_DEADZONE_INTERVAL", "60"))  # dead zone
+_last_pulse_at = None
+
+def post_market_pulse():
+    """Short 'we're here, market is X' post so members know the desk is live.
+    Every PULSE_INTERVAL_MIN during 9:30-11:00 & 3:00-4:00, hourly in dead zone.
+    Silent while a position is open (trade updates own the channel then)."""
+    global _last_pulse_at
+    if not PULSE_ENABLED or is_off_day():
+        return
+    now = datetime.now(ET)
+    t = now.time()
+
+    in_active = in_day_trade_window() or in_swing_window()
+    in_dz     = in_dead_zone()
+    if not (in_active or in_dz):
+        return
+    if position_manager.open_position_count() > 0:
+        return                                    # live trade updates cover the channel
+
+    interval = PULSE_INTERVAL_MIN if in_active else PULSE_DEADZONE_INTERVAL
+    if _last_pulse_at and (now - _last_pulse_at).total_seconds() < interval * 60 - 30:
+        return
+
+    # Live read on the indexes for flavor
+    spy = alpaca_stream.get_candles("SPY", limit=15)
+    qqq = alpaca_stream.get_candles("QQQ", limit=15)
+    blackout_note = " NOTE: an economic-report blackout is currently active — mention we're deliberately hands-off until it passes." if in_report_blackout() else ""
+    zone_note = "dead zone (11 AM-3 PM — no entries by rule, monitoring only)" if in_dz else ("day-trade window" if in_day_trade_window() else "swing window")
+
+    prompt = f"""You are Junior from The Portfolio Plug. Write ONE short Discord market pulse (2-3 sentences MAX, casual, confident, human — no headers, no bullet lists, no @everyone).
+
+Context: It's {now.strftime('%I:%M %p ET')}, currently in the {zone_note}. No valid A+ setup has printed since the last update.{blackout_note}
+
+RECENT SPY 1-min candles (most recent last): {json.dumps(spy[-8:]) if spy else 'unavailable'}
+RECENT QQQ 1-min candles (most recent last): {json.dumps(qqq[-8:]) if qqq else 'unavailable'}
+
+Give a quick honest read (direction/chop, one level if obvious) and remind them we only take clean setups. Vary your phrasing — never sound templated. Sign off: — Junior | The Portfolio Plug"""
+    try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        post_discord(CHANNEL_RECAPS, resp.content[0].text.strip())
+        _last_pulse_at = now
+        log.info(f"📣 Market pulse posted ({zone_note})")
+    except Exception as e:
+        log.error(f"Market pulse error: {e}")
 
 # ── AUTOMATED JOB 1: Daily Watchlist ─────────────────────────────────────────
 def fetch_premarket_data(ticker: str) -> dict:
@@ -1061,6 +1114,10 @@ def zone_scheduler_loop():
                     if os.path.exists(DAILY_BLACKOUTS_FILE) else False)
                 if not already:
                     daily_report_scan()
+
+            # JOB 0.5: Market pulse — active windows every 15 min, dead zone hourly
+            if not no_trade_day and dtime(9, 30) <= t <= dtime(16, 0):
+                post_market_pulse()
 
             # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only, including Friday for zone data)
             if not is_off_day() and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
