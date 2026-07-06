@@ -626,7 +626,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.4-final-2026-07-06",
+        "code_version": "v2.5-privacy-2026-07-06",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -769,7 +769,7 @@ Context: It's {now.strftime('%I:%M %p ET')}, currently in the {zone_note}. No va
 RECENT SPY 1-min candles (most recent last): {json.dumps(spy[-8:]) if spy else 'unavailable'}
 RECENT QQQ 1-min candles (most recent last): {json.dumps(qqq[-8:]) if qqq else 'unavailable'}
 
-Give a quick honest read (direction/chop, one level if obvious) and remind them we only take clean setups. Vary your phrasing — never sound templated. Sign off: — Junior | The Portfolio Plug"""
+Give a quick honest read (direction/chop, one level if obvious) and remind them we only take clean setups. Vary your phrasing — never sound templated. NEVER mention account balances or dollar amounts. Sign off: — Junior | The Portfolio Plug"""
     try:
         resp = anthropic.messages.create(
             model="claude-sonnet-4-6",
@@ -829,7 +829,7 @@ Your watchlist post must include:
 3. Key time to watch: 9:30-10:00 AM window
 4. A closing line reminding members of the rules (1 trade, volume confirmation, no chasing)
 
-Keep it tight — members read this on their phone before market open. No fluff."""
+Keep it tight — members read this on their phone before market open. No fluff. NEVER mention account balances or dollar amounts of the account."""
 
     try:
         resp = anthropic.messages.create(
@@ -921,10 +921,14 @@ def post_eod_recap():
     log.info("📊 Generating end-of-day recap...")
 
     positions_data = []
-    balance = {}
     try:
-        positions_data = get_positions()
-        balance        = get_account_balance()
+        raw_positions = get_positions()
+        # qualitative only — NEVER pass dollar amounts into any community-facing prompt
+        positions_data = [
+            {"underlying": p.get("underlying-symbol"), "type": p.get("instrument-type"),
+             "quantity": p.get("quantity"), "direction": p.get("quantity-direction")}
+            for p in raw_positions
+        ]
     except Exception as e:
         log.error(f"Could not fetch Tastytrade data for recap: {e}")
 
@@ -941,7 +945,8 @@ TODAY'S SESSION STATS:
 - Consecutive losses at close: {consecutive_loss}
 - Circuit breaker triggered today: {circuit_breaker}
 - Open positions: {len(positions_data)}
-- Account balance data: {json.dumps(balance, indent=2) if balance else 'Not available'}
+
+HARD RULE: NEVER mention account balances, dollar amounts of the account, buying power, or "Net Liq" in the post. Percentages on individual trades are fine; account money is never discussed.
 
 OPEN POSITIONS:
 {json.dumps(positions_data, indent=2) if positions_data else 'None — flat going into tomorrow'}

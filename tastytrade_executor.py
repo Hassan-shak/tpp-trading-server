@@ -161,7 +161,7 @@ def find_option_contract(ticker: str, direction: str, trade_type: str = "DAY") -
     try:
         expiry      = _next_valid_expiry(trade_type)
         option_type = "C" if direction == "CALL" else "P"
-        lo, hi      = (0.75, 1.50) if trade_type == "DAY" else (1.00, 3.50)
+        lo, hi      = (0.75, 1.50)   # ALL trades capped at $1.50 per Junior (Jul 6)
 
         log.info(f"🔍 Tastytrade chain search: {ticker} {direction} {trade_type} expiry={expiry}")
 
