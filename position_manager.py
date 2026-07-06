@@ -195,7 +195,9 @@ def _check_position(sym: str, pos: dict):
     if not pos["trail_armed"] and pnl >= TRAIL_ARM_PCT:
         pos["trail_armed"] = True
         _save()
-        _post_discord(_channels.get("recaps", ""), f"📈 {pos['ticker']} +{pnl*100:.0f}% — trail stop added. Take profits if or when comfortable.")
+        _msg = f"📈 {pos['ticker']} +{pnl*100:.0f}% — trail stop added. Take profits if or when comfortable."
+        _post_discord(_channels.get("watchlist", ""), _msg)
+        _post_discord(_channels.get("recaps", ""), _msg)
     if pos["trail_armed"] and mid <= pos["peak"] * (1 - TRAIL_GIVEBACK):
         _controlled_exit(sym, pos, "trailing stop", is_win=(mid > entry)); return
 

@@ -626,7 +626,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.2-pulse-2026-07-06",
+        "code_version": "v2.3-channels-2026-07-06",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -776,7 +776,7 @@ Give a quick honest read (direction/chop, one level if obvious) and remind them 
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
-        post_discord(CHANNEL_RECAPS, resp.content[0].text.strip())
+        post_discord(CHANNEL_WATCHLIST, resp.content[0].text.strip())
         _last_pulse_at = now
         log.info(f"📣 Market pulse posted ({zone_note})")
     except Exception as e:
@@ -1180,7 +1180,7 @@ def _start_scheduler_on_first_request():
 
 position_manager.configure(
     post_discord=post_discord,
-    channels={"day_signals": CHANNEL_DAY_SIGNALS, "swing_signals": CHANNEL_SWING_SIGNALS, "recaps": CHANNEL_RECAPS},
+    channels={"day_signals": CHANNEL_DAY_SIGNALS, "swing_signals": CHANNEL_SWING_SIGNALS, "recaps": CHANNEL_RECAPS, "watchlist": CHANNEL_WATCHLIST},
     on_win=record_win,
     on_loss=record_loss,
 )
