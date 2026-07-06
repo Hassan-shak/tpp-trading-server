@@ -10,7 +10,7 @@ import hmac
 import logging
 import threading
 import time as time_module
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, request, jsonify
@@ -160,6 +160,15 @@ def in_report_blackout() -> bool:
         sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
         if dtime(sh, sm) <= now.time() <= dtime(eh, em):
             return True
+    # Auto-scanned windows from this morning's calendar scan (additive only)
+    for w in get_scanned_blackouts():
+        try:
+            s, e = w["window"].split("-")
+            sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
+            if dtime(sh, sm) <= now.time() <= dtime(eh, em):
+                return True
+        except Exception:
+            continue
     # Then manual env var overrides for one-off events (Fed testimony, addresses, etc.)
     raw = os.environ.get("REPORT_BLACKOUTS", "")
     if not raw:
@@ -631,6 +640,7 @@ def health():
         "in_day_trade_window": in_day_trade_window(),
         "report_blackout_active": in_report_blackout(),
         "todays_scheduled_events": [e[0] for e in todays_scheduled_events()],
+        "todays_scanned_blackouts": get_scanned_blackouts(),
         "in_swing_window": in_swing_window(),
         "paper_trading": PAPER_TRADING,
         "tastytrade_authenticated": is_authenticated(),
@@ -670,6 +680,61 @@ def refresh_zones():
 # ── DAILY ZONE SCHEDULER ───────────────────────────────────────────────────────
 _scheduler_started = False
 _scheduler_lock    = threading.Lock()
+
+# ── AUTOMATED JOB 0: Daily Economic Calendar Scan (6:30-9:00 AM ET) ──────────
+DAILY_BLACKOUTS_FILE = "/tmp/tpp_daily_blackouts.json"
+
+def daily_report_scan():
+    """Ask Claude (with live web search) for today's high-impact US releases and
+    convert them to blackout windows. ADDITIVE ONLY: the built-in FOMC/ISM
+    calendar remains the guaranteed floor; a failed scan changes nothing."""
+    today_iso = datetime.now(ET).date().isoformat()
+    prompt = f"""Today is {datetime.now(ET).strftime('%A, %B %d, %Y')}. Search the web for today's US economic calendar (ForexFactory, Investing.com, or MarketWatch).
+
+List ONLY high-impact (ForexFactory "red folder" equivalent) USD events scheduled today between 9:00 AM and 4:00 PM Eastern Time. Include Fed Chair testimony and FOMC-related events. EXCLUDE low/medium impact events, and exclude anything before 9:00 AM ET.
+
+Respond with ONLY a JSON array, no other text, no markdown fences:
+[{{"event": "name", "time_et": "HH:MM"}}]
+
+If there are no qualifying events, respond with exactly: []"""
+    try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        text = text.replace("```json", "").replace("```", "").strip()
+        start, end = text.find("["), text.rfind("]")
+        events = json.loads(text[start:end + 1]) if start != -1 and end != -1 else []
+
+        windows = []
+        for ev in events:
+            try:
+                h, m = map(int, str(ev.get("time_et", "")).split(":"))
+                lo = (datetime(2000, 1, 1, h, m) - timedelta(minutes=15)).strftime("%H:%M")
+                hi = (datetime(2000, 1, 1, h, m) + timedelta(minutes=15)).strftime("%H:%M")
+                windows.append({"event": str(ev.get("event", "?"))[:60], "window": f"{lo}-{hi}"})
+            except Exception:
+                continue
+
+        with open(DAILY_BLACKOUTS_FILE, "w") as f:
+            json.dump({"date": today_iso, "windows": windows}, f)
+        log.info(f"🗓️ Daily report scan complete — {len(windows)} high-impact window(s): {windows}")
+    except Exception as e:
+        log.error(f"Daily report scan failed (built-in calendar still active): {e}")
+
+def get_scanned_blackouts() -> list:
+    try:
+        if os.path.exists(DAILY_BLACKOUTS_FILE):
+            with open(DAILY_BLACKOUTS_FILE) as f:
+                data = json.load(f)
+            if data.get("date") == datetime.now(ET).date().isoformat():
+                return data.get("windows", [])
+    except Exception:
+        pass
+    return []
 
 # ── AUTOMATED JOB 1: Daily Watchlist ─────────────────────────────────────────
 def fetch_premarket_data(ticker: str) -> dict:
@@ -994,6 +1059,15 @@ def zone_scheduler_loop():
 
             # Skip market-facing jobs on weekends AND Fridays
             no_trade_day = is_off_day()
+
+            # JOB 0: Daily economic calendar scan — 6:30-9:00 AM ET (trading days)
+            if not no_trade_day and dtime(6, 30) <= t <= dtime(9, 0):
+                scanned = get_scanned_blackouts()
+                already = os.path.exists(DAILY_BLACKOUTS_FILE) and scanned is not None and (
+                    json.load(open(DAILY_BLACKOUTS_FILE)).get("date") == today.isoformat()
+                    if os.path.exists(DAILY_BLACKOUTS_FILE) else False)
+                if not already:
+                    daily_report_scan()
 
             # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only, including Friday for zone data)
             if not is_off_day() and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
