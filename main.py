@@ -626,7 +626,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.3-channels-2026-07-06",
+        "code_version": "v2.4-final-2026-07-06",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -746,9 +746,9 @@ def post_market_pulse():
     t = now.time()
 
     in_active = in_day_trade_window() or in_swing_window()
-    in_dz     = in_dead_zone()
-    if not (in_active or in_dz):
-        return
+    if not in_active:
+        return                                    # silent outside trading windows (incl. dead zone)
+    in_dz = False
     if position_manager.open_position_count() > 0:
         return                                    # live trade updates cover the channel
 
