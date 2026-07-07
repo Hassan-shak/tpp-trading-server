@@ -445,6 +445,10 @@ def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict 
     log.info(f"✅ {mode} trade filled & protected: {contract['symbol']} @ {entry_price}")
     return {"order_id": order["order_id"], "fill_price": entry_price, "symbol": contract["symbol"]}
 
+# ── Watchlist post cooldown (Zero Repetition rule, enforced in code) ─────────
+_watchlist_post_cooldown = {}
+WATCHLIST_COOLDOWN_MIN = int(os.environ.get("WATCHLIST_COOLDOWN_MIN", "30"))
+
 # ── MAIN WEBHOOK ENDPOINT ─────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -490,6 +494,12 @@ def webhook():
         return jsonify({"status": "no_trade"}), 200
 
     if first_line.startswith("WATCHLIST"):
+        tkr  = data.get("ticker", "").upper()
+        last = _watchlist_post_cooldown.get(tkr)
+        if last and (datetime.now(ET) - last).total_seconds() < WATCHLIST_COOLDOWN_MIN * 60:
+            log.info(f"Watchlist post suppressed for {tkr} — cooldown ({WATCHLIST_COOLDOWN_MIN}m)")
+            return jsonify({"status": "watchlist_suppressed_cooldown"}), 200
+        _watchlist_post_cooldown[tkr] = datetime.now(ET)
         post_discord(CHANNEL_WATCHLIST, discord_message)
         return jsonify({"status": "watchlist_posted"}), 200
 
@@ -626,7 +636,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.5-privacy-2026-07-06",
+        "code_version": "v2.6-cooldown-2026-07-07",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
