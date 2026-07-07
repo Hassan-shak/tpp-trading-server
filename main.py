@@ -317,11 +317,12 @@ VOLUME PROFILE ZONES FOR {ticker} (auto-calculated, last updated {zones.get('upd
         zone_text = f"\nVOLUME PROFILE ZONES FOR {ticker}: NOT AVAILABLE this session — treat any zone-dependent confirmation (Rules 1, 2, 5, 6) as UNCONFIRMED.\n"
 
     # Include last 10 live candles from Alpaca for real-time price structure context
-    recent_candles = get_candles_resilient(ticker, limit=30)
+    recent_candles = get_candles_resilient(ticker, limit=15)
     if recent_candles:
-        candle_text = f"\nRECENT 1-MIN CANDLES FOR {ticker} (last {len(recent_candles)}, most recent last):\n"
-        for c in recent_candles:
-            candle_text += f"  {c.get('t','')[:16]} | O:{c.get('o')} H:{c.get('h')} L:{c.get('l')} C:{c.get('c')} V:{c.get('v')}\n"
+        candle_text = f"\nRECENT 1-MIN CANDLES FOR {ticker} (time O/H/L/C/V, most recent last):\n"
+        candle_text += "\n".join(
+            f"{c.get('t','')[11:16]} {c.get('o')}/{c.get('h')}/{c.get('l')}/{c.get('c')}/{c.get('v')}"
+            for c in recent_candles) + "\n"
     else:
         candle_text = f"\nRECENT CANDLES FOR {ticker}: UNAVAILABLE from both live stream and REST — treat all candle-dependent confirmations as failed.\n"
 
@@ -504,6 +505,28 @@ def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict 
 
 # ── Watchlist post cooldown (Zero Repetition rule, enforced in code) ─────────
 _watchlist_post_cooldown = {}
+_claude_analysis_cooldown = {}
+CLAUDE_ANALYSIS_COOLDOWN_MIN = int(os.environ.get("CLAUDE_ANALYSIS_COOLDOWN_MIN", "3"))
+_claude_calls_today = {"date": None, "count": 0}
+MAX_CLAUDE_CALLS_PER_DAY = int(os.environ.get("MAX_CLAUDE_CALLS_PER_DAY", "300"))
+
+def claude_budget_ok(ticker: str) -> tuple[bool, str]:
+    """Cost guard: per-ticker cooldown + daily call cap. Protects the API bill,
+    never the safety systems (gates, stops, exits are all non-Claude)."""
+    now = datetime.now(ET)
+    today = now.date()
+    if _claude_calls_today["date"] != today:
+        _claude_calls_today["date"], _claude_calls_today["count"] = today, 0
+    if _claude_calls_today["count"] >= MAX_CLAUDE_CALLS_PER_DAY:
+        return False, f"DAILY_CLAUDE_CAP: {MAX_CLAUDE_CALLS_PER_DAY} analyses reached"
+    last = _claude_analysis_cooldown.get(ticker)
+    if last and (now - last).total_seconds() < CLAUDE_ANALYSIS_COOLDOWN_MIN * 60:
+        return False, f"ANALYSIS_COOLDOWN: {ticker} analyzed <{CLAUDE_ANALYSIS_COOLDOWN_MIN}m ago"
+    return True, "OK"
+
+def claude_budget_mark(ticker: str):
+    _claude_analysis_cooldown[ticker] = datetime.now(ET)
+    _claude_calls_today["count"] += 1
 WATCHLIST_COOLDOWN_MIN = int(os.environ.get("WATCHLIST_COOLDOWN_MIN", "30"))
 
 # ── MAIN WEBHOOK ENDPOINT ─────────────────────────────────────────────────────
@@ -534,8 +557,15 @@ def webhook():
 
     analysis_type = determine_analysis_type(data)
 
+    # Cost guard — skip Claude for tickers analyzed moments ago
+    ok, budget_reason = claude_budget_ok(data.get("ticker", "").upper())
+    if not ok:
+        log.info(f"Claude call skipped: {budget_reason}")
+        return jsonify({"status": "skipped", "reason": budget_reason}), 200
+
     # Call Claude
     try:
+        claude_budget_mark(data.get("ticker", "").upper())
         claude_response = analyze_with_claude(data, analysis_type)
         log.info(f"Claude response: {claude_response[:200]}...")
     except Exception as e:
@@ -693,7 +723,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.8-dedup-2026-07-07",
+        "code_version": "v2.9-cost-2026-07-07",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
