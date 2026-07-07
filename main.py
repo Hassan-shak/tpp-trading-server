@@ -254,6 +254,31 @@ def post_discord(channel_id: str, message: str) -> bool:
             success = False
     return success
 
+
+def _discord_already_posted_today(channel_id: str, marker: str) -> bool:
+    """Check the channel's recent messages for a post containing `marker` made
+    today (ET). The channel is durable memory — survives restarts and deploys."""
+    try:
+        resp = requests.get(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            params={"limit": 10}, timeout=10,
+        )
+        if resp.status_code != 200:
+            return False
+        today = datetime.now(ET).date()
+        for msg in resp.json():
+            ts = msg.get("timestamp", "")
+            try:
+                msg_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ET).date()
+            except Exception:
+                continue
+            if msg_date == today and marker.lower() in msg.get("content", "").lower():
+                return True
+    except Exception as e:
+        log.error(f"Discord dedup check failed: {e}")
+    return False
+
 # ── Load system prompt ────────────────────────────────────────────────────────
 def get_system_prompt() -> str:
     path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
@@ -668,7 +693,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.7-candles-2026-07-07",
+        "code_version": "v2.8-dedup-2026-07-07",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -836,6 +861,9 @@ def post_daily_watchlist():
         log.info("Friday/weekend — watchlist suppressed")
         return
 
+    if _discord_already_posted_today(CHANNEL_WATCHLIST, "Daily Watchlist"):
+        log.info("Watchlist already in channel today — skipping duplicate")
+        return
     log.info("📋 Generating daily watchlist...")
     zones  = volume_profile.get_all_zones()
     tickers = list(DAY_TRADE_TICKERS)
@@ -960,6 +988,9 @@ def post_eod_recap():
         log.info("Friday/weekend — EOD recap suppressed")
         return
 
+    if _discord_already_posted_today(CHANNEL_RECAPS, "EOD Recap"):
+        log.info("EOD recap already in channel today — skipping duplicate")
+        return
     log.info("📊 Generating end-of-day recap...")
 
     positions_data = []
