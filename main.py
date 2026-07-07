@@ -194,6 +194,38 @@ def in_report_blackout() -> bool:
             continue
     return False
 
+
+# ── Resilient candles: stream store first, Alpaca REST fallback (restart-proof) ──
+def get_candles_resilient(ticker: str, limit: int = 30) -> list:
+    candles = []
+    try:
+        candles = alpaca_stream.get_candles(ticker, limit=limit) or []
+    except Exception:
+        candles = []
+    if len(candles) >= max(5, limit // 2):
+        return candles
+    # Stream store thin (fresh restart / backfill in progress) → REST fetch
+    try:
+        key    = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+        for feed in ("sip", "iex"):
+            resp = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+                params={"timeframe": "1Min", "limit": limit, "adjustment": "raw", "feed": feed},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                bars = resp.json().get("bars", [])
+                if bars:
+                    return [{"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"],
+                             "c": b["c"], "v": b["v"]} for b in bars]
+            if resp.status_code != 403:
+                break
+    except Exception as e:
+        log.error(f"REST candle fallback failed for {ticker}: {e}")
+    return candles
+
 # ── Discord helper ────────────────────────────────────────────────────────────
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_POSTING_ENABLED = os.environ.get("DISCORD_POSTING_ENABLED", "true").lower() == "true"
@@ -260,13 +292,13 @@ VOLUME PROFILE ZONES FOR {ticker} (auto-calculated, last updated {zones.get('upd
         zone_text = f"\nVOLUME PROFILE ZONES FOR {ticker}: NOT AVAILABLE this session — treat any zone-dependent confirmation (Rules 1, 2, 5, 6) as UNCONFIRMED.\n"
 
     # Include last 10 live candles from Alpaca for real-time price structure context
-    recent_candles = alpaca_stream.get_candles(ticker, limit=10)
+    recent_candles = get_candles_resilient(ticker, limit=30)
     if recent_candles:
         candle_text = f"\nRECENT 1-MIN CANDLES FOR {ticker} (last {len(recent_candles)}, most recent last):\n"
         for c in recent_candles:
             candle_text += f"  {c.get('t','')[:16]} | O:{c.get('o')} H:{c.get('h')} L:{c.get('l')} C:{c.get('c')} V:{c.get('v')}\n"
     else:
-        candle_text = f"\nRECENT CANDLES FOR {ticker}: Not yet available (Alpaca backfill in progress).\n"
+        candle_text = f"\nRECENT CANDLES FOR {ticker}: UNAVAILABLE from both live stream and REST — treat all candle-dependent confirmations as failed.\n"
 
     context = f"""
 CURRENT SERVER TIME (ET): {now_et.strftime('%A, %B %d, %Y %I:%M %p ET')}
@@ -636,7 +668,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.6-cooldown-2026-07-07",
+        "code_version": "v2.7-candles-2026-07-07",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -767,8 +799,8 @@ def post_market_pulse():
         return
 
     # Live read on the indexes for flavor
-    spy = alpaca_stream.get_candles("SPY", limit=15)
-    qqq = alpaca_stream.get_candles("QQQ", limit=15)
+    spy = get_candles_resilient("SPY", limit=15)
+    qqq = get_candles_resilient("QQQ", limit=15)
     blackout_note = " NOTE: an economic-report blackout is currently active — mention we're deliberately hands-off until it passes." if in_report_blackout() else ""
     zone_note = "dead zone (11 AM-3 PM — no entries by rule, monitoring only)" if in_dz else ("day-trade window" if in_day_trade_window() else "swing window")
 
@@ -874,7 +906,7 @@ def scan_for_visual_patterns():
             continue
 
         try:
-            candles = alpaca_stream.get_candles(ticker, limit=30)
+            candles = get_candles_resilient(ticker, limit=30)
             if len(candles) < 10:
                 continue
 
@@ -1158,7 +1190,7 @@ def zone_scheduler_loop():
 
             # JOB 3: Pattern scanner — every loop tick during trade window (weekdays, NOT Friday)
             if not no_trade_day and dtime(9, 25) <= t <= dtime(10, 30):
-                candles_ready = sum(1 for tk in DAY_TRADE_TICKERS if len(alpaca_stream.get_candles(tk, limit=101)) > 100)
+                candles_ready = sum(1 for tk in DAY_TRADE_TICKERS if len(get_candles_resilient(tk, limit=101)) > 50)
                 if candles_ready >= len(DAY_TRADE_TICKERS) // 2:
                     scan_for_visual_patterns()
                 else:
