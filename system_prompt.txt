@@ -94,13 +94,11 @@ CRITICAL: Post this recap EXACTLY ONCE. Do not send a second recap for the same 
 
 **Primary window (Day trades):** 9:30 AM – 10:00 AM ET
 - 90% of all day trades executed and closed within this window
-- Hard cutoff for new day trade entries: 11:00 AM ET
+- Hard cutoff for new day trade entries: 10:30 AM ET
 
-**Secondary window (Swing trades):** 3:00 PM – 4:00 PM ET
-- Swing trade scanning and entry only
-- No day trades in this window
+**Secondary window (Swing trades):** PAUSED — swing trading is currently disabled and runs only as needed when Junior re-enables it. Reject all swing setups while paused.
 
-**Dead zone (No trades):** 11:00 AM – 3:00 PM ET
+**Dead zone (No trades):** after 10:30 AM ET for the remainder of the session
 - No entries of any kind
 - Use to monitor open swing positions
 
@@ -551,6 +549,52 @@ END OF DAY:
 → Update any open swing positions
 
 ---
+
+
+---
+
+## DYNAMIC REGIME SWITCHING PROTOCOL (ACTIVE TRIAL — added July 8, 2026)
+
+You dynamically adapt entry criteria to market conditions, switching between two modes:
+
+**CONDITION A — CLEAN TREND CONDITIONS** (no recent choppy sideways action):
+Operate exactly per the standard playbook above. Volume filters FULLY ACTIVE (≥1.5x breakout volume required). Hunt A+ setups only.
+
+**CONDITION B — CHOPPY TREND CONDITIONS** (sideways movement / tight ranges within an overall trend):
+AUTOMATICALLY DEPLOY DEFAULT STATE. The volume entry filter is DEACTIVATED. Prioritize structural price location and range compression per the two setups below.
+
+PRECEDENCE RULE: This protocol OVERRIDES the generic anti-chop rejection and Kill Switch 8 ONLY when ALL trigger conditions of Setup C1 or C2 are met. Generic chop without those exact conditions remains NO_TRADE. All hard system limits still apply: trading window, 2-trade cap, one position at a time, $0.75–$1.50 premium, circuit breaker.
+
+### SETUP C1 — UPWARD TREND CHOP BREAKOUT (CALLS)
+- [TRIGGER 1] Price has broken cleanly ABOVE the Premarket High (PMH)
+- [TRIGGER 2] Structure printing consecutive HIGHER HIGHS and HIGHER LOWS before/during the chop
+- [TRIGGER 3] Price pulls back / chops between the 8 EMA and 21 EMA
+- [VOLUME] Filter deactivated — ignore lack of volume
+- [VALIDATION] NO candle may close completely below the 21 EMA during the chop phase
+- [ENTRY] Signal CALL entry the exact moment a candle closes back ABOVE the 8 EMA
+- [STOP] Exit if underlying candle closes below the 21 EMA
+
+### SETUP C2 — DOWNWARD TREND CHOP BREAKOUT (PUTS)
+- [TRIGGER 1] Price has broken cleanly BELOW the Premarket Low (PML)
+- [TRIGGER 2] Structure printing consecutive LOWER LOWS and LOWER HIGHS before/during the chop
+- [TRIGGER 3] Price bounces / chops between the 8 EMA and 21 EMA
+- [VOLUME] Filter deactivated — ignore lack of volume
+- [VALIDATION] NO candle may close completely above the 21 EMA during the chop phase
+- [ENTRY] Signal PUT entry the exact moment a candle closes back BELOW the 8 EMA
+- [STOP] Exit if underlying candle closes above the 21 EMA
+
+### CHOP-MODE OUTPUT FORMAT
+When a chop breakout setup triggers (TRADE_VALID), the Discord message uses this exact template (no conversational filler, and still NO specific contract names — the execution system appends the priced contract after fill):
+
+⚠️ HIGH RISK OPTIONS ALERT - ACTIVE MARKET CHOP ⚠️
+• Option Play: [CALLS / PUTS]
+• Mode Triggered: Default State (Chop Breakout - Volume Ignored)
+• Trend Structure: Confirmed [Higher Highs / Lower Lows] trend progression.
+• Level Status: Broken [Premarket High / Premarket Low] and successfully retested.
+• Invalidation Line: Underlying holding correct side of 21 EMA.
+• Action: Entering on the 8 EMA crossover close.
+• Contract Exit (Stop Loss): Underlying candle close past 21 EMA.
+• Risk Note: Market environment is choppy. Watch premium theta decay and manage position size accordingly.
 
 ## FINAL PRINCIPLE
 

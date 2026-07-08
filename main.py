@@ -98,15 +98,19 @@ def in_day_trade_window() -> bool:
     scanning after 10 AM if no A+ setup has fired.
     """
     now = datetime.now(ET).time()
-    return dtime(9, 30) <= now <= dtime(11, 0)
+    return dtime(9, 30) <= now <= dtime(10, 30)
 
 def in_swing_window() -> bool:
+    if not SWING_ENABLED:
+        return False
     now = datetime.now(ET).time()
     return dtime(15, 0) <= now <= dtime(16, 0)
 
 def in_dead_zone() -> bool:
     now = datetime.now(ET).time()
-    return dtime(11, 0) < now < dtime(15, 0)
+    if SWING_ENABLED:
+        return dtime(10, 30) < now < dtime(15, 0)
+    return dtime(10, 30) < now < dtime(16, 0)
 
 # ── BUILT-IN 2026 ECONOMIC CALENDAR (verified against Fed official schedule) ──
 # FOMC rate decisions: 2:00 PM ET — Kill Switch 2: FULL session halt
@@ -229,6 +233,8 @@ def get_candles_resilient(ticker: str, limit: int = 30) -> list:
 # ── Discord helper ────────────────────────────────────────────────────────────
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_POSTING_ENABLED = os.environ.get("DISCORD_POSTING_ENABLED", "true").lower() == "true"
+SWING_ENABLED      = os.environ.get("SWING_ENABLED", "false").lower() == "true"
+EOD_RECAP_ENABLED  = os.environ.get("EOD_RECAP_ENABLED", "false").lower() == "true"
 
 def post_discord(channel_id: str, message: str) -> bool:
     if not DISCORD_POSTING_ENABLED:
@@ -332,10 +338,10 @@ ALERT TRIGGER TIME (ET):  {alert_time_et_str}   ← USE THIS for time-window che
 DAY OF WEEK: {now_et.strftime('%A')}
 
 IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
-- Day trade entries are valid between 9:30 AM ET and 11:00 AM ET ONLY.
+- Day trade entries are valid between 9:30 AM ET and 10:30 AM ET ONLY.
   Use the ALERT TRIGGER TIME above for this check, not server processing time.
-- Dead zone (NO trades of any kind): 11:00 AM ET – 3:00 PM ET
-- Swing window: 3:00 PM ET – 4:00 PM ET
+- Dead zone (NO trades of any kind): after 10:30 AM ET for the rest of the session
+- Swing trades are PAUSED — reject any swing setup; day trades only
 - Friday is a NO-TRADING day — respond NO_TRADE for all signals.
 - Weekend (Sat/Sun) — respond NO_TRADE.
 - ECONOMIC REPORT BLACKOUTS are enforced by code before you ever see an alert;
@@ -343,7 +349,7 @@ IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
 - The 10 AM LOCKOUT in the playbook (Rule 6) means: if NO trade has been executed
   by 10:00 AM and no A+ setup is printing, STOP scanning. It does NOT mean all
   signals after 10 AM are automatically rejected — signals between 10:00 AM and
-  11:00 AM are still valid if they meet all other criteria.
+  10:30 AM are still valid if they meet all other criteria.
 
 SESSION TRADE COUNT TODAY: {session['trade_count']}
 CONSECUTIVE LOSSES TODAY: {session['consecutive_losses']}
@@ -723,7 +729,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v2.9-cost-2026-07-07",
+        "code_version": "v3.0-schedule-2026-07-07",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -1014,6 +1020,9 @@ Be conservative. Only flag genuinely high-probability developing setups, not noi
 # ── AUTOMATED JOB 3: End-of-Day Recap ────────────────────────────────────────
 def post_eod_recap():
     """Generate and post an end-of-day recap. Suppressed on Friday/weekends."""
+    if not EOD_RECAP_ENABLED:
+        log.info("EOD recap disabled (EOD_RECAP_ENABLED=false) — skipping")
+        return
     if is_off_day():
         log.info("Friday/weekend — EOD recap suppressed")
         return
