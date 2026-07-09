@@ -352,6 +352,7 @@ IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
   10:30 AM are still valid if they meet all other criteria.
 
 SESSION TRADE COUNT TODAY: {session['trade_count']}
+TIME IN WINDOW: {alert_time_et_str} (window closes 10:30 AM ET — if past 10:00 AM and trade_count=0, escalate to Tier 3)
 CONSECUTIVE LOSSES TODAY: {session['consecutive_losses']}
 CIRCUIT BREAKER ACTIVE: {session['circuit_breaker']}
 TASTYTRADE STATUS: {tt_status}
@@ -371,13 +372,26 @@ Based on my complete trading playbook and all rules in your system prompt:
 5. If valid: format the exact Discord message in Junior's voice
 6. If not valid: explain briefly why (1-2 sentences max, no lengthy breakdowns)
 
+TIERED ENTRY SYSTEM — ACTIVE:
+You must attempt to find at least one trade per day. Evaluate setups in this order:
+
+TIER 1 — A+ STANDARD (full rulebook, all confirmations): Enter if found. No risk label.
+TIER 2 — A RELAXED (volume ≥ 1.0x OR one missing confirmation but clean structure): Enter if no Tier 1 found. Label: ⚡ STANDARD SETUP
+TIER 3 — HIGH RISK OPPORTUNISTIC (chop protocol C1/C2, OR pre-market zone reaction, OR structural level play without full EMA confluence): Enter if no Tier 1/2 found AND trade_count=0 AND time is past 10:00 AM ET. Label: ⚠️ HIGH RISK — use the high-risk template.
+
+CONSECUTIVE INACTIVITY RULE: If SESSION TRADE COUNT = 0 and it is past 10:00 AM ET, you MUST find a Tier 3 entry unless:
+- It is an FOMC rate decision day
+- Every ticker is in a dead range with NO structural level in play (state this explicitly)
+- The two-strike circuit breaker is active
+
 IMPORTANT: Start your response with exactly one of these tags on the first line:
-- TRADE_VALID: (if this should be executed)
-- NO_TRADE: (if this should be skipped)
+- TRADE_VALID: (if this should be executed — include tier in brackets e.g. TRADE_VALID: [TIER-1])
+- NO_TRADE: (if genuinely no setup exists across all three tiers — requires explicit explanation of why all tiers failed)
 - WATCHLIST: (if this is a watchlist update only)
 
 Then on the next lines, write the Discord message exactly as Junior would post it.
-Keep NO_TRADE explanations to 1-2 sentences.
+For HIGH RISK trades use the ⚠️ HIGH RISK template from the chop protocol section.
+Keep NO_TRADE explanations to 1-2 sentences, and only use NO_TRADE if all three tiers genuinely fail.
 """
 
     response = anthropic.messages.create(
@@ -512,9 +526,9 @@ def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict 
 # ── Watchlist post cooldown (Zero Repetition rule, enforced in code) ─────────
 _watchlist_post_cooldown = {}
 _claude_analysis_cooldown = {}
-CLAUDE_ANALYSIS_COOLDOWN_MIN = int(os.environ.get("CLAUDE_ANALYSIS_COOLDOWN_MIN", "3"))
+CLAUDE_ANALYSIS_COOLDOWN_MIN = int(os.environ.get("CLAUDE_ANALYSIS_COOLDOWN_MIN", "5"))
 _claude_calls_today = {"date": None, "count": 0}
-MAX_CLAUDE_CALLS_PER_DAY = int(os.environ.get("MAX_CLAUDE_CALLS_PER_DAY", "300"))
+MAX_CLAUDE_CALLS_PER_DAY = int(os.environ.get("MAX_CLAUDE_CALLS_PER_DAY", "150"))
 
 def claude_budget_ok(ticker: str) -> tuple[bool, str]:
     """Cost guard: per-ticker cooldown + daily call cap. Protects the API bill,
@@ -729,7 +743,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v3.0-schedule-2026-07-07",
+        "code_version": "v3.1-cost2-2026-07-08",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
@@ -970,7 +984,7 @@ def scan_for_visual_patterns():
             continue
 
         try:
-            candles = get_candles_resilient(ticker, limit=30)
+            candles = get_candles_resilient(ticker, limit=15)
             if len(candles) < 10:
                 continue
 
@@ -1000,6 +1014,11 @@ Respond with EXACTLY one of:
 
 Be conservative. Only flag genuinely high-probability developing setups, not noise."""
 
+            ok, reason = claude_budget_ok(ticker)
+            if not ok:
+                log.info(f"Pattern scan skipped ({ticker}): {reason}")
+                continue
+            claude_budget_mark(ticker)
             scan_resp = anthropic.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=150,
