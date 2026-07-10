@@ -52,7 +52,7 @@ CHANNEL_LONGTERM    = os.environ["DISCORD_CHANNEL_LONGTERM"]
 ET = ZoneInfo("America/New_York")
 
 # ── Approved tickers ──────────────────────────────────────────────────────────
-DAY_TRADE_TICKERS = {"SPY", "QQQ", "TSLA", "NVDA", "AMZN", "MSFT"}
+DAY_TRADE_TICKERS = {"NVDA", "TSLA"}  # v4.0: focus list per Junior — all others ignored
 SWING_TICKERS     = {"SPY", "QQQ", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOG"}
 
 # ── Active positions tracking ─────────────────────────────────────────────────
@@ -90,15 +90,20 @@ def is_off_day() -> bool:
 
 # ── Time window checks ────────────────────────────────────────────────────────
 
+TRADE_WINDOWS = os.environ.get("TRADE_WINDOWS", "09:30-10:30,14:00-15:55")
+
 def in_day_trade_window() -> bool:
-    """
-    Day-trade entries: 9:30 AM – 11:00 AM ET.
-    The system prompt's '10 AM lockout' (Rule 6) is enforced by Claude via the
-    session trade count — NOT by a hard time gate here.  Claude knows to stop
-    scanning after 10 AM if no A+ setup has fired.
-    """
+    """Entry windows, env-configurable. Default: morning hour + afternoon trend window."""
     now = datetime.now(ET).time()
-    return dtime(9, 30) <= now <= dtime(10, 30)
+    for win in TRADE_WINDOWS.split(","):
+        try:
+            s, e = win.strip().split("-")
+            sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
+            if dtime(sh, sm) <= now <= dtime(eh, em):
+                return True
+        except Exception:
+            continue
+    return False
 
 def in_swing_window() -> bool:
     if not SWING_ENABLED:
@@ -108,9 +113,7 @@ def in_swing_window() -> bool:
 
 def in_dead_zone() -> bool:
     now = datetime.now(ET).time()
-    if SWING_ENABLED:
-        return dtime(10, 30) < now < dtime(15, 0)
-    return dtime(10, 30) < now < dtime(16, 0)
+    return dtime(9, 30) <= now <= dtime(16, 0) and not in_day_trade_window()
 
 # ── BUILT-IN 2026 ECONOMIC CALENDAR (verified against Fed official schedule) ──
 # FOMC rate decisions: 2:00 PM ET — Kill Switch 2: FULL session halt
@@ -338,7 +341,7 @@ ALERT TRIGGER TIME (ET):  {alert_time_et_str}   ← USE THIS for time-window che
 DAY OF WEEK: {now_et.strftime('%A')}
 
 IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
-- Day trade entries are valid between 9:30 AM ET and 10:30 AM ET ONLY.
+- Entries are valid ONLY inside these ET windows: {TRADE_WINDOWS} (checked in code before you see any alert).
   Use the ALERT TRIGGER TIME above for this check, not server processing time.
 - Dead zone (NO trades of any kind): after 10:30 AM ET for the rest of the session
 - Swing trades are PAUSED — reject any swing setup; day trades only
@@ -743,7 +746,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v3.1-cost2-2026-07-08",
+        "code_version": "v4.0-simple-2026-07-10",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
