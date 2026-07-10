@@ -128,7 +128,7 @@ def get_option_quote(occ_symbol: str) -> dict | None:
             return None
         items = resp.json().get("data", {}).get("items", [])
         if not items:
-            return None
+            return _alpaca_option_quote(occ_symbol)
         q   = items[0]
         bid = float(q.get("bid") or 0)
         ask = float(q.get("ask") or 0)
@@ -137,6 +137,29 @@ def get_option_quote(occ_symbol: str) -> dict | None:
         return {"bid": bid, "ask": ask, "mid": round((bid + ask) / 2, 2)}
     except Exception as e:
         log.error(f"Quote error for {occ_symbol}: {e}")
+        return None
+
+
+def _alpaca_option_quote(occ_symbol: str) -> dict | None:
+    """Fallback pricing via Alpaca options data when Tastytrade market-data is empty."""
+    try:
+        key    = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+        resp = requests.get(
+            f"https://data.alpaca.markets/v1beta1/options/snapshots/{occ_symbol}",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        snap  = resp.json().get("snapshots", {}).get(occ_symbol, {})
+        quote = snap.get("latestQuote", {})
+        bid, ask = float(quote.get("bp", 0)), float(quote.get("ap", 0))
+        if ask <= 0:
+            return None
+        return {"bid": bid, "ask": ask, "mid": round((bid + ask) / 2, 2)}
+    except Exception as e:
+        log.error(f"Alpaca option quote fallback error for {occ_symbol}: {e}")
         return None
 
 # ── Contract selection ────────────────────────────────────────────────────────
