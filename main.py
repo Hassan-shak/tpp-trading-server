@@ -84,9 +84,15 @@ def reset_session_if_new_day():
 
 # ── Day-of-week checks ────────────────────────────────────────────────────────
 
+EARLY_CLOSE_DAYS_2026 = {"2026-11-27", "2026-12-24"}  # 1 PM closes — no day trading (Kill Switch 7)
+
 def is_off_day() -> bool:
-    """Friday (4), Saturday (5), and Sunday (6) are all off days — no trading, no Discord."""
-    return datetime.now(ET).weekday() >= 4
+    """Weekends + actual US market holidays + early-close days. Fridays are TRADING DAYS."""
+    now = datetime.now(ET)
+    if now.weekday() >= 5:
+        return True
+    d = now.date().isoformat()
+    return d in US_MARKET_HOLIDAYS or d in EARLY_CLOSE_DAYS_2026
 
 # ── Time window checks ────────────────────────────────────────────────────────
 
@@ -746,7 +752,7 @@ def health():
     now_et = datetime.now(ET)
     return jsonify({
         "status": "online",
-        "code_version": "v4.0-simple-2026-07-10",
+        "code_version": "v4.1-fridays-2026-07-10",
         "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         "day_of_week": now_et.strftime("%A"),
         "is_off_day": is_off_day(),
