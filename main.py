@@ -1,1338 +1,1318 @@
 """
+main.py
+TPP Trading Server v5.0
 The Portfolio Plug — AI Trading Webhook Server
-Receives TradingView alerts → calls Claude API → posts signals to Discord
-Phase 2: Tastytrade API execution layer integrated
+
+Single-file deployment. Replaces v4.1 main.py entirely.
+
+What changed from v4.1:
+  - AM window only: 9:30–10:30 AM ET (PM window removed)
+  - 1-min timeframe explicit throughout
+  - PMH/PML trusted from TradingView as ground truth
+  - Contract pricing: ask $0.75–$1.50/share ($75–$150/contract), ATM→OTM walk
+  - Dead ticker requires ALL 3 conditions — "choppy" never a skip reason
+  - Mandatory attempt rule removed — only valid setups traded
+  - HIGH RISK tier removed — TIER-1 and TIER-2 only
+  - Position monitor runs past 10:30 AM if trade is open — no forced flatten
+  - Recap posts whenever trade closes, regardless of time
+  - 9:45 AM + 10:15 AM status updates (skipped if trade already fired)
+  - Zero SPY/QQQ output anywhere
+  - Entry signals bypass cooldown (0s) — commentary still 5 min
+  - Full gate audit log — every webhook logged with pass/block reason
+  - Emergency DM to Junior if stop-loss placement fails
 """
 
 import os
 import json
 import hmac
+import hashlib
 import logging
-import threading
 import time as time_module
-from datetime import datetime, time as dtime, timedelta
-from zoneinfo import ZoneInfo
+import threading
+from datetime import datetime, date, timedelta
+import pytz
 import requests
+import anthropic as anthropic_sdk
 from flask import Flask, request, jsonify
-from anthropic import Anthropic
-from tastytrade_executor import (
-    is_authenticated, find_option_contract,
-    place_order, close_position, get_positions, get_account_balance,
-    wait_for_fill, BASE_URL, PAPER_TRADING
-)
-import volume_profile
-import alpaca_stream
-import position_manager
-# alpaca_executor kept for data streaming only (not execution)
-import alpaca_executor
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("main")
 
 app = Flask(__name__)
-log.info(f"📦 Module main.py imported — process PID {os.getpid()}")
+log.info(f"TPP Trading Server v5.0 — PID {os.getpid()}")
 
-# ── Clients ───────────────────────────────────────────────────────────────────
-anthropic = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+ET = pytz.timezone("America/New_York")
 
-# ── Config from environment ───────────────────────────────────────────────────
-WEBHOOK_SECRET      = os.environ["WEBHOOK_SECRET"]
-DISCORD_BOT_TOKEN   = os.environ["DISCORD_BOT_TOKEN"]
-DISCORD_GUILD_ID    = os.environ["DISCORD_GUILD_ID"]
-CHANNEL_WATCHLIST   = os.environ["DISCORD_CHANNEL_WATCHLIST"]
-CHANNEL_DAY_SIGNALS = os.environ["DISCORD_CHANNEL_DAY_SIGNALS"]
-CHANNEL_SWING_SIGNALS = os.environ["DISCORD_CHANNEL_SWING_SIGNALS"]
-CHANNEL_RECAPS      = os.environ["DISCORD_CHANNEL_RECAPS"]
-CHANNEL_LONGTERM    = os.environ["DISCORD_CHANNEL_LONGTERM"]
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS & ENV
+# ══════════════════════════════════════════════════════════════════════════════
+TRADEABLE_TICKERS  = {"NVDA", "TSLA"}
+WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "")
+DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
+JUNIOR_USER_ID     = os.environ.get("JUNIOR_DISCORD_USER_ID", "")
+ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+TT_BASE            = "https://api.tastytrade.com"
+TT_USER            = os.environ["TASTYTRADE_USERNAME"]
+TT_PASS            = os.environ["TASTYTRADE_PASSWORD"]
+TT_ACCOUNT         = os.environ["TASTYTRADE_ACCOUNT_NUMBER"]
+DISCORD_API        = "https://discord.com/api/v10"
+CLAUDE_MODEL       = "claude-sonnet-4-6"
+MAX_DAILY_CALLS    = 150
+MIN_PREMIUM        = 0.75   # per share → $75/contract
+MAX_PREMIUM        = 1.50   # per share → $150/contract
+MAX_SPREAD         = 0.05   # 5% bid-ask spread cap
+FILL_TIMEOUT       = 60     # seconds before cancel on entry
+CLOSE_TIMEOUT      = 45     # seconds before market escalation on exit
 
-ET = ZoneInfo("America/New_York")
-
-# ── Approved tickers ──────────────────────────────────────────────────────────
-DAY_TRADE_TICKERS = {"NVDA", "TSLA"}  # v4.0: focus list per Junior — all others ignored
-SWING_TICKERS     = {"SPY", "QQQ", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOG"}
-
-# ── Active positions tracking ─────────────────────────────────────────────────
-active_positions = {}  # symbol -> {order_id, entry_price, quantity, ticker, direction}
-
-# ── Session state (resets at midnight ET) ─────────────────────────────────────
-session = {
-    "date": None,
-    "trade_count": 0,
-    "consecutive_losses": 0,
-    "circuit_breaker": False,
-    "kill_switch_active": False,
-    "kill_switch_reason": None,
+CHANNEL_IDS = {
+    "daily-watchlist":    os.environ.get("DISCORD_CHANNEL_WATCHLIST",  ""),
+    "day-trade-signals":  os.environ.get("DISCORD_CHANNEL_SIGNALS",    ""),
+    "profits-and-recaps": os.environ.get("DISCORD_CHANNEL_RECAPS",     ""),
 }
 
-def reset_session_if_new_day():
-    today = datetime.now(ET).date()
-    if session["date"] != today:
-        session.update({
-            "date": today,
-            "trade_count": 0,
-            "consecutive_losses": 0,
-            "circuit_breaker": False,
-            "kill_switch_active": False,
-            "kill_switch_reason": None,
-        })
-        save_session_state()
-        log.info(f"Session reset for {today}")
+MARKET_HOLIDAYS_2026 = {
+    date(2026,  1,  1), date(2026,  1, 19), date(2026,  2, 16),
+    date(2026,  4,  3), date(2026,  5, 25), date(2026,  6, 19),
+    date(2026,  7,  3), date(2026,  9,  7), date(2026, 11, 26),
+    date(2026, 12, 25),
+}
 
-# ── Day-of-week checks ────────────────────────────────────────────────────────
+FOMC_DECISION_DAYS_2026 = {
+    date(2026,  1, 29), date(2026,  3, 19), date(2026,  5,  7),
+    date(2026,  6, 18), date(2026,  7, 29), date(2026,  9, 16),
+    date(2026, 10, 28), date(2026, 12,  9),
+}
 
-EARLY_CLOSE_DAYS_2026 = {"2026-11-27", "2026-12-24"}  # 1 PM closes — no day trading (Kill Switch 7)
-
-def is_off_day() -> bool:
-    """Weekends + actual US market holidays + early-close days. Fridays are TRADING DAYS."""
-    now = datetime.now(ET)
-    if now.weekday() >= 5:
-        return True
-    d = now.date().isoformat()
-    return d in US_MARKET_HOLIDAYS or d in EARLY_CLOSE_DAYS_2026
-
-# ── Time window checks ────────────────────────────────────────────────────────
-
-TRADE_WINDOWS = os.environ.get("TRADE_WINDOWS", "09:30-10:30,14:00-15:55")
-
-def in_day_trade_window() -> bool:
-    """Entry windows, env-configurable. Default: morning hour + afternoon trend window."""
-    now = datetime.now(ET).time()
-    for win in TRADE_WINDOWS.split(","):
-        try:
-            s, e = win.strip().split("-")
-            sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
-            if dtime(sh, sm) <= now <= dtime(eh, em):
-                return True
-        except Exception:
-            continue
-    return False
-
-def in_swing_window() -> bool:
-    if not SWING_ENABLED:
-        return False
-    now = datetime.now(ET).time()
-    return dtime(15, 0) <= now <= dtime(16, 0)
-
-def in_dead_zone() -> bool:
-    now = datetime.now(ET).time()
-    return dtime(9, 30) <= now <= dtime(16, 0) and not in_day_trade_window()
-
-# ── BUILT-IN 2026 ECONOMIC CALENDAR (verified against Fed official schedule) ──
-# FOMC rate decisions: 2:00 PM ET — Kill Switch 2: FULL session halt
-FOMC_DECISION_DATES = {"2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"}
-# FOMC minutes: 2:00 PM ET, 3 weeks after each decision — blocks the 3-4 PM swing window
-FOMC_MINUTES_DATES  = {"2026-07-08", "2026-08-19", "2026-10-07", "2026-11-18", "2026-12-30"}
-US_MARKET_HOLIDAYS  = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
-                       "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25"}
-
-def _nth_business_day(year: int, month: int, n: int):
-    """Nth business day of a month, skipping weekends and US market holidays."""
-    from datetime import date, timedelta
-    d, count = date(year, month, 1), 0
-    while True:
-        if d.weekday() < 5 and d.isoformat() not in US_MARKET_HOLIDAYS:
-            count += 1
-            if count == n:
-                return d
-        d += timedelta(days=1)
-
-def todays_scheduled_events() -> list:
-    """High-impact events scheduled for today, computed — never goes stale."""
-    now = datetime.now(ET)
-    today_iso = now.date().isoformat()
-    events = []
-    if today_iso in FOMC_DECISION_DATES:
-        events.append(("FOMC_RATE_DECISION", "full-day"))
-    if today_iso in FOMC_MINUTES_DATES:
-        events.append(("FOMC_MINUTES_2PM", "13:45-16:00"))
-    if now.date() == _nth_business_day(now.year, now.month, 1):
-        events.append(("ISM_MANUFACTURING_10AM", "09:45-10:15"))
-    if now.date() == _nth_business_day(now.year, now.month, 3):
-        events.append(("ISM_SERVICES_10AM", "09:45-10:15"))
-    return events
-
-def is_fomc_decision_day() -> bool:
-    return datetime.now(ET).date().isoformat() in FOMC_DECISION_DATES
-
-def in_report_blackout() -> bool:
-    """Code-enforced economic report blackouts (Kill Switch 1).
-    Env var REPORT_BLACKOUTS, comma-separated windows:
-      "2026-07-06:09:45-10:15"  -> applies only on that date
-      "09:45-10:15"             -> applies every trading day
-    """
-    now = datetime.now(ET)
-    # Built-in calendar first (automatic, every day, forever)
-    for _name, window in todays_scheduled_events():
-        if window == "full-day":
-            return True
-        s, e = window.split("-")
-        sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
-        if dtime(sh, sm) <= now.time() <= dtime(eh, em):
-            return True
-    # Auto-scanned windows from this morning's calendar scan (additive only)
-    for w in get_scanned_blackouts():
-        try:
-            s, e = w["window"].split("-")
-            sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
-            if dtime(sh, sm) <= now.time() <= dtime(eh, em):
-                return True
-        except Exception:
-            continue
-    # Then manual env var overrides for one-off events (Fed testimony, addresses, etc.)
-    raw = os.environ.get("REPORT_BLACKOUTS", "")
-    if not raw:
-        return False
-    today_iso = now.date().isoformat()
-    for win in raw.split(","):
-        win = win.strip()
-        if not win:
-            continue
-        try:
-            if win.count(":") == 3:                 # date-scoped
-                date_part, time_part = win.split(":", 1)
-                if date_part != today_iso:
-                    continue
-            else:
-                time_part = win
-            start_s, end_s = time_part.split("-")
-            sh, sm = map(int, start_s.split(":"))
-            eh, em = map(int, end_s.split(":"))
-            if dtime(sh, sm) <= now.time() <= dtime(eh, em):
-                return True
-        except Exception:
-            continue
-    return False
+# ══════════════════════════════════════════════════════════════════════════════
+#  SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+_TMP_PATH = "/tmp/tpp_v5_session.json"
+_state: dict = {}
 
 
-# ── Resilient candles: stream store first, Alpaca REST fallback (restart-proof) ──
-def get_candles_resilient(ticker: str, limit: int = 30) -> list:
-    candles = []
+def _blank_state(today: str) -> dict:
+    return {
+        "trade_count":        0,
+        "consecutive_losses": 0,
+        "circuit_breaker":    False,
+        "open_position":      None,
+        "last_reset_date":    today,
+        "daily_trade_log":    [],
+    }
+
+
+def _save_state(s: dict):
     try:
-        candles = alpaca_stream.get_candles(ticker, limit=limit) or []
+        with open(_TMP_PATH, "w") as f:
+            json.dump(s, f)
+    except Exception as e:
+        log.warning(f"State save failed: {e}")
+
+
+def load_state() -> dict:
+    global _state
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    if _state.get("last_reset_date") == today:
+        return _state
+    # Try disk
+    try:
+        with open(_TMP_PATH) as f:
+            data = json.load(f)
+        if data.get("last_reset_date") == today:
+            _state = data
+            return _state
     except Exception:
-        candles = []
-    if len(candles) >= max(5, limit // 2):
-        return candles
-    # Stream store thin (fresh restart / backfill in progress) → REST fetch
+        pass
+    # Try Render env
+    raw = os.environ.get("SESSION_STATE_JSON", "")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if data.get("last_reset_date") == today:
+                _state = data
+                _save_state(_state)
+                return _state
+        except Exception:
+            pass
+    log.info(f"New trading day {today} — resetting session state")
+    _state = _blank_state(today)
+    _save_state(_state)
+    return _state
+
+
+def _commit(s: dict):
+    global _state
+    _state = s
+    _save_state(s)
+
+
+def get_trade_count() -> int:
+    return load_state()["trade_count"]
+
+def get_circuit_breaker() -> bool:
+    return load_state()["circuit_breaker"]
+
+def get_open_position() -> dict | None:
+    return load_state()["open_position"]
+
+def is_max_trades_reached() -> bool:
+    return load_state()["trade_count"] >= 2
+
+def increment_trade_count():
+    s = load_state()
+    s["trade_count"] += 1
+    log.info(f"Trade count → {s['trade_count']}")
+    _commit(s)
+
+def set_open_position(position: dict):
+    s = load_state()
+    s["open_position"] = position
+    _commit(s)
+
+def clear_open_position():
+    s = load_state()
+    s["open_position"] = None
+    _commit(s)
+
+def record_trade_result(win: bool):
+    s = load_state()
+    if win:
+        s["consecutive_losses"] = 0
+        log.info("Win recorded — loss counter reset")
+    else:
+        s["consecutive_losses"] += 1
+        log.info(f"Loss recorded — consecutive: {s['consecutive_losses']}")
+        if s["consecutive_losses"] >= 2:
+            s["circuit_breaker"] = True
+            log.warning("CIRCUIT BREAKER — 2 consecutive losses, day over")
+    s["daily_trade_log"].append({
+        "result": "win" if win else "loss",
+        "time":   datetime.now(ET).isoformat(),
+    })
+    _commit(s)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DISCORD
+# ══════════════════════════════════════════════════════════════════════════════
+_last_discord_hash: dict[str, str] = {}
+
+
+def _msg_hash(msg: str) -> str:
+    return hashlib.md5(msg.encode()).hexdigest()
+
+
+def post_to_discord(channel: str, message: str) -> bool:
+    channel_id = CHANNEL_IDS.get(channel)
+    if not channel_id:
+        log.error(f"No channel ID for '{channel}'")
+        return False
+    h = _msg_hash(message)
+    if _last_discord_hash.get(channel) == h:
+        log.info(f"Dedup skip — identical message to #{channel}")
+        return True
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type":  "application/json",
+    }
+    resp = requests.post(
+        f"{DISCORD_API}/channels/{channel_id}/messages",
+        headers=headers,
+        json={"content": message},
+        timeout=10,
+    )
+    if resp.status_code in (200, 201):
+        _last_discord_hash[channel] = h
+        log.info(f"Discord → #{channel}: {message[:80]}…")
+        return True
+    log.error(f"Discord post failed #{channel}: {resp.status_code} {resp.text}")
+    return False
+
+
+def send_emergency_dm(message: str):
+    if not JUNIOR_USER_ID:
+        log.warning("JUNIOR_DISCORD_USER_ID not set — cannot DM")
+        return
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type":  "application/json",
+    }
+    dm = requests.post(
+        f"{DISCORD_API}/users/@me/channels",
+        headers=headers,
+        json={"recipient_id": JUNIOR_USER_ID},
+        timeout=10,
+    )
+    if dm.status_code not in (200, 201):
+        log.error(f"DM channel creation failed: {dm.text}")
+        return
+    requests.post(
+        f"{DISCORD_API}/channels/{dm.json()['id']}/messages",
+        headers=headers,
+        json={"content": f"🚨 **TPP ALERT** 🚨\n{message}"},
+        timeout=10,
+    )
+    log.warning(f"Emergency DM sent: {message}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GATE CHECKS
+# ══════════════════════════════════════════════════════════════════════════════
+_last_entry_signal: dict[str, datetime]    = {}
+_last_commentary:   dict[str, datetime]    = {}
+COMMENTARY_COOLDOWN = 300  # 5 minutes
+
+
+def _gate_market_day() -> tuple[bool, str]:
+    today = datetime.now(ET).date()
+    if today.weekday() >= 5:
+        return False, f"weekend ({today.strftime('%A')})"
+    if today in MARKET_HOLIDAYS_2026:
+        return False, f"market holiday ({today})"
+    return True, "ok"
+
+
+def _gate_window() -> tuple[bool, str]:
+    """Gates NEW entries only. Does not affect position monitoring."""
+    now    = datetime.now(ET)
+    open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_ = now.replace(hour=10, minute=30, second=0, microsecond=0)
+    if open_ <= now <= close_:
+        return True, "ok"
+    return False, f"outside 9:30–10:30 AM window ({now.strftime('%H:%M ET')})"
+
+
+def _gate_ticker(ticker: str) -> tuple[bool, str]:
+    if ticker in TRADEABLE_TICKERS:
+        return True, "ok"
+    return False, f"{ticker} not in whitelist {TRADEABLE_TICKERS}"
+
+
+def _gate_blackout() -> tuple[bool, str]:
+    today = datetime.now(ET).date()
+    if today in FOMC_DECISION_DAYS_2026:
+        return True, "FOMC decision day — full day halt"
+    if os.environ.get("MANUAL_BLACKOUT", "0").strip() == "1":
+        return True, "manual blackout active"
+    return False, "ok"
+
+
+def _gate_circuit_breaker() -> tuple[bool, str]:
+    if get_circuit_breaker():
+        return True, "circuit breaker — 2 consecutive losses today"
+    return False, "ok"
+
+
+def _gate_max_trades() -> tuple[bool, str]:
+    if is_max_trades_reached():
+        return True, f"max trades reached ({get_trade_count()}/2)"
+    return False, "ok"
+
+
+def _gate_open_position() -> tuple[bool, str]:
+    pos = get_open_position()
+    if pos:
+        return True, f"position already open: {pos.get('occ_symbol')}"
+    return False, "ok"
+
+
+def _gate_cooldown(ticker: str, signal_type: str) -> tuple[bool, str]:
+    now = datetime.now(ET)
+    if signal_type == "entry":
+        _last_entry_signal[ticker] = now
+        return True, "entry signals bypass cooldown"
+    last = _last_commentary.get(ticker)
+    if last:
+        elapsed = (now - last).total_seconds()
+        if elapsed < COMMENTARY_COOLDOWN:
+            return False, f"commentary cooldown — {int(COMMENTARY_COOLDOWN - elapsed)}s left"
+    _last_commentary[ticker] = now
+    return True, "ok"
+
+
+def all_gates_pass(ticker: str, signal_type: str = "entry") -> bool:
+    checks = [
+        ("market_day",      _gate_market_day),
+        ("window",          _gate_window),
+        ("ticker",          lambda: _gate_ticker(ticker)),
+        ("blackout",        _gate_blackout),
+        ("circuit_breaker", _gate_circuit_breaker),
+        ("max_trades",      _gate_max_trades),
+        ("open_position",   _gate_open_position),
+        ("cooldown",        lambda: _gate_cooldown(ticker, signal_type)),
+    ]
+    for name, fn in checks:
+        passed, reason = fn()
+        if not passed:
+            log.info(f"GATE BLOCKED [{ticker}] [{signal_type}] — {name}: {reason}")
+            return False
+    log.info(f"GATE PASSED [{ticker}] [{signal_type}] — all clear → Claude")
+    return True
+
+
+def _in_window() -> bool:
+    now = datetime.now(ET)
+    return (now.hour == 9 and now.minute >= 30) or (now.hour == 10 and now.minute < 30)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TASTYTRADE CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+_tt_token        = None
+_tt_token_expiry = None
+
+
+def _tt_get_token() -> str:
+    global _tt_token, _tt_token_expiry
+    now = datetime.now(ET)
+    if _tt_token and _tt_token_expiry and now < _tt_token_expiry:
+        return _tt_token
+    resp = requests.post(
+        f"{TT_BASE}/sessions",
+        json={"login": TT_USER, "password": TT_PASS, "remember-me": True},
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    if resp.status_code != 201:
+        raise RuntimeError(f"Tastytrade auth failed {resp.status_code}: {resp.text}")
+    _tt_token        = resp.json()["data"]["session-token"]
+    _tt_token_expiry = now + timedelta(hours=23)
+    log.info("Tastytrade session refreshed")
+    return _tt_token
+
+
+def _tt_headers() -> dict:
+    return {"Authorization": _tt_get_token(), "Content-Type": "application/json"}
+
+
+def _next_friday() -> date:
+    today = datetime.now(ET).date()
+    now   = datetime.now(ET)
+    days  = (4 - today.weekday()) % 7 or 7
+    if today.weekday() == 3 and now.hour >= 14:
+        days += 7
+    return today + timedelta(days=days)
+
+
+def _spot_price(ticker: str) -> float | None:
+    # Alpaca REST primary
     try:
         key    = os.environ.get("ALPACA_API_KEY", "")
         secret = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
-        for feed in ("sip", "iex"):
-            resp = requests.get(
-                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
-                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
-                params={"timeframe": "1Min", "limit": limit, "adjustment": "raw", "feed": feed},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                bars = resp.json().get("bars", [])
-                if bars:
-                    return [{"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"],
-                             "c": b["c"], "v": b["v"]} for b in bars]
-            if resp.status_code != 403:
-                break
+        resp   = requests.get(
+            f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            params={"feed": "sip"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            quote = resp.json().get("quote", {})
+            ask   = float(quote.get("ap", 0))
+            bid   = float(quote.get("bp", 0))
+            if ask and bid:
+                return (ask + bid) / 2
     except Exception as e:
-        log.error(f"REST candle fallback failed for {ticker}: {e}")
-    return candles
-
-# ── Discord helper ────────────────────────────────────────────────────────────
-DISCORD_API = "https://discord.com/api/v10"
-DISCORD_POSTING_ENABLED = os.environ.get("DISCORD_POSTING_ENABLED", "true").lower() == "true"
-SWING_ENABLED      = os.environ.get("SWING_ENABLED", "false").lower() == "true"
-EOD_RECAP_ENABLED  = os.environ.get("EOD_RECAP_ENABLED", "false").lower() == "true"
-
-def post_discord(channel_id: str, message: str) -> bool:
-    if not DISCORD_POSTING_ENABLED:
-        log.info(f"Discord posting disabled — suppressed message to channel {channel_id}")
-        return False
-
-    # ── FRIDAY BLOCK ──────────────────────────────────────────────────────────
-    if is_off_day():
-        log.info("Friday — Discord posting suppressed (no-trading day)")
-        return False
-
-    url = f"{DISCORD_API}/channels/{channel_id}/messages"
-    headers = {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    chunks = [message[i:i+1990] for i in range(0, len(message), 1990)]
-    success = True
-    for chunk in chunks:
-        resp = requests.post(url, headers=headers, json={"content": chunk})
-        if resp.status_code not in (200, 201):
-            log.error(f"Discord post failed: {resp.status_code} — {resp.text}")
-            success = False
-    return success
-
-
-def _discord_already_posted_today(channel_id: str, marker: str) -> bool:
-    """Check the channel's recent messages for a post containing `marker` made
-    today (ET). The channel is durable memory — survives restarts and deploys."""
+        log.warning(f"Alpaca spot failed for {ticker}: {e}")
+    # Tastytrade fallback
     try:
         resp = requests.get(
-            f"{DISCORD_API}/channels/{channel_id}/messages",
-            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
-            params={"limit": 10}, timeout=10,
+            f"{TT_BASE}/market-data/equities",
+            headers=_tt_headers(),
+            params={"symbols[]": ticker},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            items = resp.json()["data"]["items"]
+            if items:
+                return float(items[0].get("last", 0)) or None
+    except Exception as e:
+        log.error(f"Tastytrade spot fallback failed for {ticker}: {e}")
+    return None
+
+
+def _live_option_quote(occ_symbol: str) -> dict | None:
+    try:
+        resp = requests.get(
+            f"{TT_BASE}/market-data/options",
+            headers=_tt_headers(),
+            params={"symbols[]": occ_symbol},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            items = resp.json()["data"]["items"]
+            return items[0] if items else None
+    except Exception as e:
+        log.error(f"Quote fetch failed for {occ_symbol}: {e}")
+    return None
+
+
+def _build_occ(ticker: str, expiry: date, strike: float, opt_type: str) -> str:
+    return f"{ticker}{expiry.strftime('%y%m%d')}{opt_type}{int(strike * 1000):08d}"
+
+
+def select_contract(ticker: str, direction: str) -> tuple[str | None, float | None, float | None]:
+    expiry   = _next_friday()
+    opt_type = "C" if direction == "call" else "P"
+    spot     = _spot_price(ticker)
+    if not spot:
+        log.error(f"No spot price for {ticker}")
+        return None, None, None
+    resp = requests.get(
+        f"{TT_BASE}/option-chains/{ticker}/nested",
+        headers=_tt_headers(),
+        params={"expiration-date": expiry.strftime("%Y-%m-%d")},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        log.error(f"Chain fetch failed for {ticker}: {resp.text}")
+        return None, None, None
+    expirations = resp.json()["data"].get("expirations", [])
+    target_exp  = next(
+        (e for e in expirations if e["expiration-date"] == expiry.strftime("%Y-%m-%d")), None
+    )
+    if not target_exp:
+        log.error(f"No expiry {expiry} for {ticker}")
+        return None, None, None
+    strikes = sorted(float(s["strike-price"]) for s in target_exp.get("strikes", []))
+    if not strikes:
+        return None, None, None
+    atm     = min(strikes, key=lambda s: abs(s - spot))
+    atm_idx = strikes.index(atm)
+    ordered = strikes[atm_idx:] if direction == "call" else list(reversed(strikes[:atm_idx + 1]))
+    for strike in ordered:
+        occ   = _build_occ(ticker, expiry, strike, opt_type)
+        quote = _live_option_quote(occ)
+        if not quote:
+            continue
+        ask    = float(quote.get("ask") or 0)
+        bid    = float(quote.get("bid") or 0)
+        if ask <= 0:
+            continue
+        if ask < MIN_PREMIUM:
+            log.info(f"OTM walk stopped at {strike} — ask ${ask:.2f} below min")
+            break
+        spread = (ask - bid) / ask if ask else 1
+        if spread >= MAX_SPREAD:
+            log.info(f"Strike {strike} skipped — spread {spread:.1%}")
+            continue
+        if MIN_PREMIUM <= ask <= MAX_PREMIUM:
+            log.info(f"Contract: {occ} | ask=${ask:.2f}/share (${ask*100:.0f}/contract)")
+            return occ, strike, ask
+        log.info(f"Strike {strike} ask=${ask:.2f} above max — moving OTM")
+    log.warning(f"No valid contract for {ticker} {direction} in ${MIN_PREMIUM}–${MAX_PREMIUM}")
+    return None, None, None
+
+
+def _tt_place_order(payload: dict) -> str | None:
+    resp = requests.post(
+        f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders",
+        headers=_tt_headers(),
+        json=payload,
+        timeout=10,
+    )
+    if resp.status_code not in (200, 201):
+        log.error(f"Order failed {resp.status_code}: {resp.text}")
+        return None
+    order_id = str(resp.json()["data"]["order"]["id"])
+    log.info(f"Order placed → ID {order_id}")
+    return order_id
+
+
+def _tt_poll_fill(order_id: str, timeout: int) -> float | None:
+    deadline = time_module.time() + timeout
+    while time_module.time() < deadline:
+        resp = requests.get(
+            f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders/{order_id}",
+            headers=_tt_headers(), timeout=5,
         )
         if resp.status_code != 200:
-            return False
-        today = datetime.now(ET).date()
-        for msg in resp.json():
-            ts = msg.get("timestamp", "")
-            try:
-                msg_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ET).date()
-            except Exception:
-                continue
-            if msg_date == today and marker.lower() in msg.get("content", "").lower():
-                return True
-    except Exception as e:
-        log.error(f"Discord dedup check failed: {e}")
-    return False
+            time_module.sleep(2)
+            continue
+        order  = resp.json()["data"]["order"]
+        status = order.get("status", "")
+        if status == "Filled":
+            fill = float(order["legs"][0].get("average-fill-price", 0))
+            log.info(f"FILLED {order_id} @ ${fill:.2f}/share (${fill*100:.0f}/contract)")
+            return fill
+        if status in ("Cancelled", "Rejected", "Expired"):
+            log.warning(f"Order {order_id}: {status}")
+            return None
+        time_module.sleep(3)
+    log.warning(f"Order {order_id} timed out — cancelling")
+    _tt_cancel_order(order_id)
+    return None
 
-# ── Load system prompt ────────────────────────────────────────────────────────
-def get_system_prompt() -> str:
-    path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
-    with open(path, "r") as f:
-        return f.read()
 
-# ── Claude analysis ───────────────────────────────────────────────────────────
-def analyze_with_claude(alert_data: dict, analysis_type: str) -> str:
-    system_prompt = get_system_prompt()
-
-    now_et = datetime.now(ET)
-
-    # Parse the alert's own timestamp so Claude reasons about ALERT time, not processing time
-    alert_time_raw = alert_data.get("time", "")
-    try:
-        alert_dt_utc = datetime.fromisoformat(alert_time_raw.replace("Z", "+00:00"))
-        alert_dt_et  = alert_dt_utc.astimezone(ET)
-        alert_time_et_str = alert_dt_et.strftime("%I:%M %p ET")
-    except Exception:
-        alert_time_et_str = "unknown (parse error)"
-
-    tt_status = "CONNECTED (PAPER)" if (is_authenticated() and PAPER_TRADING) else \
-                "CONNECTED (LIVE)"  if (is_authenticated() and not PAPER_TRADING) else \
-                "NOT CONNECTED"
-
-    ticker = alert_data.get("ticker", "").upper()
-    zones  = volume_profile.get_zones(ticker)
-
-    if zones:
-        zone_text = f"""
-VOLUME PROFILE ZONES FOR {ticker} (auto-calculated, last updated {zones.get('updated_at', 'unknown')}):
-1H — Point of Control: {zones.get('1H', {}).get('poc', 'N/A')} | Demand Zone: {zones.get('1H', {}).get('demand', 'N/A')} | Supply Zone: {zones.get('1H', {}).get('supply', 'N/A')}
-4H — Point of Control: {zones.get('4H', {}).get('poc', 'N/A')} | Demand Zone: {zones.get('4H', {}).get('demand', 'N/A')} | Supply Zone: {zones.get('4H', {}).get('supply', 'N/A')}
-"""
-    else:
-        zone_text = f"\nVOLUME PROFILE ZONES FOR {ticker}: NOT AVAILABLE this session — treat any zone-dependent confirmation (Rules 1, 2, 5, 6) as UNCONFIRMED.\n"
-
-    # Include last 10 live candles from Alpaca for real-time price structure context
-    recent_candles = get_candles_resilient(ticker, limit=15)
-    if recent_candles:
-        candle_text = f"\nRECENT 1-MIN CANDLES FOR {ticker} (time O/H/L/C/V, most recent last):\n"
-        candle_text += "\n".join(
-            f"{c.get('t','')[11:16]} {c.get('o')}/{c.get('h')}/{c.get('l')}/{c.get('c')}/{c.get('v')}"
-            for c in recent_candles) + "\n"
-    else:
-        candle_text = f"\nRECENT CANDLES FOR {ticker}: UNAVAILABLE from both live stream and REST — treat all candle-dependent confirmations as failed.\n"
-
-    context = f"""
-CURRENT SERVER TIME (ET): {now_et.strftime('%A, %B %d, %Y %I:%M %p ET')}
-ALERT TRIGGER TIME (ET):  {alert_time_et_str}   ← USE THIS for time-window checks, not server time
-DAY OF WEEK: {now_et.strftime('%A')}
-
-IMPORTANT TIME-WINDOW RULES (hard-coded — do NOT override):
-- Entries are valid ONLY inside these ET windows: {TRADE_WINDOWS} (checked in code before you see any alert).
-  Use the ALERT TRIGGER TIME above for this check, not server processing time.
-- Dead zone (NO trades of any kind): after 10:30 AM ET for the rest of the session
-- Swing trades are PAUSED — reject any swing setup; day trades only
-- Friday is a NO-TRADING day — respond NO_TRADE for all signals.
-- Weekend (Sat/Sun) — respond NO_TRADE.
-- ECONOMIC REPORT BLACKOUTS are enforced by code before you ever see an alert;
-  if you receive an alert, no blackout is active. Do not invent report-based rejections.
-- The 10 AM LOCKOUT in the playbook (Rule 6) means: if NO trade has been executed
-  by 10:00 AM and no A+ setup is printing, STOP scanning. It does NOT mean all
-  signals after 10 AM are automatically rejected — signals between 10:00 AM and
-  10:30 AM are still valid if they meet all other criteria.
-
-SESSION TRADE COUNT TODAY: {session['trade_count']}
-TIME IN WINDOW: {alert_time_et_str} (window closes 10:30 AM ET — if past 10:00 AM and trade_count=0, escalate to Tier 3)
-CONSECUTIVE LOSSES TODAY: {session['consecutive_losses']}
-CIRCUIT BREAKER ACTIVE: {session['circuit_breaker']}
-TASTYTRADE STATUS: {tt_status}
-
-{zone_text}{candle_text}
-
-INCOMING ALERT DATA:
-{json.dumps(alert_data, indent=2)}
-
-ANALYSIS TYPE REQUESTED: {analysis_type}
-
-Based on my complete trading playbook and all rules in your system prompt:
-1. Run the full 5-category pre-flight checklist against this alert
-2. Use the ALERT TRIGGER TIME (not server time) for all time-window checks
-3. Check the alert against the 3-Screen Confluence System (Rules 1-6)
-4. Determine if this is a valid trade signal, watchlist note, or no-trade
-5. If valid: format the exact Discord message in Junior's voice
-6. If not valid: explain briefly why (1-2 sentences max, no lengthy breakdowns)
-
-TIERED ENTRY SYSTEM — ACTIVE:
-You must attempt to find at least one trade per day. Evaluate setups in this order:
-
-TIER 1 — A+ STANDARD (full rulebook, all confirmations): Enter if found. No risk label.
-TIER 2 — A RELAXED (volume ≥ 1.0x OR one missing confirmation but clean structure): Enter if no Tier 1 found. Label: ⚡ STANDARD SETUP
-TIER 3 — HIGH RISK OPPORTUNISTIC (chop protocol C1/C2, OR pre-market zone reaction, OR structural level play without full EMA confluence): Enter if no Tier 1/2 found AND trade_count=0 AND time is past 10:00 AM ET. Label: ⚠️ HIGH RISK — use the high-risk template.
-
-CONSECUTIVE INACTIVITY RULE: If SESSION TRADE COUNT = 0 and it is past 10:00 AM ET, you MUST find a Tier 3 entry unless:
-- It is an FOMC rate decision day
-- Every ticker is in a dead range with NO structural level in play (state this explicitly)
-- The two-strike circuit breaker is active
-
-IMPORTANT: Start your response with exactly one of these tags on the first line:
-- TRADE_VALID: (if this should be executed — include tier in brackets e.g. TRADE_VALID: [TIER-1])
-- NO_TRADE: (if genuinely no setup exists across all three tiers — requires explicit explanation of why all tiers failed)
-- WATCHLIST: (if this is a watchlist update only)
-
-Then on the next lines, write the Discord message exactly as Junior would post it.
-For HIGH RISK trades use the ⚠️ HIGH RISK template from the chop protocol section.
-Keep NO_TRADE explanations to 1-2 sentences, and only use NO_TRADE if all three tiers genuinely fail.
-"""
-
-    response = anthropic.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        system=[
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": context}]
+def _tt_cancel_order(order_id: str):
+    requests.delete(
+        f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders/{order_id}",
+        headers=_tt_headers(), timeout=5,
     )
-    return response.content[0].text
+    log.info(f"Cancelled order {order_id}")
 
-# ── Route alert to correct Discord channel ────────────────────────────────────
-def route_to_channel(alert_type: str, analysis_type: str) -> str:
-    if analysis_type == "WATCHLIST":
-        return CHANNEL_WATCHLIST
-    elif analysis_type == "SWING_SIGNAL":
-        return CHANNEL_SWING_SIGNALS
-    elif analysis_type == "RECAP":
-        return CHANNEL_RECAPS
-    elif analysis_type == "LONGTERM":
-        return CHANNEL_LONGTERM
+
+def enter_trade(occ_symbol: str) -> float | None:
+    order_id = _tt_place_order({
+        "time-in-force": "Day",
+        "order-type":    "Market",
+        "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
+                  "quantity": 1, "action": "Buy to Open"}],
+    })
+    return _tt_poll_fill(order_id, FILL_TIMEOUT) if order_id else None
+
+
+def place_stop_loss(occ_symbol: str, fill_price: float) -> str | None:
+    trigger  = round(fill_price * 0.75, 2)
+    limit    = round(fill_price * 0.70, 2)
+    order_id = _tt_place_order({
+        "time-in-force": "Day",
+        "order-type":    "Stop Limit",
+        "stop-trigger":  str(trigger),
+        "price":         str(limit),
+        "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
+                  "quantity": 1, "action": "Sell to Close"}],
+    })
+    if order_id:
+        log.info(f"Stop-limit: trigger=${trigger} limit=${limit} → {order_id}")
     else:
-        return CHANNEL_DAY_SIGNALS
+        log.critical(f"STOP LOSS FAILED for {occ_symbol} — MANUAL INTERVENTION NEEDED")
+    return order_id
 
-# ── Determine analysis type from alert ───────────────────────────────────────
-def determine_analysis_type(alert_data: dict) -> str:
-    alert_type = alert_data.get("alert_type", "")
-    if "WATCHLIST" in alert_type:
-        return "WATCHLIST"
-    elif in_swing_window():
-        return "SWING_SIGNAL"
-    elif "RECAP" in alert_type or "CLOSE" in alert_type:
-        return "RECAP"
-    elif in_day_trade_window():
-        return "DAY_SIGNAL"
+
+def close_position_tt(occ_symbol: str, reason: str, current_bid: float) -> float:
+    log.info(f"Closing {occ_symbol} — {reason}")
+    order_id = _tt_place_order({
+        "time-in-force": "Day",
+        "order-type":    "Limit",
+        "price":         str(round(current_bid, 2)),
+        "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
+                  "quantity": 1, "action": "Sell to Close"}],
+    })
+    fill = _tt_poll_fill(order_id, CLOSE_TIMEOUT) if order_id else None
+    if not fill:
+        log.warning(f"Limit close not filled in {CLOSE_TIMEOUT}s — escalating to market")
+        if order_id:
+            _tt_cancel_order(order_id)
+        mkt_id = _tt_place_order({
+            "time-in-force": "Day",
+            "order-type":    "Market",
+            "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
+                      "quantity": 1, "action": "Sell to Close"}],
+        })
+        fill = _tt_poll_fill(mkt_id, FILL_TIMEOUT) if mkt_id else current_bid
+    return fill or current_bid
+
+
+def cancel_resting_stop(stop_order_id: str | None):
+    if stop_order_id:
+        _tt_cancel_order(stop_order_id)
+        log.info(f"Resting stop {stop_order_id} cancelled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POSITION MONITOR
+#  Runs past 10:30 AM if position open — no forced flatten at window close
+# ══════════════════════════════════════════════════════════════════════════════
+def monitor_open_position():
+    pos = get_open_position()
+    if not pos:
+        return
+
+    now        = datetime.now(ET)
+    occ        = pos["occ_symbol"]
+    fill_price = float(pos["fill_price"])
+    entry_time = datetime.fromisoformat(pos["entry_time"])
+    peak_pnl   = float(pos.get("peak_pnl", 0.0))
+
+    quote = _live_option_quote(occ)
+    if not quote:
+        log.warning(f"No quote for {occ} — skipping monitor tick")
+        return
+
+    current_bid = float(quote.get("bid") or 0)
+    if current_bid <= 0:
+        return
+
+    pnl_pct = (current_bid - fill_price) / fill_price
+
+    if pnl_pct > peak_pnl:
+        peak_pnl        = pnl_pct
+        pos["peak_pnl"] = peak_pnl
+        set_open_position(pos)
+
+    reason = None
+
+    # 1. Profit target +40%
+    if pnl_pct >= 0.40:
+        reason = "PROFIT TARGET +40%"
+
+    # 2. Trailing stop — arms at +10%, trails 15% below peak
+    elif peak_pnl >= 0.10 and pnl_pct <= (peak_pnl - 0.15):
+        reason = f"TRAILING STOP (peak {peak_pnl:+.1%})"
+
+    # 3. 10-min chop circuit
     else:
-        return "NO_TRADE_WINDOW"
+        mins_in = (now - entry_time).total_seconds() / 60
+        if mins_in >= 10 and abs(pnl_pct) < 0.05 and pnl_pct <= -0.15:
+            reason = "CHOP CIRCUIT -15%"
 
-# ── Pre-flight gate ───────────────────────────────────────────────────────────
-def pre_flight_gate(alert_data: dict) -> tuple[bool, str]:
-    reset_session_if_new_day()
+    if reason:
+        exit_price    = close_position_tt(occ, reason, current_bid)
+        cancel_resting_stop(pos.get("stop_order_id"))
+        pnl_dollar    = (exit_price - fill_price) * 100
+        pnl_pct_final = (exit_price - fill_price) / fill_price
+        emoji         = "✅" if exit_price > fill_price else "❌"
+        close_time    = datetime.now(ET).strftime("%H:%M ET")
+        post_to_discord(
+            "profits-and-recaps",
+            f"{emoji} **{occ} CLOSED** — {reason}\n"
+            f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
+            f"P&L: {pnl_pct_final:+.1%} "
+            f"({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
+        )
+        clear_open_position()
+        record_trade_result(win=(exit_price > fill_price))
+        log.info(f"Position closed — {occ} | {reason} | {pnl_pct_final:+.1%}")
 
-    # ── OFF-DAY BLOCK (Fri/Sat/Sun) ──────────────────────────────────────────
-    if is_off_day():
-        return False, "OFF_DAY: Fri/Sat/Sun — no trading"
 
-    ticker = alert_data.get("ticker", "").upper()
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLAUDE BRAIN — v5.0 SYSTEM PROMPT
+# ══════════════════════════════════════════════════════════════════════════════
+_claude_client    = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+_claude_calls     = 0
+_claude_call_date = None
 
-    if session["circuit_breaker"]:
-        return False, "CIRCUIT_BREAKER: Two consecutive losses — system shut down"
+SYSTEM_PROMPT = """\
+You are Junior 2.0, the automated trading brain for The Portfolio Plug (TPP).
+You analyze real-time 1-minute chart data for NVDA and TSLA and decide whether
+to enter an options trade during the 9:30–10:30 AM ET trading window.
 
-    if session["kill_switch_active"]:
-        return False, f"KILL_SWITCH: {session['kill_switch_reason']}"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CORE IDENTITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Tickers traded: NVDA and TSLA only. No other tickers ever.
+- Timeframe: 1-minute candles exclusively. All EMA, volume, and
+  structure readings (HH/HL/LH/LL) are 1-min based.
+- Trading window: 9:30–10:30 AM ET. One window per day.
+- Max 2 trades per day. One position at a time.
+- Never self-name contracts. Never mention account balances.
+- Speak in Junior's voice: direct, confident, 1–2 sentence paragraphs.
+- @everyone is added automatically to every approved signal.
+- Zero repetition. No spam. Never mention SPY or QQQ under any circumstance.
+- If no valid setup exists, return NO_TRADE. Post nothing to Discord.
 
-    if session["trade_count"] >= 2:
-        return False, "TRADE_CAP: Maximum 2 trades reached for today"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PMH / PML — TRUST TRADINGVIEW COMPLETELY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PMH and PML values in the alert context are pre-verified by TradingView.
+Treat them as ground truth — do not question or re-validate the level.
+Your job is to assess price action around that level, not whether the
+level is correct. When a level value is present, use it as the anchor
+for your entire analysis.
 
-    if is_fomc_decision_day():
-        return False, "KILL_SWITCH_2: FOMC rate decision day — 100% cash, full trading halt"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONDITION A — CLEAN TREND (preferred)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All three must be present on the 1-min chart:
+  1. Volume >= 1.2x the 20-candle average on the breakout candle
+  2. Price breaking PMH (calls) or PML (puts) with a confirmed 1-min close
+  3. 8 EMA above 21 EMA (calls) or below (puts), price has not closed
+     back through the 21 EMA
 
-    if in_report_blackout():
-        return False, "REPORT_BLACKOUT: Economic data release window — no entries (Kill Switch 1)"
+All three present → APPROVE, tag [TIER-1].
 
-    if in_dead_zone():
-        return False, "DEAD_ZONE: No trades between 11:00 AM – 3:00 PM ET"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONDITION B — CHOP / LOW VOLUME TREND (still tradeable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Markets trend on low volume — this is normal and valid.
 
-    analysis_type = determine_analysis_type(alert_data)
-    if analysis_type == "NO_TRADE_WINDOW":
-        return False, "OUT_OF_WINDOW: Alert received outside trading windows"
+  SETUP 1 — CALLS (chop / uptrend):
+    - PMH break confirmed by TradingView alert
+    - Price making HH/HL sequence on 1-min
+    - Price compressing between the 8 and 21 EMA
+    - No 1-min candle has closed below the 21 EMA
+    - Entry trigger: 1-min candle closes back above the 8 EMA
+    → APPROVE, tag [TIER-2]
 
-    if analysis_type == "DAY_SIGNAL" and ticker not in DAY_TRADE_TICKERS:
-        return False, f"INVALID_TICKER: {ticker} not on approved day-trade list"
+  SETUP 2 — PUTS (chop / downtrend):
+    - PML break confirmed by TradingView alert
+    - Price making LH/LL sequence on 1-min
+    - Price compressing between the 8 and 21 EMA
+    - No 1-min candle has closed above the 21 EMA
+    - Entry trigger: 1-min candle closes back below the 8 EMA
+    → APPROVE, tag [TIER-2]
 
-    return True, "PASS"
+Volume is a confirming factor in Condition B, not a hard gate.
+Consistent directional closes on low volume = valid setup.
 
-# ── Execute trade via Alpaca ──────────────────────────────────────────────────
-def execute_trade(alert_data: dict, direction: str, analysis_type: str) -> dict | None:
-    """LIVE execution: MARKET entry -> confirmed fill -> broker-resting stop ->
-    hand off to position_manager exit engine. Discord signal ONLY after fill."""
-    ticker = alert_data.get("ticker", "").upper()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEAD TICKER — THE ONLY VALID NO_TRADE REASON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A ticker is only "explicitly dead" when ALL of these are true together:
+  - Volume below 0.4x the 20-candle average for 3+ consecutive 1-min candles
+  - Candle range (high minus low) below 0.3x ATR(14) on those same candles
+  - No directional structure — no HH/HL or LH/LL visible on the 1-min
 
-    if not is_authenticated():
-        log.warning("Tastytrade not authenticated — signal posted to Discord only")
+If price is making consistent directional closes → NOT dead.
+Choppy price action → NOT dead.
+Slow trend on low volume → NOT dead.
+Low volume alone → NOT dead.
+"Choppy" is NEVER a standalone NO_TRADE reason.
+
+NO_TRADE is only permitted when:
+  - FOMC decision day (system will not call you on these days)
+  - Active circuit breaker (system will not call you when tripped)
+  - BOTH NVDA and TSLA are explicitly dead per all 3 conditions above
+
+If only one ticker is dead, analyze the other.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIER TAGS & SIGNAL FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[TIER-1]  Clean Condition A — post signal immediately
+[TIER-2]  Condition B — add warning emoji, note lower confluence
+
+Signal description (you write this — execution engine handles the rest):
+  - 1-2 sentences max in Junior's voice
+  - Name the level that broke, the structure you saw, the direction
+  - Example: "NVDA reclaimed PMH at 127.40 on the 1-min with HH/HL
+    structure intact — calls are live."
+  - No internal log language, no EMA numbers, no contract details
+
+NO_TRADE — post nothing, return JSON only with reason.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE FORMAT — ALWAYS JSON, NO PREAMBLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APPROVE:
+{
+  "decision": "APPROVE",
+  "ticker": "NVDA",
+  "direction": "call",
+  "tier": "TIER-1",
+  "setup_description": "NVDA reclaimed PMH at 127.40 on the 1-min with HH/HL structure intact — calls are live."
+}
+
+NO_TRADE:
+{
+  "decision": "NO_TRADE",
+  "reason": "Both tickers explicitly dead — flat range, no structure, volume collapsed."
+}
+
+direction must be exactly "call" or "put".
+tier must be exactly "TIER-1" or "TIER-2".
+"""
+
+
+def _claude_budget_ok() -> bool:
+    global _claude_calls, _claude_call_date
+    today = datetime.now(ET).date()
+    if _claude_call_date != today:
+        _claude_calls     = 0
+        _claude_call_date = today
+    if _claude_calls >= MAX_DAILY_CALLS:
+        log.warning(f"Daily Claude cap ({MAX_DAILY_CALLS}) reached")
+        return False
+    return True
+
+
+def _build_claude_prompt(alert_data: dict, session: dict) -> str:
+    ticker     = alert_data.get("ticker",     "UNKNOWN")
+    alert_type = alert_data.get("alert_type", "UNKNOWN")
+    close      = alert_data.get("close",      "N/A")
+    volume     = alert_data.get("volume",     "N/A")
+    high       = alert_data.get("high",       "N/A")
+    low        = alert_data.get("low",        "N/A")
+    open_      = alert_data.get("open",       "N/A")
+    level      = alert_data.get("level",      None)
+    pmh        = alert_data.get("pmh",        None)
+    pml        = alert_data.get("pml",        None)
+
+    level_lines = []
+    if level:
+        level_lines.append(f"TradingView confirmed level: {level}")
+        if "PMH" in str(alert_type).upper():
+            level_lines.append(f"Price has broken above PMH at {level}.")
+        elif "PML" in str(alert_type).upper():
+            level_lines.append(f"Price has broken below PML at {level}.")
+    if pmh:
+        level_lines.append(f"PMH (TradingView verified): {pmh}")
+    if pml:
+        level_lines.append(f"PML (TradingView verified): {pml}")
+    level_context = "\n".join(level_lines) if level_lines else "No specific level in alert."
+
+    now = datetime.now(ET).strftime("%H:%M ET")
+    return f"""
+ALERT RECEIVED — {now}
+Ticker:     {ticker}
+Alert type: {alert_type}
+
+1-MIN CANDLE:
+  Open:   {open_}
+  High:   {high}
+  Low:    {low}
+  Close:  {close}
+  Volume: {volume}
+
+KEY LEVELS (TradingView verified — treat as ground truth):
+{level_context}
+
+SESSION STATE:
+  trade_count:        {session.get('trade_count', 0)} / 2
+  consecutive_losses: {session.get('consecutive_losses', 0)}
+  circuit_breaker:    {session.get('circuit_breaker', False)}
+  open_position:      {session.get('open_position') is not None}
+
+Analyze the 1-min setup on {ticker} and return your JSON decision.
+""".strip()
+
+
+def call_claude(alert_data: dict, session: dict) -> dict | None:
+    global _claude_calls
+    if not _claude_budget_ok():
         return None
-
-    # One position at a time when unattended — never stack live risk
-    if position_manager.open_position_count() >= 1:
-        log.info("Position already open — skipping new entry (single-position rule)")
-        return None
-
-    trade_type = "DAY" if analysis_type == "DAY_SIGNAL" else "SWING"
-    contract   = find_option_contract(ticker, direction, trade_type)
-    if not contract:
-        log.warning(f"No suitable contract found for {ticker} {direction}")
-        return None
-
-    # MARKET order entry (playbook rule: instant fill)
-    order = place_order(contract, quantity=1)
-    if not order:
-        log.error("Entry order rejected by Tastytrade")
-        return None
-
-    fill = wait_for_fill(order["order_id"], timeout_sec=60)
-    if not fill or not fill.get("fill_price"):
-        log.error("Entry not filled within 60s — cancelled, no position (fail closed)")
-        return None
-
-    entry_price = fill["fill_price"]
-
-    # Protective stop + monitoring BEFORE we announce anything
-    position_manager.register(contract["symbol"], ticker, direction, entry_price, 1, trade_type)
-
-    session["trade_count"] += 1
-    save_session_state()
-
-    # Exact playbook signal format, only after a confirmed fill
-    expiry_dt = datetime.fromisoformat(contract["expiry"])
-    signal = (f"Buying {ticker} {expiry_dt.strftime('%B %-d').upper()} "
-              f"${contract['strike']:g} {direction} @ {entry_price:.2f} @everyone")
-    channel = CHANNEL_DAY_SIGNALS if trade_type == "DAY" else CHANNEL_SWING_SIGNALS
-    post_discord(channel, signal)
-
-    mode = "PAPER" if PAPER_TRADING else "LIVE"
-    log.info(f"✅ {mode} trade filled & protected: {contract['symbol']} @ {entry_price}")
-    return {"order_id": order["order_id"], "fill_price": entry_price, "symbol": contract["symbol"]}
-
-# ── Watchlist post cooldown (Zero Repetition rule, enforced in code) ─────────
-_watchlist_post_cooldown = {}
-_claude_analysis_cooldown = {}
-CLAUDE_ANALYSIS_COOLDOWN_MIN = int(os.environ.get("CLAUDE_ANALYSIS_COOLDOWN_MIN", "5"))
-_claude_calls_today = {"date": None, "count": 0}
-MAX_CLAUDE_CALLS_PER_DAY = int(os.environ.get("MAX_CLAUDE_CALLS_PER_DAY", "150"))
-
-def claude_budget_ok(ticker: str) -> tuple[bool, str]:
-    """Cost guard: per-ticker cooldown + daily call cap. Protects the API bill,
-    never the safety systems (gates, stops, exits are all non-Claude)."""
-    now = datetime.now(ET)
-    today = now.date()
-    if _claude_calls_today["date"] != today:
-        _claude_calls_today["date"], _claude_calls_today["count"] = today, 0
-    if _claude_calls_today["count"] >= MAX_CLAUDE_CALLS_PER_DAY:
-        return False, f"DAILY_CLAUDE_CAP: {MAX_CLAUDE_CALLS_PER_DAY} analyses reached"
-    last = _claude_analysis_cooldown.get(ticker)
-    if last and (now - last).total_seconds() < CLAUDE_ANALYSIS_COOLDOWN_MIN * 60:
-        return False, f"ANALYSIS_COOLDOWN: {ticker} analyzed <{CLAUDE_ANALYSIS_COOLDOWN_MIN}m ago"
-    return True, "OK"
-
-def claude_budget_mark(ticker: str):
-    _claude_analysis_cooldown[ticker] = datetime.now(ET)
-    _claude_calls_today["count"] += 1
-WATCHLIST_COOLDOWN_MIN = int(os.environ.get("WATCHLIST_COOLDOWN_MIN", "30"))
-
-# ── MAIN WEBHOOK ENDPOINT ─────────────────────────────────────────────────────
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    reset_session_if_new_day()
-
     try:
-        data = request.get_json(force=True)
+        response = _claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=512,
+            system=[{
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{
+                "role":    "user",
+                "content": _build_claude_prompt(alert_data, session),
+            }],
+        )
+        _claude_calls += 1
+        raw = response.content[0].text.strip()
+        log.info(f"Claude raw: {raw[:200]}")
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        decision = json.loads(raw)
+        log.info(
+            f"Claude: {decision.get('decision')} | "
+            f"ticker={decision.get('ticker')} | "
+            f"direction={decision.get('direction')} | "
+            f"tier={decision.get('tier')}"
+        )
+        return decision
+    except json.JSONDecodeError as e:
+        log.error(f"Claude JSON parse failed: {e}")
+        return None
     except Exception as e:
-        return jsonify({"error": "Invalid JSON"}), 400
+        log.error(f"Claude API call failed: {e}")
+        return None
 
-    if not data:
-        return jsonify({"error": "Empty payload"}), 400
 
-    log.info(f"Webhook received: {json.dumps(data)}")
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXECUTION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
+    log.info(f"{'='*50}")
+    log.info(f"EXECUTE: {ticker} {direction.upper()}")
+    log.info(f"{'='*50}")
 
-    # Verify secret
-    incoming_secret = data.get("secret", "")
-    if not hmac.compare_digest(incoming_secret, WEBHOOK_SECRET):
-        return jsonify({"error": "Unauthorized"}), 401
+    tier  = claude_decision.get("tier", "TIER-1")
+    setup = claude_decision.get("setup_description", "")
 
-    # Pre-flight gate
-    can_proceed, gate_reason = pre_flight_gate(data)
-    if not can_proceed:
-        log.info(f"Pre-flight blocked: {gate_reason}")
-        return jsonify({"status": "blocked", "reason": gate_reason}), 200
+    occ, strike, ask = select_contract(ticker, direction)
+    if not occ:
+        post_to_discord(
+            "day-trade-signals",
+            f"⚠️ Setup identified on **{ticker} {direction.upper()}** "
+            f"but no contract available in the $75–$150 range. Passing on this one.",
+        )
+        return False
 
-    analysis_type = determine_analysis_type(data)
+    fill_price = enter_trade(occ)
+    if not fill_price:
+        post_to_discord(
+            "day-trade-signals",
+            f"⚠️ Order placed for **{ticker}** but fill not confirmed within 60s. "
+            f"No position recorded — check broker.",
+        )
+        return False
 
-    # Cost guard — skip Claude for tickers analyzed moments ago
-    ok, budget_reason = claude_budget_ok(data.get("ticker", "").upper())
-    if not ok:
-        log.info(f"Claude call skipped: {budget_reason}")
-        return jsonify({"status": "skipped", "reason": budget_reason}), 200
+    log.info(f"FILLED: {occ} @ ${fill_price:.2f}/share")
 
-    # Call Claude
+    stop_order_id = place_stop_loss(occ, fill_price)
+    if not stop_order_id:
+        send_emergency_dm(
+            f"STOP LOSS FAILED — {occ} filled @ ${fill_price:.2f} — SET MANUALLY NOW"
+        )
+
+    arrow      = "🟢" if direction == "call" else "🔴"
+    type_label = "CALL" if direction == "call" else "PUT"
+    target     = round(fill_price * 1.40, 2)
+    stop       = round(fill_price * 0.75, 2)
+    cost       = round(fill_price * 100,  2)
+    entry_time = datetime.now(ET).strftime("%H:%M ET")
+
+    post_to_discord(
+        "day-trade-signals",
+        f"@everyone\n\n"
+        f"{arrow} **{ticker} {type_label}** [{tier}]\n\n"
+        f"**Contract:** `{occ}`\n"
+        f"**Entry:** ${fill_price:.2f}/share (${cost:.0f}/contract) @ {entry_time}\n"
+        f"**Target:** ${target:.2f} (+40%)\n"
+        f"**Stop:** ${stop:.2f} (-25%)\n\n"
+        f"{setup}",
+    )
+    log.info("Signal posted to #day-trade-signals")
+
+    set_open_position({
+        "ticker":        ticker,
+        "direction":     direction,
+        "occ_symbol":    occ,
+        "fill_price":    fill_price,
+        "stop_order_id": stop_order_id,
+        "target_price":  round(fill_price * 1.40, 2),
+        "peak_pnl":      0.0,
+        "entry_time":    datetime.now(ET).isoformat(),
+    })
+    increment_trade_count()
+    log.info(f"Trade complete — {occ} live | stop={stop_order_id}")
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALPACA DATA HELPERS (REST only — no WebSocket)
+# ══════════════════════════════════════════════════════════════════════════════
+def _alpaca_headers() -> dict:
+    return {
+        "APCA-API-KEY-ID":     os.environ.get("ALPACA_API_KEY", ""),
+        "APCA-API-SECRET-KEY": os.environ.get("ALPACA_API_SECRET")
+                               or os.environ.get("ALPACA_SECRET_KEY", ""),
+    }
+
+
+def get_latest_1min_candle(ticker: str) -> dict | None:
     try:
-        claude_budget_mark(data.get("ticker", "").upper())
-        claude_response = analyze_with_claude(data, analysis_type)
-        log.info(f"Claude response: {claude_response[:200]}...")
+        resp = requests.get(
+            f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+            headers=_alpaca_headers(),
+            params={"timeframe": "1Min", "limit": 2, "feed": "sip"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            bars = resp.json().get("bars", [])
+            if bars:
+                b = bars[-1]
+                return {"open": b["o"], "high": b["h"], "low": b["l"],
+                        "close": b["c"], "volume": b["v"]}
     except Exception as e:
-        log.error(f"Claude API error: {e}")
-        return jsonify({"error": "Claude API failed"}), 500
+        log.error(f"1-min candle fetch failed for {ticker}: {e}")
+    return None
 
-    # Parse Claude's decision
-    first_line     = claude_response.split("\n")[0].strip().upper()
-    discord_message = "\n".join(claude_response.split("\n")[1:]).strip()
 
-    if first_line.startswith("NO_TRADE"):
-        log.info("Claude determined: no trade")
-        return jsonify({"status": "no_trade"}), 200
-
-    if first_line.startswith("WATCHLIST"):
-        tkr  = data.get("ticker", "").upper()
-        last = _watchlist_post_cooldown.get(tkr)
-        if last and (datetime.now(ET) - last).total_seconds() < WATCHLIST_COOLDOWN_MIN * 60:
-            log.info(f"Watchlist post suppressed for {tkr} — cooldown ({WATCHLIST_COOLDOWN_MIN}m)")
-            return jsonify({"status": "watchlist_suppressed_cooldown"}), 200
-        _watchlist_post_cooldown[tkr] = datetime.now(ET)
-        post_discord(CHANNEL_WATCHLIST, discord_message)
-        return jsonify({"status": "watchlist_posted"}), 200
-
-    if first_line.startswith("TRADE_VALID"):
-        # Execute first — the confirmed-fill signal from execute_trade is the
-        # ONLY entry message the community sees (no unconfirmed announcements)
-        direction = data.get("direction", "CALL")
-        if direction in ("CALL", "PUT"):
-            order = execute_trade(data, direction, analysis_type)
-            if order:
-                log.info(f"Trade executed: {order}")
-                return jsonify({"status": "trade_executed", "order": order}), 200
-
-        return jsonify({"status": "signal_posted", "execution": "skipped"}), 200
-
-    # Fallback — post whatever Claude returned
-    channel_id = route_to_channel(data.get("alert_type", ""), analysis_type)
-    post_discord(channel_id, claude_response)
-    return jsonify({"status": "posted"}), 200
-
-# ── SESSION PERSISTENCE (survives Render restarts) ───────────────────────────
-SESSION_FILE = "/tmp/tpp_session.json"
-
-def save_session_state():
+def get_key_levels(ticker: str) -> dict:
+    """Get PMH/PML from previous day's bar."""
     try:
-        with open(SESSION_FILE, "w") as f:
-            json.dump({**session, "date": str(session["date"])}, f)
+        resp = requests.get(
+            f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+            headers=_alpaca_headers(),
+            params={"timeframe": "1Day", "limit": 2, "feed": "sip"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            bars = resp.json().get("bars", [])
+            if len(bars) >= 1:
+                prev = bars[-2] if len(bars) >= 2 else bars[0]
+                return {"pmh": prev["h"], "pml": prev["l"]}
     except Exception as e:
-        log.error(f"Session save failed: {e}")
+        log.error(f"Key levels fetch failed for {ticker}: {e}")
+    return {"pmh": None, "pml": None}
 
-def load_session_state():
-    try:
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE) as f:
-                data = json.load(f)
-            if data.get("date") == str(datetime.now(ET).date()):
-                session.update({k: v for k, v in data.items() if k != "date"})
-                session["date"] = datetime.now(ET).date()
-                log.info(f"📂 Session state restored: trades={session['trade_count']} losses={session['consecutive_losses']} breaker={session['circuit_breaker']}")
-    except Exception as e:
-        log.error(f"Session load failed: {e}")
 
-# ── AUTO WIN/LOSS (fed by exit engine — no manual endpoints needed) ──────────
-def record_win(symbol: str):
-    reset_session_if_new_day()
-    session["consecutive_losses"] = 0
-    save_session_state()
+def get_daily_levels(ticker: str) -> dict:
+    levels = get_key_levels(ticker)
+    return {
+        "pmh":        levels.get("pmh"),
+        "pml":        levels.get("pml"),
+        "prev_close": None,
+        "prev_open":  None,
+        "avg_volume": None,
+    }
 
-def record_loss(symbol: str):
-    reset_session_if_new_day()
-    session["consecutive_losses"] += 1
-    save_session_state()
-    if session["consecutive_losses"] >= 2 and not session["circuit_breaker"]:
-        session["circuit_breaker"] = True
-        save_session_state()
-        post_discord(CHANNEL_RECAPS,
-            "Two stops hit back to back — that's the market telling us to sit out. "
-            "Shutting it down for the day to protect capital. Hands in our pockets, back tomorrow. @everyone")
 
-# ── EMERGENCY FLATTEN (hit this from your phone) ─────────────────────────────
-@app.route("/flatten", methods=["POST"])
-def flatten():
-    data = request.get_json(force=True, silent=True) or {}
-    if not hmac.compare_digest(data.get("secret", ""), WEBHOOK_SECRET):
-        return jsonify({"error": "Unauthorized"}), 401
-    session["kill_switch_active"] = True
-    session["kill_switch_reason"] = "Manual flatten"
-    save_session_state()
-    results = position_manager.flatten_all()
-    log.info(f"🧯 FLATTEN executed: {results}")
-    return jsonify({"status": "flattened", **results, "kill_switch": True}), 200
-
-# ── KILL SWITCH ───────────────────────────────────────────────────────────────
-@app.route("/kill", methods=["POST"])
-def kill_switch():
-    data = request.get_json(force=True)
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    action = data.get("action", "activate")
-    reason = data.get("reason", "Manual override")
-
-    if action == "activate":
-        session["kill_switch_active"] = True
-        session["kill_switch_reason"] = reason
-        return jsonify({"status": "kill_switch_active", "reason": reason}), 200
-    else:
-        session["kill_switch_active"] = False
-        session["kill_switch_reason"] = None
-        return jsonify({"status": "kill_switch_deactivated"}), 200
-
-# ── LOSS / WIN TRACKING ───────────────────────────────────────────────────────
-@app.route("/loss", methods=["POST"])
-def log_loss():
-    data = request.get_json(force=True)
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    reset_session_if_new_day()
-    session["consecutive_losses"] += 1
-    if session["consecutive_losses"] >= 2:
-        session["circuit_breaker"] = True
-        msg = "🚨 TWO CONSECUTIVE LOSSES — System shutting down for the day. Capital protection mode active. See you tomorrow. @everyone"
-        post_discord(CHANNEL_RECAPS, msg)
-        return jsonify({"status": "circuit_breaker_triggered"}), 200
-
-    return jsonify({"status": "loss_logged", "consecutive": session["consecutive_losses"]}), 200
-
-@app.route("/win", methods=["POST"])
-def log_win():
-    data = request.get_json(force=True)
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    reset_session_if_new_day()
-    session["consecutive_losses"] = 0
-    return jsonify({"status": "win_logged"}), 200
-
-# ── POSITIONS ─────────────────────────────────────────────────────────────────
-@app.route("/positions", methods=["GET"])
-def positions():
-    return jsonify({
-        "active_positions": active_positions,
-        "managed_positions": position_manager.open_position_count(),
-        "tastytrade_positions": get_positions(),
-        "account_balance": get_account_balance(),
-        "paper_trading": PAPER_TRADING,
-    }), 200
-
-# ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-@app.route("/health", methods=["GET"])
-def health():
-    reset_session_if_new_day()
-    now_et = datetime.now(ET)
-    return jsonify({
-        "status": "online",
-        "code_version": "v4.1-fridays-2026-07-10",
-        "time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
-        "day_of_week": now_et.strftime("%A"),
-        "is_off_day": is_off_day(),
-        "in_day_trade_window": in_day_trade_window(),
-        "report_blackout_active": in_report_blackout(),
-        "todays_scheduled_events": [e[0] for e in todays_scheduled_events()],
-        "todays_scanned_blackouts": get_scanned_blackouts(),
-        "in_swing_window": in_swing_window(),
-        "paper_trading": PAPER_TRADING,
-        "tastytrade_authenticated": is_authenticated(),
-        "session": {
-            "date": str(session["date"]),
-            "trade_count": session["trade_count"],
-            "consecutive_losses": session["consecutive_losses"],
-            "circuit_breaker": session["circuit_breaker"],
-            "kill_switch_active": session["kill_switch_active"],
-        }
-    }), 200
-
-@app.route("/status", methods=["GET"])
-def status():
-    return health()
-
-# ── VOLUME PROFILE ZONES ───────────────────────────────────────────────────────
-@app.route("/zones", methods=["GET"])
-def zones():
-    """Debug endpoint — view current auto-calculated Volume Profile zones for all tickers."""
-    return jsonify({
-        "zones": volume_profile.get_all_zones(),
-        "tickers_tracked": list(SWING_TICKERS),
-        "worker_pid": os.getpid(),
-        "scheduler_started": _scheduler_started,
-    }), 200
-
-@app.route("/zones/refresh", methods=["POST"])
-def refresh_zones():
-    """Manually trigger an immediate zone recalculation."""
-    data = request.get_json(force=True, silent=True) or {}
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-    results = volume_profile.update_all_zones(list(SWING_TICKERS))
-    return jsonify({"status": "refreshed", "results": results}), 200
-
-# ── DAILY ZONE SCHEDULER ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCHEDULER — background thread
+# ══════════════════════════════════════════════════════════════════════════════
 _scheduler_started = False
 _scheduler_lock    = threading.Lock()
 
-# ── AUTOMATED JOB 0: Daily Economic Calendar Scan (6:30-9:00 AM ET) ──────────
-DAILY_BLACKOUTS_FILE = "/tmp/tpp_daily_blackouts.json"
 
-def daily_report_scan():
-    """Ask Claude (with live web search) for today's high-impact US releases and
-    convert them to blackout windows. ADDITIVE ONLY: the built-in FOMC/ISM
-    calendar remains the guaranteed floor; a failed scan changes nothing."""
-    today_iso = datetime.now(ET).date().isoformat()
-    prompt = f"""Today is {datetime.now(ET).strftime('%A, %B %d, %Y')}. Search the web for today's US economic calendar (ForexFactory, Investing.com, or MarketWatch).
-
-List ONLY high-impact (ForexFactory "red folder" equivalent) USD events scheduled today between 9:00 AM and 4:00 PM Eastern Time. Include Fed Chair testimony and FOMC-related events. EXCLUDE low/medium impact events, and exclude anything before 9:00 AM ET.
-
-Respond with ONLY a JSON array, no other text, no markdown fences:
-[{{"event": "name", "time_et": "HH:MM"}}]
-
-If there are no qualifying events, respond with exactly: []"""
-    try:
-        resp = anthropic.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        text = text.replace("```json", "").replace("```", "").strip()
-        start, end = text.find("["), text.rfind("]")
-        events = json.loads(text[start:end + 1]) if start != -1 and end != -1 else []
-
-        windows = []
-        for ev in events:
-            try:
-                h, m = map(int, str(ev.get("time_et", "")).split(":"))
-                lo = (datetime(2000, 1, 1, h, m) - timedelta(minutes=15)).strftime("%H:%M")
-                hi = (datetime(2000, 1, 1, h, m) + timedelta(minutes=15)).strftime("%H:%M")
-                windows.append({"event": str(ev.get("event", "?"))[:60], "window": f"{lo}-{hi}"})
-            except Exception:
-                continue
-
-        with open(DAILY_BLACKOUTS_FILE, "w") as f:
-            json.dump({"date": today_iso, "windows": windows}, f)
-        log.info(f"🗓️ Daily report scan complete — {len(windows)} high-impact window(s): {windows}")
-    except Exception as e:
-        log.error(f"Daily report scan failed (built-in calendar still active): {e}")
-
-def get_scanned_blackouts() -> list:
-    try:
-        if os.path.exists(DAILY_BLACKOUTS_FILE):
-            with open(DAILY_BLACKOUTS_FILE) as f:
-                data = json.load(f)
-            if data.get("date") == datetime.now(ET).date().isoformat():
-                return data.get("windows", [])
-    except Exception:
-        pass
-    return []
-
-# ── AUTOMATED JOB 0.5: Market Pulse (community engagement) ───────────────────
-PULSE_ENABLED            = os.environ.get("PULSE_ENABLED", "true").lower() == "true"
-PULSE_INTERVAL_MIN       = int(os.environ.get("PULSE_INTERVAL_MIN", "15"))       # active windows
-PULSE_DEADZONE_INTERVAL  = int(os.environ.get("PULSE_DEADZONE_INTERVAL", "60"))  # dead zone
-_last_pulse_at = None
-
-def post_market_pulse():
-    """Short 'we're here, market is X' post so members know the desk is live.
-    Every PULSE_INTERVAL_MIN during 9:30-11:00 & 3:00-4:00, hourly in dead zone.
-    Silent while a position is open (trade updates own the channel then)."""
-    global _last_pulse_at
-    if not PULSE_ENABLED or is_off_day():
-        return
-    now = datetime.now(ET)
-    t = now.time()
-
-    in_active = in_day_trade_window() or in_swing_window()
-    if not in_active:
-        return                                    # silent outside trading windows (incl. dead zone)
-    in_dz = False
-    if position_manager.open_position_count() > 0:
-        return                                    # live trade updates cover the channel
-
-    interval = PULSE_INTERVAL_MIN if in_active else PULSE_DEADZONE_INTERVAL
-    if _last_pulse_at and (now - _last_pulse_at).total_seconds() < interval * 60 - 30:
-        return
-
-    # Live read on the indexes for flavor
-    spy = get_candles_resilient("SPY", limit=15)
-    qqq = get_candles_resilient("QQQ", limit=15)
-    blackout_note = " NOTE: an economic-report blackout is currently active — mention we're deliberately hands-off until it passes." if in_report_blackout() else ""
-    zone_note = "dead zone (11 AM-3 PM — no entries by rule, monitoring only)" if in_dz else ("day-trade window" if in_day_trade_window() else "swing window")
-
-    prompt = f"""You are Junior from The Portfolio Plug. Write ONE short Discord market pulse (2-3 sentences MAX, casual, confident, human — no headers, no bullet lists, no @everyone).
-
-Context: It's {now.strftime('%I:%M %p ET')}, currently in the {zone_note}. No valid A+ setup has printed since the last update.{blackout_note}
-
-RECENT SPY 1-min candles (most recent last): {json.dumps(spy[-8:]) if spy else 'unavailable'}
-RECENT QQQ 1-min candles (most recent last): {json.dumps(qqq[-8:]) if qqq else 'unavailable'}
-
-Give a quick honest read (direction/chop, one level if obvious) and remind them we only take clean setups. Vary your phrasing — never sound templated. NEVER mention account balances or dollar amounts. Sign off: — Junior | The Portfolio Plug"""
-    try:
-        resp = anthropic.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        post_discord(CHANNEL_WATCHLIST, resp.content[0].text.strip())
-        _last_pulse_at = now
-        log.info(f"📣 Market pulse posted ({zone_note})")
-    except Exception as e:
-        log.error(f"Market pulse error: {e}")
-
-# ── AUTOMATED JOB 1: Daily Watchlist ─────────────────────────────────────────
-def fetch_premarket_data(ticker: str) -> dict:
-    """Pull premarket price, gap, and volume data from Alpaca real-time stream."""
-    return alpaca_stream.get_premarket_data(ticker)
-
-def post_daily_watchlist():
-    """Generate and post the morning watchlist to #daily-watchlist."""
-    # Never post on Friday or weekends
-    if is_off_day():
-        log.info("Friday/weekend — watchlist suppressed")
-        return
-
-    if _discord_already_posted_today(CHANNEL_WATCHLIST, "Daily Watchlist"):
-        log.info("Watchlist already in channel today — skipping duplicate")
-        return
-    log.info("📋 Generating daily watchlist...")
-    zones  = volume_profile.get_all_zones()
-    tickers = list(DAY_TRADE_TICKERS)
-
-    market_data = []
-    for t in tickers:
-        data = fetch_premarket_data(t)
-        if data:
-            z = zones.get(t, {})
-            data["demand_1h"] = z.get("1H", {}).get("demand")
-            data["supply_1h"] = z.get("1H", {}).get("supply")
-            data["poc_1h"]    = z.get("1H", {}).get("poc")
-            market_data.append(data)
-
-    if not market_data:
-        log.warning("No pre-market data available for watchlist")
-        return
-
-    events_note = ", ".join(e[0].replace("_", " ").title() for e in todays_scheduled_events()) or "None"
-    prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — pre-market. You are Junior from The Portfolio Plug.\nHIGH-IMPACT EVENTS SCHEDULED TODAY: {events_note} (entries are auto-blocked around these — mention them naturally in the watchlist if any).
-
-Write the daily morning watchlist post for #daily-watchlist on Discord. Use your real voice — direct, confident, educational.
-
-PRE-MARKET DATA:
-{json.dumps(market_data, indent=2)}
-
-VOLUME PROFILE ZONES (1H demand/supply for reference):
-{json.dumps({t: zones.get(t, {}).get("1H") for t in tickers if zones.get(t)}, indent=2)}
-
-Your watchlist post must include:
-1. A short market context read (1-2 sentences on overall tone/direction today)
-2. For each ticker: current price, gap %, what level to watch (demand/supply zone or PMH/PML), and ONE sentence on what you're looking for
-3. Key time to watch: 9:30-10:00 AM window
-4. A closing line reminding members of the rules (1 trade, volume confirmation, no chasing)
-
-Keep it tight — members read this on their phone before market open. No fluff. NEVER mention account balances or dollar amounts of the account."""
-
-    try:
-        resp = anthropic.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        watchlist_msg = resp.content[0].text
-        post_discord(CHANNEL_WATCHLIST, watchlist_msg)
-        log.info("✅ Daily watchlist posted to Discord")
-    except Exception as e:
-        log.error(f"Watchlist generation error: {e}", exc_info=True)
-
-# ── AUTOMATED JOB 2: Pattern Scanner ─────────────────────────────────────────
-_pattern_scan_cooldown = {}
-
-def scan_for_visual_patterns():
-    """Scan for confluence setups — only runs on trading days (not Fri/weekend)."""
-    if is_off_day() or in_report_blackout():
-        return
-
-    now_et = datetime.now(ET)
-    if not (dtime(9, 25) <= now_et.time() <= dtime(10, 30)):
-        return
-
-    log.info("🔍 Running pattern scan...")
-    zones = volume_profile.get_all_zones()
-
-    for ticker in DAY_TRADE_TICKERS:
-        last = _pattern_scan_cooldown.get(ticker)
-        if last and (now_et - last).total_seconds() < 600:
-            continue
-
-        try:
-            candles = get_candles_resilient(ticker, limit=15)
-            if len(candles) < 10:
-                continue
-
-            zone_data = zones.get(ticker, {})
-
-            prompt = f"""You are Junior's AI trading system. Analyze this 1-minute candle data for {ticker} and determine if any high-probability setup from the 3-Screen Confluence System is currently forming or has just triggered.
-
-LAST 30 CANDLES (most recent last):
-{json.dumps(candles[-20:], indent=2)}
-
-VOLUME PROFILE ZONES:
-1H: {zone_data.get('1H')}
-4H: {zone_data.get('4H')}
-
-Current time: {now_et.strftime('%I:%M %p ET')}
-
-Check for:
-1. Price approaching or bouncing off 8 EMA or 21 EMA
-2. Price near a Volume Profile demand or supply zone
-3. Flag/consolidation pattern forming after a strong move
-4. RSI divergence conditions
-5. PMH/PML proximity
-
-Respond with EXACTLY one of:
-- "NO_SETUP: [brief reason]" if nothing significant is forming
-- "WATCHLIST: [ticker] [direction] — [1 sentence describing the setup and what to watch for]"
-
-Be conservative. Only flag genuinely high-probability developing setups, not noise."""
-
-            ok, reason = claude_budget_ok(ticker)
-            if not ok:
-                log.info(f"Pattern scan skipped ({ticker}): {reason}")
-                continue
-            claude_budget_mark(ticker)
-            scan_resp = anthropic.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=150,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            result_text = scan_resp.content[0].text.strip()
-            log.info(f"Pattern scan {ticker}: {result_text[:80]}")
-
-            if result_text.startswith("WATCHLIST:"):
-                msg = f"👀 **Pattern Alert** — {result_text.replace('WATCHLIST: ', '')}\n\n_Developing setup — confirm your confirmations before entering. Not a trade signal._"
-                post_discord(CHANNEL_DAY_SIGNALS, msg)
-                _pattern_scan_cooldown[ticker] = now_et
-                log.info(f"✅ Pattern alert posted for {ticker}")
-
-        except Exception as e:
-            log.error(f"Pattern scan error for {ticker}: {e}")
-
-# ── AUTOMATED JOB 3: End-of-Day Recap ────────────────────────────────────────
-def post_eod_recap():
-    """Generate and post an end-of-day recap. Suppressed on Friday/weekends."""
-    if not EOD_RECAP_ENABLED:
-        log.info("EOD recap disabled (EOD_RECAP_ENABLED=false) — skipping")
-        return
-    if is_off_day():
-        log.info("Friday/weekend — EOD recap suppressed")
-        return
-
-    if _discord_already_posted_today(CHANNEL_RECAPS, "EOD Recap"):
-        log.info("EOD recap already in channel today — skipping duplicate")
-        return
-    log.info("📊 Generating end-of-day recap...")
-
-    positions_data = []
-    try:
-        raw_positions = get_positions()
-        # qualitative only — NEVER pass dollar amounts into any community-facing prompt
-        positions_data = [
-            {"underlying": p.get("underlying-symbol"), "type": p.get("instrument-type"),
-             "quantity": p.get("quantity"), "direction": p.get("quantity-direction")}
-            for p in raw_positions
-        ]
-    except Exception as e:
-        log.error(f"Could not fetch Tastytrade data for recap: {e}")
-
-    trade_count      = session.get("trade_count", 0)
-    consecutive_loss = session.get("consecutive_losses", 0)
-    circuit_breaker  = session.get("circuit_breaker", False)
-
-    prompt = f"""It is {datetime.now(ET).strftime('%A, %B %d, %Y')} — market just closed. You are Junior from The Portfolio Plug.
-
-Write the end-of-day recap post for #profits-and-recaps. Keep it real, educational, and in your voice.
-
-TODAY'S SESSION STATS:
-- Trades taken: {trade_count}
-- Consecutive losses at close: {consecutive_loss}
-- Circuit breaker triggered today: {circuit_breaker}
-- Open positions: {len(positions_data)}
-
-HARD RULE: NEVER mention account balances, dollar amounts of the account, buying power, or "Net Liq" in the post. Percentages on individual trades are fine; account money is never discussed.
-
-OPEN POSITIONS:
-{json.dumps(positions_data, indent=2) if positions_data else 'None — flat going into tomorrow'}
-
-Your recap must include:
-1. One honest sentence about how today went overall
-2. If trades were taken: what the setup was, what worked or didn't
-3. If no trades: why the system stayed in cash — frame it as discipline, not failure
-4. Open positions if any: what you're holding and why
-5. What to watch for tomorrow (1-2 things)
-6. A closing line for the community
-
-Keep it under 300 words. No fluff."""
-
-    try:
-        resp = anthropic.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        recap_msg = resp.content[0].text
-        post_discord(CHANNEL_RECAPS, recap_msg)
-        log.info("✅ End-of-day recap posted to Discord")
-    except Exception as e:
-        log.error(f"EOD recap generation error: {e}", exc_info=True)
-
-# ── MASTER SCHEDULER LOOP ─────────────────────────────────────────────────────
-def zone_scheduler_loop():
-    """
-    Master background thread handling ALL automated daily jobs:
-    1. Volume Profile zone calculation (8:00 AM ET daily)
-    2. Daily watchlist post (9:15 AM ET, weekdays excluding Friday)
-    3. Pattern scanner (every 5 min, 9:25-10:30 AM ET, weekdays excluding Friday)
-    4. End-of-day recap (4:01 PM ET, weekdays excluding Friday)
-    """
-    SCHEDULER_STATE_FILE = "/tmp/tpp_scheduler_state.json"
-    ZONE_FILE            = "/tmp/tpp_zones.json"
-    RENDER_API_KEY       = os.environ.get("RENDER_API_KEY", "")
-    RENDER_SERVICE_ID    = "srv-d91fh10k1i2s73arkh20"
-
-    def load_scheduler_state() -> dict:
-        state = {}
-        zone_date      = os.environ.get("SCHEDULER_ZONE_DATE")
-        watchlist_date = os.environ.get("SCHEDULER_WATCHLIST_DATE")
-        recap_date     = os.environ.get("SCHEDULER_RECAP_DATE")
-        if zone_date:      state["zone_date"]      = zone_date
-        if watchlist_date: state["watchlist_date"] = watchlist_date
-        if recap_date:     state["recap_date"]     = recap_date
-        if state:
-            log.info(f"📅 Loaded scheduler state from env vars: {state}")
-            return state
-        try:
-            if os.path.exists(SCHEDULER_STATE_FILE):
-                with open(SCHEDULER_STATE_FILE, "r") as f:
-                    data = json.load(f)
-                if data:
-                    log.info(f"📅 Loaded scheduler state from file: {data}")
-                    return data
-        except Exception:
-            pass
-        try:
-            if os.path.exists(ZONE_FILE):
-                with open(ZONE_FILE, "r") as f:
-                    zones = json.load(f)
-                meta = zones.get("__scheduler_state__", {})
-                if meta:
-                    return meta
-                today_iso = datetime.now(ET).date().isoformat()
-                for key, val in zones.items():
-                    if key.startswith("__"):
-                        continue
-                    if today_iso in val.get("updated_at", ""):
-                        return {"zone_date": today_iso, "watchlist_date": None, "recap_date": None}
-        except Exception:
-            pass
-        return {}
-
-    def save_scheduler_state(state: dict):
-        try:
-            with open(SCHEDULER_STATE_FILE, "w") as f:
-                json.dump(state, f)
-        except Exception as e:
-            log.error(f"Failed to save scheduler state locally: {e}")
-
-        if RENDER_API_KEY:
-            try:
-                env_vars = []
-                if state.get("zone_date"):
-                    env_vars.append({"key": "SCHEDULER_ZONE_DATE",      "value": state["zone_date"]})
-                if state.get("watchlist_date"):
-                    env_vars.append({"key": "SCHEDULER_WATCHLIST_DATE", "value": state["watchlist_date"]})
-                if state.get("recap_date"):
-                    env_vars.append({"key": "SCHEDULER_RECAP_DATE",     "value": state["recap_date"]})
-                if env_vars:
-                    resp = requests.put(
-                        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
-                        headers={"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"},
-                        json=env_vars,
-                        timeout=10
-                    )
-                    if resp.status_code == 200:
-                        log.info(f"✅ Scheduler state persisted to Render env vars: {state}")
-                    else:
-                        log.warning(f"⚠️ Render API state save failed: {resp.status_code}")
-            except Exception as e:
-                log.error(f"Render API state save error: {e}")
-
-        try:
-            if os.path.exists(ZONE_FILE):
-                with open(ZONE_FILE, "r") as f:
-                    zones = json.load(f)
-                zones["__scheduler_state__"] = state
-                with open(ZONE_FILE, "w") as f:
-                    json.dump(zones, f)
-        except Exception:
-            pass
-
-    _state = load_scheduler_state()
-    last_zone_date      = datetime.fromisoformat(_state["zone_date"]).date()      if _state.get("zone_date")      else None
-    last_watchlist_date = datetime.fromisoformat(_state["watchlist_date"]).date() if _state.get("watchlist_date") else None
-    last_recap_date     = datetime.fromisoformat(_state["recap_date"]).date()     if _state.get("recap_date")     else None
-
-    log.info(f"📅 Scheduler state loaded — zones: {last_zone_date}, watchlist: {last_watchlist_date}, recap: {last_recap_date}")
-
-    try:
-        alpaca_stream.start()
-        log.info("✅ Alpaca real-time stream started — backfill running in background")
-        time_module.sleep(3)
-    except Exception as e:
-        log.error(f"Alpaca stream start failed: {e}", exc_info=True)
-
-    # Run zone calculation on startup only if no fresh zone data exists
-    try:
-        existing_zones = volume_profile.get_all_zones()
-        now_et_boot    = datetime.now(ET)
-        zones_are_fresh = False
-        if existing_zones:
-            for ticker_data in existing_zones.values():
-                updated_at_str = ticker_data.get("updated_at", "")
-                if updated_at_str:
-                    try:
-                        updated_at = datetime.fromisoformat(updated_at_str)
-                        if updated_at.date() == now_et_boot.date():
-                            zones_are_fresh = True
-                            break
-                    except Exception:
-                        pass
-        if zones_are_fresh:
-            log.info("✅ Zone data from today already exists — skipping startup recalculation")
-            last_zone_date = now_et_boot.date()
-        else:
-            log.info("🔄 No fresh zones found — will calculate at 8:00 AM ET")
-    except Exception as e:
-        log.error(f"Zone startup check failed: {e}", exc_info=True)
+def _scheduler_loop():
+    log.info("Scheduler loop started")
+    last_watchlist_date   = None
+    last_945_date         = None
+    last_1015_date        = None
 
     while True:
         try:
-            now_et = datetime.now(ET)
-            today  = now_et.date()
-            t      = now_et.time()
+            now   = datetime.now(ET)
+            today = now.date()
+            t     = now.time()
 
-            # Skip market-facing jobs on weekends AND Fridays
-            no_trade_day = is_off_day()
+            # Skip everything on weekends and holidays
+            is_trading_day = (
+                today.weekday() < 5
+                and today not in MARKET_HOLIDAYS_2026
+            )
 
-            # JOB 0: Daily economic calendar scan — 6:30-9:00 AM ET (trading days)
-            if not no_trade_day and dtime(6, 30) <= t <= dtime(9, 0):
-                scanned = get_scanned_blackouts()
-                already = os.path.exists(DAILY_BLACKOUTS_FILE) and scanned is not None and (
-                    json.load(open(DAILY_BLACKOUTS_FILE)).get("date") == today.isoformat()
-                    if os.path.exists(DAILY_BLACKOUTS_FILE) else False)
-                if not already:
-                    daily_report_scan()
+            if is_trading_day:
 
-            # JOB 0.5: Market pulse — active windows every 15 min, dead zone hourly
-            if not no_trade_day and dtime(9, 30) <= t <= dtime(16, 0):
-                post_market_pulse()
+                # ── Watchlist 9:15 AM ─────────────────────────────────────
+                from datetime import time as dtime
+                if dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today:
+                    log.info("JOB: daily watchlist")
+                    try:
+                        for ticker in ["NVDA", "TSLA"]:
+                            levels = get_daily_levels(ticker)
+                            pmh    = levels.get("pmh", "N/A")
+                            pml    = levels.get("pml", "N/A")
+                            post_to_discord(
+                                "daily-watchlist",
+                                f"**{ticker}** — Watching {pmh} (PMH) and {pml} (PML). "
+                                f"Window opens 9:30 AM — alerts fire on confirmed setups only.",
+                            )
+                        last_watchlist_date = today
+                    except Exception as e:
+                        log.error(f"Watchlist job error: {e}")
 
-            # JOB 1: Volume Profile zones — 8:00 AM ET (weekdays only, including Friday for zone data)
-            if not is_off_day() and dtime(8, 0) <= t <= dtime(8, 30) and today != last_zone_date:
-                log.info("🔄 Running daily Volume Profile zone calculation...")
-                volume_profile.update_all_zones(list(SWING_TICKERS))
-                last_zone_date = today
-                save_scheduler_state({
-                    "zone_date":      today.isoformat(),
-                    "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None,
-                    "recap_date":     last_recap_date.isoformat()     if last_recap_date     else None,
-                })
-                log.info("✅ Daily Volume Profile zones updated automatically.")
+                # ── 9:45 AM status update ─────────────────────────────────
+                if dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today:
+                    s = load_state()
+                    if s["trade_count"] == 0 and not get_open_position():
+                        post_to_discord(
+                            "day-trade-signals",
+                            "👀 Live and scanning — looking for a valid setup on NVDA and TSLA. "
+                            "Nothing worth the risk yet. Will alert when something lines up.",
+                        )
+                        log.info("9:45 status update posted")
+                    else:
+                        log.info("9:45 status update skipped — trade already active")
+                    last_945_date = today
 
-            # JOB 2: Daily watchlist — 9:15 AM ET (weekdays, NOT Friday)
-            if not no_trade_day and dtime(9, 15) <= t <= dtime(9, 45) and today != last_watchlist_date:
-                post_daily_watchlist()
-                last_watchlist_date = today
-                save_scheduler_state({
-                    "zone_date":      last_zone_date.isoformat()      if last_zone_date      else None,
-                    "watchlist_date": today.isoformat(),
-                    "recap_date":     last_recap_date.isoformat()     if last_recap_date     else None,
-                })
+                # ── 10:15 AM status update ────────────────────────────────
+                if dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today:
+                    s = load_state()
+                    if s["trade_count"] == 0 and not get_open_position():
+                        post_to_discord(
+                            "day-trade-signals",
+                            "🔍 Still watching — 15 minutes left in the window. "
+                            "No clean setup yet on NVDA or TSLA. "
+                            "If nothing sets up we sit out — no forced trades.",
+                        )
+                        log.info("10:15 status update posted")
+                    else:
+                        log.info("10:15 status update skipped — trade already active")
+                    last_1015_date = today
 
-            # JOB 3: Pattern scanner — every loop tick during trade window (weekdays, NOT Friday)
-            if not no_trade_day and dtime(9, 25) <= t <= dtime(10, 30):
-                candles_ready = sum(1 for tk in DAY_TRADE_TICKERS if len(get_candles_resilient(tk, limit=101)) > 50)
-                if candles_ready >= len(DAY_TRADE_TICKERS) // 2:
-                    scan_for_visual_patterns()
-                else:
-                    log.info(f"⏳ Pattern scanner skipped — only {candles_ready}/{len(DAY_TRADE_TICKERS)} tickers ready")
+                # ── 1-min scanner 9:25–10:30 AM ──────────────────────────
+                if dtime(9, 25) <= t <= dtime(10, 30) and _in_window():
+                    try:
+                        for ticker in ["NVDA", "TSLA"]:
+                            if not all_gates_pass(ticker, signal_type="entry"):
+                                continue
+                            candle = get_latest_1min_candle(ticker)
+                            levels = get_key_levels(ticker)
+                            if not candle:
+                                continue
+                            alert_data = {
+                                "ticker":     ticker,
+                                "alert_type": "SCANNER_1MIN",
+                                "close":      candle.get("close"),
+                                "open":       candle.get("open"),
+                                "high":       candle.get("high"),
+                                "low":        candle.get("low"),
+                                "volume":     candle.get("volume"),
+                                "pmh":        levels.get("pmh"),
+                                "pml":        levels.get("pml"),
+                            }
+                            session  = load_state()
+                            decision = call_claude(alert_data, session)
+                            if decision and decision.get("decision") == "APPROVE":
+                                direction = decision.get("direction", "").lower()
+                                if direction in ("call", "put"):
+                                    execute_trade(ticker, direction, decision)
+                                    break
+                    except Exception as e:
+                        log.error(f"Scanner error: {e}")
 
-            # JOB 4: End-of-day recap — 4:01 PM ET (weekdays, NOT Friday)
-            if not no_trade_day and dtime(16, 1) <= t <= dtime(16, 30) and today != last_recap_date:
-                post_eod_recap()
-                last_recap_date = today
-                save_scheduler_state({
-                    "zone_date":      last_zone_date.isoformat()      if last_zone_date      else None,
-                    "watchlist_date": last_watchlist_date.isoformat() if last_watchlist_date else None,
-                    "recap_date":     today.isoformat(),
-                })
+            # ── Position monitor — runs regardless of window/day ──────────
+            # Keeps managing past 10:30 AM if trade is still open
+            pos = get_open_position()
+            if pos or _in_window():
+                try:
+                    monitor_open_position()
+                except Exception as e:
+                    log.error(f"Position monitor error: {e}")
 
         except Exception as e:
-            log.error(f"Master scheduler error: {e}", exc_info=True)
+            log.error(f"Scheduler loop error: {e}")
 
-        time_module.sleep(300)  # check every 5 minutes
+        time_module.sleep(60)  # tick every 60 seconds
 
-def ensure_scheduler_started():
+
+def _ensure_scheduler():
     global _scheduler_started
     with _scheduler_lock:
         if not _scheduler_started:
             _scheduler_started = True
-            log.info(f"🚀 Starting zone scheduler in worker PID {os.getpid()}")
-            thread = threading.Thread(target=zone_scheduler_loop, daemon=True)
-            thread.start()
+            t = threading.Thread(target=_scheduler_loop, daemon=True)
+            t.start()
+            log.info("Scheduler started — all jobs registered")
 
-@app.before_request
-def _start_scheduler_on_first_request():
-    if not _scheduler_started:
-        ensure_scheduler_started()
 
-position_manager.configure(
-    post_discord=post_discord,
-    channels={"day_signals": CHANNEL_DAY_SIGNALS, "swing_signals": CHANNEL_SWING_SIGNALS, "recaps": CHANNEL_RECAPS, "watchlist": CHANNEL_WATCHLIST},
-    on_win=record_win,
-    on_loss=record_loss,
-)
-load_session_state()
-position_manager.start()
-ensure_scheduler_started()
+# ══════════════════════════════════════════════════════════════════════════════
+#  FLASK ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── /webhook ──────────────────────────────────────────────────────────────────
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    sig = request.headers.get("X-Signature", "")
+    if WEBHOOK_SECRET:
+        expected = hmac.new(WEBHOOK_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            log.warning("Webhook rejected — invalid signature")
+            return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json
+    if not data:
+        return jsonify({"error": "no data"}), 400
+
+    ticker     = str(data.get("ticker", "")).upper()
+    alert_type = str(data.get("alert_type", "UNKNOWN"))
+    log.info(f"WEBHOOK: {ticker} | {alert_type}")
+
+    if not all_gates_pass(ticker, signal_type="entry"):
+        return jsonify({"status": "blocked"}), 200
+
+    session  = load_state()
+    decision = call_claude(data, session)
+
+    if not decision:
+        return jsonify({"status": "claude_error"}), 200
+
+    if decision.get("decision") == "APPROVE":
+        d_ticker    = decision.get("ticker", ticker).upper()
+        d_direction = decision.get("direction", "").lower()
+        if d_direction not in ("call", "put"):
+            log.error(f"Invalid direction: {d_direction}")
+            return jsonify({"status": "invalid_direction"}), 200
+        success = execute_trade(d_ticker, d_direction, decision)
+        return jsonify({"status": "traded" if success else "execution_failed"}), 200
+
+    reason = decision.get("reason", "No reason given")
+    log.info(f"NO_TRADE: {reason}")
+    return jsonify({"status": "no_trade", "reason": reason}), 200
+
+
+# ── /flatten ──────────────────────────────────────────────────────────────────
+@app.route("/flatten", methods=["POST"])
+def flatten():
+    data = request.get_json(force=True, silent=True) or {}
+    if WEBHOOK_SECRET and not hmac.compare_digest(
+        data.get("secret", ""), WEBHOOK_SECRET
+    ):
+        return jsonify({"error": "unauthorized"}), 401
+
+    pos = get_open_position()
+    if not pos:
+        return jsonify({"status": "no_position"}), 200
+
+    occ        = pos["occ_symbol"]
+    fill_price = float(pos["fill_price"])
+    quote      = _live_option_quote(occ)
+    bid        = float(quote.get("bid", fill_price * 0.90)) if quote else fill_price * 0.90
+
+    exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid)
+    cancel_resting_stop(pos.get("stop_order_id"))
+
+    pnl_pct    = (exit_price - fill_price) / fill_price
+    pnl_dollar = (exit_price - fill_price) * 100
+    emoji      = "✅" if exit_price > fill_price else "❌"
+    close_time = datetime.now(ET).strftime("%H:%M ET")
+
+    post_to_discord(
+        "profits-and-recaps",
+        f"{emoji} **{occ} CLOSED** — MANUAL FLATTEN\n"
+        f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
+        f"P&L: {pnl_pct:+.1%} ({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
+    )
+    clear_open_position()
+    record_trade_result(win=(exit_price > fill_price))
+    log.info(f"Flatten complete — {occ} @ ${exit_price:.2f}")
+    return jsonify({"status": "flattened", "exit_price": exit_price}), 200
+
+
+# ── /kill ─────────────────────────────────────────────────────────────────────
+@app.route("/kill", methods=["POST"])
+def kill():
+    data = request.get_json(force=True, silent=True) or {}
+    if WEBHOOK_SECRET and not hmac.compare_digest(
+        data.get("secret", ""), WEBHOOK_SECRET
+    ):
+        return jsonify({"error": "unauthorized"}), 401
+
+    flatten()
+    s = load_state()
+    s["circuit_breaker"] = True
+    _commit(s)
+    log.warning("/kill — circuit breaker on, day over")
+    post_to_discord("day-trade-signals", "🛑 Kill switch activated — no more trades today.")
+    return jsonify({"status": "killed"}), 200
+
+
+# ── /status ───────────────────────────────────────────────────────────────────
+@app.route("/status", methods=["GET"])
+def status():
+    s   = load_state()
+    now = datetime.now(ET)
+    pos = s.get("open_position")
+    return jsonify({
+        "status":             "online",
+        "version":            "v5.0",
+        "time_et":            now.strftime("%Y-%m-%d %H:%M:%S ET"),
+        "trade_count":        s["trade_count"],
+        "circuit_breaker":    s["circuit_breaker"],
+        "consecutive_losses": s["consecutive_losses"],
+        "open_position":      pos is not None,
+        "open_symbol":        pos["occ_symbol"] if pos else None,
+        "last_reset_date":    s["last_reset_date"],
+        "in_window":          _in_window(),
+    }), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return status()
+
+
+# ── / ─────────────────────────────────────────────────────────────────────────
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "TPP Trading Server v5.0 — live"}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STARTUP
+# ══════════════════════════════════════════════════════════════════════════════
+load_state()
+_ensure_scheduler()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
