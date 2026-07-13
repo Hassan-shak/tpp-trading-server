@@ -4,3 +4,5 @@ requests==2.32.3
 gunicorn==23.0.0
 numpy==2.1.3
 websocket-client==1.8.0
+pytz
+APScheduler==3.10.4
