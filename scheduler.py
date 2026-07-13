@@ -53,11 +53,72 @@ def _in_window() -> bool:
 def job_volume_zones():
     log.info("JOB: volume zone recalculation")
     try:
-        from alpaca_data import compute_volume_zones
-        zones = compute_volume_zones(["NVDA", "TSLA"])
-        log.info(f"Volume zones updated: {zones}")
+        for ticker in ["NVDA", "TSLA"]:
+            levels = _get_daily_levels(ticker)
+            log.info("Daily levels " + ticker + ": PMH=" + str(levels.get("pmh")) + " PML=" + str(levels.get("pml")))
     except Exception as e:
         log.error(f"Volume zone job failed: {e}")
+
+
+# ── Alpaca data helpers (inline) ─────────────────────────────────────────────────
+def _get_daily_levels(ticker: str) -> dict:
+    import os, requests as _req
+    key = os.environ.get("ALPACA_API_KEY", "")
+    sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+    for feed in ("sip", "iex"):
+        try:
+            r = _req.get(
+                "https://data.alpaca.markets/v2/stocks/" + ticker + "/bars",
+                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                params={"timeframe": "1Day", "limit": 5, "adjustment": "raw", "feed": feed},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                bars = r.json().get("bars", [])
+                if bars:
+                    p = bars[-1]
+                    return {
+                        "ticker": ticker,
+                        "pmh": round(float(p["h"]), 2),
+                        "pml": round(float(p["l"]), 2),
+                        "prev_close": round(float(p["c"]), 2),
+                        "prev_open": round(float(p["o"]), 2),
+                        "avg_volume": int(sum(b["v"] for b in bars) / len(bars)),
+                    }
+        except Exception as e:
+            log.warning("daily_levels " + feed + " " + ticker + ": " + str(e))
+    return {"ticker": ticker, "pmh": None, "pml": None, "prev_close": None, "prev_open": None, "avg_volume": None}
+
+
+def _get_daily_levels_str(lvl: dict) -> tuple:
+    pmh = lvl.get("pmh")
+    pml = lvl.get("pml")
+    return ("$" + str(pmh) if pmh else "N/A", "$" + str(pml) if pml else "N/A")
+
+
+def _get_latest_1min_candle(ticker: str) -> dict:
+    import os, requests as _req
+    key = os.environ.get("ALPACA_API_KEY", "")
+    sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+    for feed in ("sip", "iex"):
+        try:
+            r = _req.get(
+                "https://data.alpaca.markets/v2/stocks/" + ticker + "/bars",
+                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                params={"timeframe": "1Min", "limit": 1, "adjustment": "raw", "feed": feed},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                bars = r.json().get("bars", [])
+                if bars:
+                    b = bars[-1]
+                    return {"open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"]}
+        except Exception as e:
+            log.warning("1min_candle " + feed + " " + ticker + ": " + str(e))
+    return None
+
+def _get_key_levels(ticker: str) -> dict:
+    return _get_daily_levels(ticker)
 
 
 # ── job 2: watchlist (9:15 AM) ────────────────────────────────────────────────
@@ -68,11 +129,10 @@ def job_watchlist():
     """
     log.info("JOB: daily watchlist")
     try:
-        from alpaca_data import get_daily_levels
         from claude_brain import call_claude
 
         for ticker in ["NVDA", "TSLA"]:
-            levels = get_daily_levels(ticker)
+            levels = _get_daily_levels(ticker)
 
             alert_data = {
                 "ticker":     ticker,
@@ -115,7 +175,6 @@ def job_scanner():
     log.debug("JOB: scanner tick")
 
     try:
-        from alpaca_data    import get_latest_1min_candle, get_key_levels
         from gate_checks    import all_gates_pass
         from claude_brain   import call_claude
         from execution_engine import execute_trade
@@ -124,8 +183,8 @@ def job_scanner():
             if not all_gates_pass(ticker, signal_type="entry"):
                 continue
 
-            candle = get_latest_1min_candle(ticker)
-            levels = get_key_levels(ticker)
+            candle = _get_latest_1min_candle(ticker)
+            levels = _get_key_levels(ticker)
 
             if not candle:
                 log.warning(f"No 1-min candle for {ticker}")
