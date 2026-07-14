@@ -368,26 +368,34 @@ _tt_token_expiry = None
 
 
 def _tt_get_token() -> str:
+    """OAuth2 refresh-token flow (v4.1 method). Password sessions fail on servers."""
     global _tt_token, _tt_token_expiry
     now = datetime.now(ET)
     if _tt_token and _tt_token_expiry and now < _tt_token_expiry:
         return _tt_token
     resp = requests.post(
-        f"{TT_BASE}/sessions",
-        json={"login": TT_USER, "password": TT_PASS, "remember-me": True},
+        f"{TT_BASE}/oauth/token",
+        json={
+            "grant_type":    "refresh_token",
+            "refresh_token": os.environ["TASTYTRADE_REFRESH_TOKEN"],
+            "client_id":     os.environ["TASTYTRADE_CLIENT_ID"],
+            "client_secret": os.environ["TASTYTRADE_CLIENT_SECRET"],
+        },
         headers={"Content-Type": "application/json"},
         timeout=10,
     )
-    if resp.status_code != 201:
-        raise RuntimeError(f"Tastytrade auth failed {resp.status_code}: {resp.text}")
-    _tt_token        = resp.json()["data"]["session-token"]
-    _tt_token_expiry = now + timedelta(hours=23)
-    log.info("Tastytrade session refreshed")
+    if resp.status_code != 200:
+        raise RuntimeError(f"Tastytrade OAuth failed {resp.status_code}: {resp.text}")
+    body             = resp.json()
+    _tt_token        = body["access_token"]
+    expires_in       = int(body.get("expires_in", 900))
+    _tt_token_expiry = now + timedelta(seconds=max(expires_in - 120, 300))
+    log.info("Tastytrade access token refreshed — LIVE mode | Account: " + TT_ACCOUNT)
     return _tt_token
 
 
 def _tt_headers() -> dict:
-    return {"Authorization": _tt_get_token(), "Content-Type": "application/json"}
+    return {"Authorization": "Bearer " + _tt_get_token(), "Content-Type": "application/json"}
 
 
 def _next_friday() -> date:
