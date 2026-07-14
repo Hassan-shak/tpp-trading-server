@@ -130,45 +130,124 @@ def _get_key_levels(ticker: str) -> dict:
 # ── job 2: watchlist (9:15 AM) ────────────────────────────────────────────────
 def job_watchlist():
     """
-    Post one combined daily watchlist for NVDA and TSLA.
-    Skips any ticker with missing PMH/PML — never posts None.
-    Single message, no per-ticker spam, no alert-window copy.
+    Post daily watchlist for NVDA and TSLA in Junior's voice.
+    Pulls pre-market price, gap %, PMH/PML, demand/supply zones from Alpaca.
+    Claude writes a rich detailed watchlist — not a bare two-liner.
+    NVDA and TSLA only. No SPY/QQQ/AMZN ever.
     """
     log.info("JOB: daily watchlist")
     try:
-        lines = []
+        import anthropic as _anthropic
+        import requests as _req
+        _client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+        ticker_data = []
         for ticker in ["NVDA", "TSLA"]:
             levels = _get_daily_levels(ticker)
-            pmh = levels.get("pmh")
-            pml = levels.get("pml")
-            close = levels.get("prev_close")
+            pmh       = levels.get("pmh")
+            pml       = levels.get("pml")
+            prev_close = levels.get("prev_close")
+            avg_vol   = levels.get("avg_volume")
 
             if pmh is None or pml is None:
-                log.warning(f"Watchlist: skipping {ticker} — PMH/PML missing")
+                log.warning("Watchlist: skipping " + ticker + " — levels missing")
                 continue
 
-            mid = round((pmh + pml) / 2, 2)
-            if close and close >= mid:
-                bias = "🟢 Bullish"
-            else:
-                bias = "🔴 Bearish"
+            # Pre-market mid-price for gap calculation
+            pre_price = None
+            gap_pct   = None
+            key = os.environ.get("ALPACA_API_KEY", "")
+            sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+            for feed in ("iex", "sip", None):
+                try:
+                    params = {"feed": feed} if feed else {}
+                    r = _req.get(
+                        "https://data.alpaca.markets/v2/stocks/" + ticker + "/quotes/latest",
+                        headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                        params=params, timeout=5,
+                    )
+                    if r.status_code == 200:
+                        q = r.json().get("quote", {})
+                        ap = float(q.get("ap") or 0)
+                        bp = float(q.get("bp") or 0)
+                        if ap and bp:
+                            pre_price = round((ap + bp) / 2, 2)
+                            break
+                except Exception:
+                    continue
 
-            lines.append(f"**{ticker}** | PMH: ${pmh:.2f}  PML: ${pml:.2f}  |  {bias}")
+            if pre_price and prev_close:
+                gap_pct = round(((pre_price - prev_close) / prev_close) * 100, 2)
 
-        if not lines:
-            log.warning("Watchlist: no valid tickers — nothing posted")
+            poc          = round((pmh + pml) / 2, 2)
+            demand_zone  = str(round(pml - 1.0, 2)) + "-" + str(pml)
+            supply_zone  = str(pmh) + "-" + str(round(pmh + 1.0, 2))
+
+            ticker_data.append({
+                "ticker":      ticker,
+                "price":       pre_price or prev_close,
+                "gap_pct":     gap_pct,
+                "pmh":         pmh,
+                "pml":         pml,
+                "prev_close":  prev_close,
+                "avg_volume":  avg_vol,
+                "demand_zone": demand_zone,
+                "supply_zone": supply_zone,
+                "poc":         poc,
+            })
+
+        if not ticker_data:
+            log.warning("Watchlist: no valid data — skipping post")
             return
 
-        message = "📋 **Today's Watchlist**\n\n" + "\n".join(lines)
-        post_to_discord("daily-watchlist", message)
-        log.info(f"Watchlist posted: {len(lines)} ticker(s)")
+        # Build data string for Claude
+        data_lines = []
+        for td in ticker_data:
+            g = td["gap_pct"]
+            gap_str = ("+" if g >= 0 else "") + str(g) + "%" if g is not None else "N/A"
+            data_lines.append(
+                td["ticker"] + ": price=$" + str(td["price"]) +
+                " gap=" + gap_str +
+                " PMH=$" + str(td["pmh"]) +
+                " PML=$" + str(td["pml"]) +
+                " demand=" + td["demand_zone"] +
+                " supply=" + td["supply_zone"] +
+                " POC=$" + str(td["poc"])
+            )
+        data_str = "\n".join(data_lines)
+
+        prompt = (
+            "You are Junior from The Portfolio Plug. Write the morning watchlist for #daily-watchlist.\n\n"
+            "STRICT RULES:\n"
+            "- NVDA and TSLA ONLY. Never mention SPY, QQQ, AMZN, or any other ticker.\n"
+            "- Junior voice: direct, confident, no fluff, no disclaimers.\n"
+            "- For each ticker: bold ticker name, current price, gap %, which zone it is sitting in, POC level, "
+            "and one clear trade thesis sentence (what you are watching for — bounce, break, rejection).\n"
+            "- End with one line: window opens 9:30 AM ET, alerts fire on confirmed setups only.\n"
+            "- Members read this on their phone. Keep it tight — 3-4 sentences per ticker max.\n"
+            "- Never mention account balances or dollar amounts of the account.\n"
+            "- Use exact dollar amounts from the data below.\n\n"
+            "FORMAT EXAMPLE:\n"
+            "**NVDA** | $205.19 | Gap: -0.05%\n"
+            "Trading inside the 203.65-206.05 demand zone — needs volume confirmation before I trust a bounce. "
+            "POC sits at $212.07, that is the target if buyers step in here.\n\n"
+            "MARKET DATA:\n" + data_str + "\n\n"
+            "Write the watchlist now."
+        )
+
+        response = _client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        msg = response.content[0].text.strip()
+        post_to_discord("daily-watchlist", msg)
+        log.info("Watchlist posted successfully")
 
     except Exception as e:
-        log.error(f"Watchlist job failed: {e}")
+        log.error("Watchlist job failed: " + str(e))
 
 
-# ── job 3: 1-min scanner (9:25–10:30 AM) ─────────────────────────────────────
 def job_scanner():
     """
     Runs every minute inside the trading window.
