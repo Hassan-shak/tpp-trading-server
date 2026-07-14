@@ -103,14 +103,17 @@ def _get_latest_1min_candle(ticker: str) -> dict:
     import os, requests as _req
     key = os.environ.get("ALPACA_API_KEY", "")
     sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
-    for feed in ("sip", "iex"):
-        try:
-            r = _req.get(
-                "https://data.alpaca.markets/v2/stocks/" + ticker + "/bars",
-                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
-                params={"timeframe": "1Min", "limit": 1, "adjustment": "raw", "feed": feed},
-                timeout=5,
-            )
+      for feed in ("iex", "sip", None):
+    try:
+      params = {"timeframe": "1Min", "limit": 1, "adjustment": "raw"}
+      if feed:
+        params["feed"] = feed
+      r = _req.get(
+        "https://data.alpaca.markets/v2/stocks/" + ticker + "/bars",
+        headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+        params=params,
+        timeout=5,
+      )
             if r.status_code == 200:
                 bars = r.json().get("bars", [])
                 if bars:
