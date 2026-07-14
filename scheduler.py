@@ -124,39 +124,39 @@ def _get_key_levels(ticker: str) -> dict:
 # ── job 2: watchlist (9:15 AM) ────────────────────────────────────────────────
 def job_watchlist():
     """
-    Post daily watchlist for NVDA and TSLA only.
-    No SPY/QQQ. No market commentary on non-tradeable tickers.
+    Post one combined daily watchlist for NVDA and TSLA.
+    Skips any ticker with missing PMH/PML — never posts None.
+    Single message, no per-ticker spam, no alert-window copy.
     """
     log.info("JOB: daily watchlist")
     try:
-        from claude_brain import call_claude
+        lines = []
 
         for ticker in ["NVDA", "TSLA"]:
             levels = _get_daily_levels(ticker)
+            pmh = levels.get("pmh")
+            pml = levels.get("pml")
+            close = levels.get("prev_close")
 
-            alert_data = {
-                "ticker":     ticker,
-                "alert_type": "WATCHLIST",
-                "pmh":        levels.get("pmh"),
-                "pml":        levels.get("pml"),
-                "close":      levels.get("prev_close"),
-                "volume":     levels.get("avg_volume"),
-                "high":       levels.get("pmh"),
-                "low":        levels.get("pml"),
-                "open":       levels.get("prev_open"),
-            }
+            if pmh is None or pml is None:
+                log.warning(f"Watchlist: skipping {ticker} — PMH/PML missing")
+                continue
 
-            session  = load_state()
-            decision = call_claude(alert_data, session)
-
-            if decision and decision.get("decision") == "APPROVE":
-                blurb = decision.get("setup_description", f"{ticker} levels loaded.")
+            mid = round((pmh + pml) / 2, 2)
+            if close and close >= mid:
+                bias = "🟢 Bullish"
             else:
-                pmh = levels.get("pmh", "N/A")
-                pml = levels.get("pml", "N/A")
-                blurb = f"Watching {pmh} (PMH) and {pml} (PML) for direction."
+                bias = "🔴 Bearish"
 
-            post_to_discord("daily-watchlist", f"**{ticker}** — {blurb}")
+            lines.append(f"**{ticker}** | PMH: ${pmh:.2f}  PML: ${pml:.2f}  |  {bias}")
+
+        if not lines:
+            log.warning("Watchlist: no valid tickers — nothing posted")
+            return
+
+        message = "📋 **Today's Watchlist**\n\n" + "\n".join(lines)
+        post_to_discord("daily-watchlist", message)
+        log.info(f"Watchlist posted: {len(lines)} ticker(s)")
 
     except Exception as e:
         log.error(f"Watchlist job failed: {e}")
