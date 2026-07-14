@@ -97,32 +97,32 @@ def _is_valid_ticker(ticker: str) -> tuple[bool, str]:
 def _is_blackout() -> tuple[bool, str]:
     today = datetime.now(ET).date()
     if today in FOMC_DECISION_DAYS_2026:
-        return True, "FOMC decision day — full day halt"
+        return False, "FOMC decision day — full day halt"
     if os.environ.get("MANUAL_BLACKOUT", "0").strip() == "1":
-        return True, "manual blackout active (MANUAL_BLACKOUT=1)"
-    return False, "ok"
+        return False, "manual blackout active (MANUAL_BLACKOUT=1)"
+    return True, "ok"
 
 
 def _circuit_breaker_active() -> tuple[bool, str]:
     from session_state import get_circuit_breaker
     if get_circuit_breaker():
-        return True, "circuit breaker — 2 consecutive losses today"
-    return False, "ok"
+        return False, "circuit breaker — 2 consecutive losses today"
+    return True, "ok"
 
 
 def _max_trades_reached() -> tuple[bool, str]:
     from session_state import is_max_trades_reached, get_trade_count
     if is_max_trades_reached():
-        return True, f"max trades reached ({get_trade_count()}/2 today)"
-    return False, "ok"
+        return False, f"max trades reached ({get_trade_count()}/2 today)"
+    return True, "ok"
 
 
 def _position_already_open() -> tuple[bool, str]:
     from session_state import get_open_position
     pos = get_open_position()
     if pos:
-        return True, f"position already open: {pos.get('occ_symbol')}"
-    return False, "ok"
+        return False, f"position already open: {pos.get('occ_symbol')}"
+    return True, "ok"
 
 
 def _cooldown_ok(ticker: str, signal_type: str) -> tuple[bool, str]:
