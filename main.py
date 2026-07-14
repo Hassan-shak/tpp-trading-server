@@ -1182,14 +1182,13 @@ def _ensure_scheduler():
 # ── /webhook ──────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    sig = request.headers.get("X-Signature", "")
-    if WEBHOOK_SECRET:
-        expected = hmac.new(WEBHOOK_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, sig):
-            log.warning("Webhook rejected — invalid signature")
-            return jsonify({"error": "unauthorized"}), 401
+    # Verify secret from JSON body (TradingView compatible)
+    data = request.get_json(force=True, silent=True) or {}
+    incoming_secret = data.get("secret", "")
+    if WEBHOOK_SECRET and not hmac.compare_digest(incoming_secret, WEBHOOK_SECRET):
+        log.warning("Webhook rejected — invalid signature")
+        return jsonify({"error": "unauthorized"}), 401
 
-    data = request.json
     if not data:
         return jsonify({"error": "no data"}), 400
 
