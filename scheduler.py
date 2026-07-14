@@ -65,14 +65,17 @@ def _get_daily_levels(ticker: str) -> dict:
     import os, requests as _req
     key = os.environ.get("ALPACA_API_KEY", "")
     sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
-    for feed in ("sip", "iex"):
-        try:
-            r = _req.get(
-                "https://data.alpaca.markets/v2/stocks/" + ticker + "/bars",
-                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
-                params={"timeframe": "1Day", "limit": 5, "adjustment": "raw", "feed": feed},
-                timeout=10,
-            )
+  for feed in ("iex", "sip", None):
+    try:
+      params = {"timeframe": "1Day", "limit": 5, "adjustment": "raw"}
+      if feed:
+        params["feed"] = feed
+      r = _req.get(
+        "https://data.alpaca.markets/v2/stocks/" + ticker + "/bars",
+        headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+        params=params,
+        timeout=10,
+      )
             if r.status_code == 200:
                 bars = r.json().get("bars", [])
                 if bars:
