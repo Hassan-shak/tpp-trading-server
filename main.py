@@ -296,29 +296,29 @@ def _gate_ticker(ticker: str) -> tuple[bool, str]:
 def _gate_blackout() -> tuple[bool, str]:
     today = datetime.now(ET).date()
     if today in FOMC_DECISION_DAYS_2026:
-        return True, "FOMC decision day — full day halt"
+        return False, "FOMC decision day — full day halt"
     if os.environ.get("MANUAL_BLACKOUT", "0").strip() == "1":
-        return True, "manual blackout active"
-    return False, "ok"
+        return False, "manual blackout active"
+    return True, "ok"
 
 
 def _gate_circuit_breaker() -> tuple[bool, str]:
     if get_circuit_breaker():
-        return True, "circuit breaker — 2 consecutive losses today"
-    return False, "ok"
+        return False, "circuit breaker — 2 consecutive losses today"
+    return True, "ok"
 
 
 def _gate_max_trades() -> tuple[bool, str]:
     if is_max_trades_reached():
-        return True, f"max trades reached ({get_trade_count()}/2)"
-    return False, "ok"
+        return False, f"max trades reached ({get_trade_count()}/2)"
+    return True, "ok"
 
 
 def _gate_open_position() -> tuple[bool, str]:
     pos = get_open_position()
     if pos:
-        return True, f"position already open: {pos.get('occ_symbol')}"
-    return False, "ok"
+        return False, f"position already open: {pos.get('occ_symbol')}"
+    return True, "ok"
 
 
 def _gate_cooldown(ticker: str, signal_type: str) -> tuple[bool, str]:
@@ -1298,6 +1298,18 @@ def status():
 @app.route("/health", methods=["GET"])
 def health():
     return status()
+
+
+@app.route("/tt-test", methods=["GET"])
+def tt_test():
+    """Verify Tastytrade auth works without placing any order."""
+    try:
+        token = _tt_get_token()
+        if token:
+            return jsonify({"tastytrade_auth": "ok", "account": TT_ACCOUNT}), 200
+        return jsonify({"tastytrade_auth": "failed", "reason": "no token returned"}), 500
+    except Exception as e:
+        return jsonify({"tastytrade_auth": "failed", "reason": str(e)}), 500
 
 
 # ── / ─────────────────────────────────────────────────────────────────────────
