@@ -1030,10 +1030,12 @@ def get_latest_1min_candle(ticker: str) -> dict | None:
     return None
 
 def get_key_levels(ticker: str) -> dict:
-    """PMH/PML/prev_close from previous day bar. Feed fallback iex -> sip -> default."""
+    """PMH/PML/prev_close from last COMPLETED daily bar (explicit start: Alpaca defaults start=today -> empty pre-open)."""
+    start = (datetime.now(ET).date() - timedelta(days=7)).isoformat()
+    today_str = datetime.now(ET).strftime("%Y-%m-%d")
     for feed in ("iex", "sip", None):
         try:
-            params = {"timeframe": "1Day", "limit": 2}
+            params = {"timeframe": "1Day", "limit": 10, "start": start}
             if feed:
                 params["feed"] = feed
             resp = requests.get(
@@ -1044,8 +1046,12 @@ def get_key_levels(ticker: str) -> dict:
             )
             if resp.status_code == 200:
                 bars = resp.json().get("bars", [])
-                if bars:
-                    prev = bars[-2] if len(bars) >= 2 else bars[0]
+                prev = None
+                for b in reversed(bars):
+                    if not str(b.get("t", "")).startswith(today_str):
+                        prev = b
+                        break
+                if prev:
                     return {"pmh": prev["h"], "pml": prev["l"], "prev_close": prev["c"]}
             else:
                 log.warning(f"key levels {ticker} feed={feed} -> {resp.status_code}")
