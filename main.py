@@ -71,7 +71,7 @@ CLOSE_TIMEOUT      = 45     # seconds before market escalation on exit
 
 CHANNEL_IDS = {
     "daily-watchlist":    os.environ.get("DISCORD_CHANNEL_WATCHLIST",  ""),
-    "day-trade-signals":  os.environ.get("DISCORD_CHANNEL_SIGNALS",    ""),
+    "day-trade-signals":  os.environ.get("DISCORD_CHANNEL_DAY_SIGNALS") or os.environ.get("DISCORD_CHANNEL_SIGNALS",    ""),
     "profits-and-recaps": os.environ.get("DISCORD_CHANNEL_RECAPS",     ""),
 }
 
@@ -415,7 +415,7 @@ def _spot_price(ticker: str) -> float | None:
         resp   = requests.get(
             f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest",
             headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
-            params={"feed": "sip"},
+            params={"feed": "iex"},
             timeout=5,
         )
         if resp.status_code == 200:
@@ -1005,42 +1005,54 @@ def _alpaca_headers() -> dict:
 
 
 def get_latest_1min_candle(ticker: str) -> dict | None:
-    try:
-        resp = requests.get(
-            f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
-            headers=_alpaca_headers(),
-            params={"timeframe": "1Min", "limit": 2, "feed": "sip"},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            bars = resp.json().get("bars", [])
-            if bars:
-                b = bars[-1]
-                return {"open": b["o"], "high": b["h"], "low": b["l"],
-                        "close": b["c"], "volume": b["v"]}
-    except Exception as e:
-        log.error(f"1-min candle fetch failed for {ticker}: {e}")
+    """Latest 1-min bar. Feed fallback iex -> sip -> default (SIP realtime embargoed on basic plans)."""
+    for feed in ("iex", "sip", None):
+        try:
+            params = {"timeframe": "1Min", "limit": 2}
+            if feed:
+                params["feed"] = feed
+            resp = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                headers=_alpaca_headers(),
+                params=params,
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                bars = resp.json().get("bars", [])
+                if bars:
+                    b = bars[-1]
+                    return {"open": b["o"], "high": b["h"], "low": b["l"],
+                            "close": b["c"], "volume": b["v"]}
+            else:
+                log.warning(f"1min candle {ticker} feed={feed} -> {resp.status_code}")
+        except Exception as e:
+            log.warning(f"1min candle {ticker} feed={feed}: {e}")
     return None
 
-
 def get_key_levels(ticker: str) -> dict:
-    """Get PMH/PML from previous day's bar."""
-    try:
-        resp = requests.get(
-            f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
-            headers=_alpaca_headers(),
-            params={"timeframe": "1Day", "limit": 2, "feed": "sip"},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            bars = resp.json().get("bars", [])
-            if len(bars) >= 1:
-                prev = bars[-2] if len(bars) >= 2 else bars[0]
-                return {"pmh": prev["h"], "pml": prev["l"]}
-    except Exception as e:
-        log.error(f"Key levels fetch failed for {ticker}: {e}")
-    return {"pmh": None, "pml": None}
-
+    """PMH/PML/prev_close from previous day bar. Feed fallback iex -> sip -> default."""
+    for feed in ("iex", "sip", None):
+        try:
+            params = {"timeframe": "1Day", "limit": 2}
+            if feed:
+                params["feed"] = feed
+            resp = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                headers=_alpaca_headers(),
+                params=params,
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                bars = resp.json().get("bars", [])
+                if bars:
+                    prev = bars[-2] if len(bars) >= 2 else bars[0]
+                    return {"pmh": prev["h"], "pml": prev["l"], "prev_close": prev["c"]}
+            else:
+                log.warning(f"key levels {ticker} feed={feed} -> {resp.status_code}")
+        except Exception as e:
+            log.warning(f"key levels {ticker} feed={feed}: {e}")
+    log.error(f"Key levels failed on all feeds for {ticker}")
+    return {"pmh": None, "pml": None, "prev_close": None}
 
 def get_daily_levels(ticker: str) -> dict:
     levels = get_key_levels(ticker)
@@ -1085,15 +1097,59 @@ def _scheduler_loop():
                 if dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today:
                     log.info("JOB: daily watchlist")
                     try:
+                        rows = []
                         for ticker in ["NVDA", "TSLA"]:
-                            levels = get_daily_levels(ticker)
-                            pmh    = levels.get("pmh", "N/A")
-                            pml    = levels.get("pml", "N/A")
-                            post_to_discord(
-                                "daily-watchlist",
-                                f"**{ticker}** — Watching {pmh} (PMH) and {pml} (PML). "
-                                f"Window opens 9:30 AM — alerts fire on confirmed setups only.",
+                            lv  = get_key_levels(ticker)
+                            pmh = lv.get("pmh")
+                            pml = lv.get("pml")
+                            pc  = lv.get("prev_close")
+                            if pmh is None or pml is None:
+                                log.warning("Watchlist: no levels for " + ticker)
+                                continue
+                            spot = _spot_price(ticker) or pc
+                            gap  = round(((spot - pc) / pc) * 100, 2) if (spot and pc) else None
+                            poc  = round((pmh + pml) / 2, 2)
+                            rows.append({"ticker": ticker, "price": spot, "gap": gap,
+                                         "pmh": pmh, "pml": pml, "poc": poc})
+                        if rows:
+                            data_lines = []
+                            for r_ in rows:
+                                g = r_["gap"]
+                                gs = (("+" if g >= 0 else "") + str(g) + "%") if g is not None else "flat"
+                                data_lines.append(
+                                    r_["ticker"] + ": price=$" + str(r_["price"]) +
+                                    " gap=" + gs + " PMH=$" + str(r_["pmh"]) +
+                                    " PML=$" + str(r_["pml"]) + " POC=$" + str(r_["poc"]))
+                            wl_prompt = (
+                                "You are Junior from The Portfolio Plug. Write the morning "
+                                "watchlist post for #daily-watchlist.\n"
+                                "RULES: NVDA and TSLA ONLY - never mention any other ticker. "
+                                "Junior voice: direct, confident, educational, zero fluff, no disclaimers. "
+                                "For each ticker in its own block: bold ticker name, price, gap %, "
+                                "whether price sits near PMH (supply) or PML (demand), the POC level, "
+                                "and ONE clear sentence on what you are watching for (bounce, break, rejection). "
+                                "3-4 sentences per ticker max. End with exactly one line: "
+                                "Window opens 9:30 AM ET - alerts fire on confirmed setups only.\n"
+                                "DATA:\n" + "\n".join(data_lines)
                             )
+                            try:
+                                _wl_client = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+                                _wl_resp = _wl_client.messages.create(
+                                    model=CLAUDE_MODEL, max_tokens=600,
+                                    messages=[{"role": "user", "content": wl_prompt}],
+                                )
+                                post_to_discord("daily-watchlist", _wl_resp.content[0].text.strip())
+                            except Exception as we:
+                                log.error("Watchlist Claude call failed: " + str(we))
+                                for r_ in rows:
+                                    post_to_discord(
+                                        "daily-watchlist",
+                                        "**" + r_["ticker"] + "** | $" + str(r_["price"]) +
+                                        " | PMH $" + str(r_["pmh"]) + " / PML $" + str(r_["pml"]) +
+                                        " / POC $" + str(r_["poc"]) +
+                                        " - window opens 9:30 AM ET, alerts on confirmed setups only.")
+                        else:
+                            log.warning("Watchlist skipped - no level data for either ticker")
                         last_watchlist_date = today
                     except Exception as e:
                         log.error(f"Watchlist job error: {e}")
