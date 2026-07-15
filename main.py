@@ -1264,6 +1264,24 @@ def webhook():
 
     ticker     = str(data.get("ticker", "")).upper()
     alert_type = str(data.get("alert_type", "UNKNOWN"))
+
+    # -- sanitize TradingView template quirks + enrich levels server-side --
+    if "{{" in alert_type or not alert_type.strip():
+        alert_type = "PRICE_ALERT"
+        data["alert_type"] = alert_type
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    for _k in ("pmh", "pml", "level", "close", "open", "high", "low", "volume"):
+        if _k in data:
+            data[_k] = _num(data[_k])
+    if ticker in TRADEABLE_TICKERS and (not data.get("pmh") or not data.get("pml")):
+        _lv = get_key_levels(ticker)
+        data["pmh"] = data.get("pmh") or _lv.get("pmh")
+        data["pml"] = data.get("pml") or _lv.get("pml")
+        log.info(f"Webhook enriched {ticker}: PMH={data.get('pmh')} PML={data.get('pml')}")
     log.info(f"WEBHOOK: {ticker} | {alert_type}")
 
     if not all_gates_pass(ticker, signal_type="entry"):
