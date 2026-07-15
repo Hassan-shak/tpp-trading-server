@@ -1078,11 +1078,40 @@ _scheduler_started = False
 _scheduler_lock    = threading.Lock()
 
 
+def _post_scanning_update(label: str, closing: str):
+    """Claude-written live scanning update for #daily-watchlist — educational, real levels."""
+    try:
+        rows = []
+        for _tk in ["NVDA", "TSLA"]:
+            _lvl = get_key_levels(_tk)
+            _cd  = get_latest_1min_candle(_tk)
+            _px  = (_cd or {}).get("close") or _spot_price(_tk)
+            if _px and _lvl.get("pmh") and _lvl.get("pml"):
+                rows.append(_tk + ": price=$" + str(_px) + " PMH=$" + str(_lvl["pmh"]) + " PML=$" + str(_lvl["pml"]))
+        if not rows:
+            post_to_discord("daily-watchlist", "Scanning NVDA and TSLA — waiting on confirmed level breaks. " + closing)
+            return
+        _pr = (
+            "You are Junior from The Portfolio Plug posting a mid-window scanning update (" + label + ") in #daily-watchlist.\n"
+            "RULES: NVDA and TSLA only. Junior voice - direct, educational, zero fluff, no disclaimers. "
+            "For each ticker, 1-2 sentences: where price trades versus PMH and PML right now, "
+            "and exactly what has to happen for an entry (break and hold which level). "
+            "This teaches the playbook - it is NOT a signal. At most one emoji total. "
+            "End with exactly this line: " + closing + "\n"
+            "LIVE DATA:\n" + "\n".join(rows)
+        )
+        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _rp = _cl.messages.create(model=CLAUDE_MODEL, max_tokens=400, messages=[{"role": "user", "content": _pr}])
+        post_to_discord("daily-watchlist", _rp.content[0].text.strip())
+    except Exception as _e:
+        log.error("Scanning update failed: " + str(_e))
+
 def _scheduler_loop():
     log.info("Scheduler loop started")
-    last_watchlist_date   = None
-    last_945_date         = None
-    last_1015_date        = None
+    _s0 = load_state()
+    last_watchlist_date   = _s0.get("last_watchlist_date")
+    last_945_date         = _s0.get("last_945_date")
+    last_1015_date        = _s0.get("last_1015_date")
 
     while True:
         try:
@@ -1157,6 +1186,7 @@ def _scheduler_loop():
                         else:
                             log.warning("Watchlist skipped - no level data for either ticker")
                         last_watchlist_date = today
+                        _sp = load_state(); _sp["last_watchlist_date"] = today; _commit(_sp)
                     except Exception as e:
                         log.error(f"Watchlist job error: {e}")
 
@@ -1164,30 +1194,23 @@ def _scheduler_loop():
                 if dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today:
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
-                        post_to_discord(
-                            "day-trade-signals",
-                            "👀 Live and scanning — looking for a valid setup on NVDA and TSLA. "
-                            "Nothing worth the risk yet. Will alert when something lines up.",
-                        )
+                        _post_scanning_update("9:45 AM", "No forced trades — entries hit #day-trade-signals only on confirmed setups.")
                         log.info("9:45 status update posted")
                     else:
                         log.info("9:45 status update skipped — trade already active")
                     last_945_date = today
+                    _sp = load_state(); _sp["last_945_date"] = today; _commit(_sp)
 
                 # ── 10:15 AM status update ────────────────────────────────
                 if dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today:
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
-                        post_to_discord(
-                            "day-trade-signals",
-                            "🔍 Still watching — 15 minutes left in the window. "
-                            "No clean setup yet on NVDA or TSLA. "
-                            "If nothing sets up we sit out — no forced trades.",
-                        )
+                        _post_scanning_update("10:15 AM — final stretch", "Window closes 10:30 — if nothing sets up we sit out. No forced trades.")
                         log.info("10:15 status update posted")
                     else:
                         log.info("10:15 status update skipped — trade already active")
                     last_1015_date = today
+                    _sp = load_state(); _sp["last_1015_date"] = today; _commit(_sp)
 
                 # ── 1-min scanner 9:25–10:30 AM ──────────────────────────
                 if dtime(9, 25) <= t <= dtime(10, 30) and _in_window():
@@ -1277,10 +1300,14 @@ def webhook():
     for _k in ("pmh", "pml", "level", "close", "open", "high", "low", "volume"):
         if _k in data:
             data[_k] = _num(data[_k])
-    if ticker in TRADEABLE_TICKERS and (not data.get("pmh") or not data.get("pml")):
+    if ticker in TRADEABLE_TICKERS:
         _lv = get_key_levels(ticker)
-        data["pmh"] = data.get("pmh") or _lv.get("pmh")
-        data["pml"] = data.get("pml") or _lv.get("pml")
+        if _lv.get("pmh") and _lv.get("pml"):
+            data["pmh"] = _lv.get("pmh")
+            data["pml"] = _lv.get("pml")
+        elif not data.get("pmh") or not data.get("pml"):
+            data["pmh"] = None
+            data["pml"] = None
         log.info(f"Webhook enriched {ticker}: PMH={data.get('pmh')} PML={data.get('pml')}")
     log.info(f"WEBHOOK: {ticker} | {alert_type}")
 
