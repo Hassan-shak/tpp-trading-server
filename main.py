@@ -1525,6 +1525,38 @@ def exec_test():
         return jsonify({"ok": False, "reason": str(e), "trace": traceback.format_exc()[-400:]}), 500
 
 
+@app.route("/quote-test", methods=["GET"])
+def quote_test():
+    """Probe 4 quote request variants to find the one Tastytrade answers. Read-only."""
+    try:
+        occ_padded = "NVDA  260717C00210000"
+        compact = occ_padded.replace(" ", "")
+        from urllib.parse import quote as _uq
+        out = {}
+        def probe(name, url, params=None):
+            try:
+                r = requests.get(url, headers=_tt_headers(), params=params, timeout=5)
+                try:
+                    d = r.json().get("data", {})
+                    items = d.get("items", []) if isinstance(d, dict) else []
+                    if not items and isinstance(d, dict) and d.get("symbol"):
+                        items = [d]
+                except Exception:
+                    items = []
+                first = items[0] if items else None
+                out[name] = {"http": r.status_code, "n": len(items),
+                             "keys": (sorted(list(first.keys()))[:14] if isinstance(first, dict) else None),
+                             "bid": (first or {}).get("bid"), "ask": (first or {}).get("ask")}
+            except Exception as e:
+                out[name] = {"err": str(e)[:80]}
+        probe("bytype_padded", f"{TT_BASE}/market-data/by-type?equity-option=" + _uq(occ_padded, safe=""))
+        probe("bytype_compact", f"{TT_BASE}/market-data/by-type", {"equity-option": compact})
+        probe("path_padded", f"{TT_BASE}/market-data/" + _uq(occ_padded, safe=""))
+        probe("options_padded", f"{TT_BASE}/market-data/options", {"symbols[]": occ_padded})
+        return jsonify(out), 200
+    except Exception as e:
+        return jsonify({"err": str(e)}), 500
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"status": "TPP Trading Server v5.0 — live"}), 200
