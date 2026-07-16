@@ -1502,8 +1502,11 @@ def exec_test():
             for st in walk:
                 occ = _build_occ(tk, expiry, st, opt_type)
                 q   = _live_option_quote(occ) or {}
-                sample.append({"strike": st, "occ": occ,
-                               "bid": q.get("bid"), "ask": q.get("ask")})
+                entry = {"strike": st, "occ": occ,
+                         "bid": q.get("bid"), "ask": q.get("ask")}
+                if not sample and q:
+                    entry["raw"] = {k: q.get(k) for k in list(q.keys())[:20]}
+                sample.append(entry)
         occ, strike, ask = select_contract(tk, dr)
         return jsonify({
             "ok": bool(occ), "ticker": tk, "direction": dr,
