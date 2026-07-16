@@ -446,9 +446,9 @@ def _spot_price(ticker: str) -> float | None:
 def _live_option_quote(occ_symbol: str) -> dict | None:
     try:
         resp = requests.get(
-            f"{TT_BASE}/market-data/options",
+            f"{TT_BASE}/market-data/by-type",
             headers=_tt_headers(),
-            params={"symbols[]": occ_symbol},
+            params={"equity-option": occ_symbol},
             timeout=5,
         )
         if resp.status_code == 200:
@@ -494,7 +494,7 @@ def select_contract(ticker: str, direction: str) -> tuple:
                 except (TypeError, ValueError):
                     continue
                 if sym and sp:
-                    strike_map[sp] = sym.replace(" ", "")
+                    strike_map[sp] = sym  # TT-native symbol (padded, keep spaces)
     if not strike_map:
         log.error(f"No strikes parsed for {ticker} {exp_str} items={len(items)}")
         return None, None, None
@@ -1500,7 +1500,7 @@ def exec_test():
             ai  = strikes.index(atm)
             walk = strikes[ai:ai+6] if dr == "call" else list(reversed(strikes[max(0,ai-5):ai+1]))
             for st in walk:
-                occ = _build_occ(tk, expiry, st, opt_type)
+                occ = (tk + "      ")[:6] + expiry.strftime("%y%m%d") + opt_type + ("%08d" % int(round(st * 1000)))
                 q   = _live_option_quote(occ) or {}
                 entry = {"strike": st, "occ": occ,
                          "bid": q.get("bid"), "ask": q.get("ask")}
