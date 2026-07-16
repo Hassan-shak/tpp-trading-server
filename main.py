@@ -444,23 +444,29 @@ def _spot_price(ticker: str) -> float | None:
 
 
 def _live_option_quote(occ_symbol: str) -> dict | None:
+    """Option NBBO from Alpaca OPRA (included in Algo Trader Plus).
+    Tastytrade REST market-data returns 403 for this OAuth grant, so quotes
+    come from Alpaca; orders still go to Tastytrade with the padded symbol."""
     try:
-        from urllib.parse import quote as _uq
+        compact = occ_symbol.replace(" ", "")
+        key = os.environ.get("ALPACA_API_KEY", "")
+        sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
         resp = requests.get(
-            f"{TT_BASE}/market-data/by-type?equity-option=" + _uq(occ_symbol, safe=""),
-            headers=_tt_headers(),
+            "https://data.alpaca.markets/v1beta1/options/quotes/latest",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+            params={"symbols": compact},
             timeout=5,
         )
         if resp.status_code == 200:
-            items = resp.json().get("data", {}).get("items", [])
-            if not items:
-                log.warning("quote empty for " + occ_symbol)
-            return items[0] if items else None
-        log.warning("quote http " + str(resp.status_code) + " for " + occ_symbol)
+            q = resp.json().get("quotes", {}).get(compact)
+            if q:
+                return {"bid": q.get("bp"), "ask": q.get("ap")}
+            log.warning("alpaca option quote empty for " + compact)
+        else:
+            log.warning("alpaca option quote http " + str(resp.status_code) + " for " + compact)
     except Exception as e:
         log.error(f"Quote fetch failed for {occ_symbol}: {e}")
     return None
-
 
 def _build_occ(ticker: str, expiry: date, strike: float, opt_type: str) -> str:
     return f"{ticker}{expiry.strftime('%y%m%d')}{opt_type}{int(strike * 1000):08d}"
