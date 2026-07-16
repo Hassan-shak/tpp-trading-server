@@ -1428,6 +1428,57 @@ def tt_test():
 
 
 # ── / ─────────────────────────────────────────────────────────────────────────
+@app.route("/wl-test", methods=["GET"])
+def wl_test():
+    """Dry-run: generate the watchlist with LIVE data right now. Nothing posts to Discord."""
+    try:
+        rows = []
+        for _tk in ["NVDA", "TSLA"]:
+            lv  = get_key_levels(_tk)
+            pmh = lv.get("pmh")
+            pml = lv.get("pml")
+            pc  = lv.get("prev_close")
+            if pmh is None or pml is None:
+                continue
+            spot = _spot_price(_tk) or pc
+            gap  = round(((spot - pc) / pc) * 100, 2) if (spot and pc) else None
+            poc  = round((pmh + pml) / 2, 2)
+            rows.append({"ticker": _tk, "price": spot, "gap": gap, "pmh": pmh, "pml": pml, "poc": poc})
+        if not rows:
+            return jsonify({"ok": False, "reason": "no level data"}), 500
+        data_lines = [r["ticker"] + ": price=$" + str(r["price"]) + " gap=" + str(r["gap"]) + "% PMH=$" + str(r["pmh"]) + " PML=$" + str(r["pml"]) + " POC=$" + str(r["poc"]) for r in rows]
+        _pr = (
+            "You are Junior from The Portfolio Plug. Write the morning watchlist post for #daily-watchlist.\n"
+            "RULES: NVDA and TSLA ONLY. Junior voice - direct, confident, educational, zero fluff, no disclaimers. "
+            "For each ticker in its own block: bold ticker name, price, gap %, whether price sits near PMH (supply) or PML (demand), "
+            "the POC level, and ONE clear sentence on what you are watching for (bounce, break, rejection). "
+            "3-4 sentences per ticker max. End with exactly one line: Window opens 9:30 AM ET - alerts fire on confirmed setups only.\n"
+            "DATA:\n" + "\n".join(data_lines)
+        )
+        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _rp = _cl.messages.create(model=CLAUDE_MODEL, max_tokens=600, messages=[{"role": "user", "content": _pr}])
+        return jsonify({"ok": True, "rows": rows, "watchlist": _rp.content[0].text.strip()}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
+
+@app.route("/exec-test", methods=["GET"])
+def exec_test():
+    """Dry-run contract selection against the LIVE Tastytrade chain. NO ORDER IS PLACED."""
+    try:
+        tk = str(request.args.get("ticker", "NVDA")).upper()
+        dr = str(request.args.get("direction", "call")).lower()
+        if tk not in TRADEABLE_TICKERS or dr not in ("call", "put"):
+            return jsonify({"ok": False, "reason": "invalid params"}), 400
+        occ, strike, ask = select_contract(tk, dr)
+        if not occ:
+            return jsonify({"ok": False, "reason": "no contract found in $0.75-$1.50 ask range"}), 200
+        return jsonify({"ok": True, "ticker": tk, "direction": dr, "occ_symbol": occ, "strike": strike,
+                        "ask_per_share": ask, "cost_per_contract": round(ask * 100, 2),
+                        "note": "DRY RUN - no order placed"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"status": "TPP Trading Server v5.0 — live"}), 200
