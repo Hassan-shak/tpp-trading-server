@@ -1464,20 +1464,52 @@ def wl_test():
 
 @app.route("/exec-test", methods=["GET"])
 def exec_test():
-    """Dry-run contract selection against the LIVE Tastytrade chain. NO ORDER IS PLACED."""
+    """Dry-run: dumps live chain diagnostics + runs select_contract. NO ORDER PLACED."""
     try:
         tk = str(request.args.get("ticker", "NVDA")).upper()
         dr = str(request.args.get("direction", "call")).lower()
         if tk not in TRADEABLE_TICKERS or dr not in ("call", "put"):
             return jsonify({"ok": False, "reason": "invalid params"}), 400
+        spot   = _spot_price(tk)
+        expiry = _next_friday()
+        opt_type = "C" if dr == "call" else "P"
+        resp = requests.get(
+            f"{TT_BASE}/option-chains/{tk}/nested",
+            headers=_tt_headers(),
+            params={"expiration-date": expiry.strftime("%Y-%m-%d")},
+            timeout=10,
+        )
+        chain_status = resp.status_code
+        strikes = []
+        if chain_status == 200:
+            exps = resp.json()["data"].get("expirations", [])
+            texp = next((e for e in exps if e["expiration-date"] == expiry.strftime("%Y-%m-%d")), None)
+            if texp:
+                strikes = sorted(float(s["strike-price"]) for s in texp.get("strikes", []))
+        sample = []
+        if strikes and spot:
+            atm = min(strikes, key=lambda s: abs(s - spot))
+            ai  = strikes.index(atm)
+            walk = strikes[ai:ai+6] if dr == "call" else list(reversed(strikes[max(0,ai-5):ai+1]))
+            for st in walk:
+                occ = _build_occ(tk, expiry, st, opt_type)
+                q   = _live_option_quote(occ) or {}
+                sample.append({"strike": st, "occ": occ,
+                               "bid": q.get("bid"), "ask": q.get("ask")})
         occ, strike, ask = select_contract(tk, dr)
-        if not occ:
-            return jsonify({"ok": False, "reason": "no contract found in $0.75-$1.50 ask range"}), 200
-        return jsonify({"ok": True, "ticker": tk, "direction": dr, "occ_symbol": occ, "strike": strike,
-                        "ask_per_share": ask, "cost_per_contract": round(ask * 100, 2),
-                        "note": "DRY RUN - no order placed"}), 200
+        return jsonify({
+            "ok": bool(occ), "ticker": tk, "direction": dr,
+            "spot": spot, "expiry": expiry.strftime("%Y-%m-%d"),
+            "chain_http": chain_status, "num_strikes": len(strikes),
+            "sample_quotes": sample,
+            "selected": ({"occ": occ, "strike": strike, "ask": ask,
+                          "cost_per_contract": round(ask*100,2) if ask else None} if occ else None),
+            "note": "DRY RUN - no order placed; zero bid/ask = market closed",
+        }), 200
     except Exception as e:
-        return jsonify({"ok": False, "reason": str(e)}), 500
+        import traceback
+        return jsonify({"ok": False, "reason": str(e), "trace": traceback.format_exc()[-400:]}), 500
+
 
 @app.route("/", methods=["GET"])
 def root():
