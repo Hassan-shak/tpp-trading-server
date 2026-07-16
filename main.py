@@ -463,58 +463,65 @@ def _build_occ(ticker: str, expiry: date, strike: float, opt_type: str) -> str:
     return f"{ticker}{expiry.strftime('%y%m%d')}{opt_type}{int(strike * 1000):08d}"
 
 
-def select_contract(ticker: str, direction: str) -> tuple[str | None, float | None, float | None]:
+def select_contract(ticker: str, direction: str) -> tuple:
+    """ATM->OTM walk. Parses nested chain data.items[].expirations[].strikes[], uses strike own OCC."""
     expiry   = _next_friday()
-    opt_type = "C" if direction == "call" else "P"
-    spot     = _spot_price(ticker)
+    exp_str  = expiry.strftime("%Y-%m-%d")
+    side_key = "call" if direction == "call" else "put"
+    spot = _spot_price(ticker)
     if not spot:
         log.error(f"No spot price for {ticker}")
         return None, None, None
     resp = requests.get(
         f"{TT_BASE}/option-chains/{ticker}/nested",
         headers=_tt_headers(),
-        params={"expiration-date": expiry.strftime("%Y-%m-%d")},
+        params={"expiration-date": exp_str},
         timeout=10,
     )
     if resp.status_code != 200:
-        log.error(f"Chain fetch failed for {ticker}: {resp.text}")
+        log.error(f"Chain fetch failed for {ticker}: {resp.status_code}")
         return None, None, None
-    expirations = resp.json()["data"].get("expirations", [])
-    target_exp  = next(
-        (e for e in expirations if e["expiration-date"] == expiry.strftime("%Y-%m-%d")), None
-    )
-    if not target_exp:
-        log.error(f"No expiry {expiry} for {ticker}")
+    items = resp.json().get("data", {}).get("items", [])
+    strike_map = {}
+    for it in items:
+        for exp in it.get("expirations", []):
+            if exp.get("expiration-date") != exp_str:
+                continue
+            for stk in exp.get("strikes", []):
+                sym = stk.get(side_key)
+                try:
+                    sp = float(stk.get("strike-price"))
+                except (TypeError, ValueError):
+                    continue
+                if sym and sp:
+                    strike_map[sp] = sym.replace(" ", "")
+    if not strike_map:
+        log.error(f"No strikes parsed for {ticker} {exp_str} items={len(items)}")
         return None, None, None
-    strikes = sorted(float(s["strike-price"]) for s in target_exp.get("strikes", []))
-    if not strikes:
-        return None, None, None
+    strikes = sorted(strike_map.keys())
     atm     = min(strikes, key=lambda s: abs(s - spot))
-    atm_idx = strikes.index(atm)
-    ordered = strikes[atm_idx:] if direction == "call" else list(reversed(strikes[:atm_idx + 1]))
+    ai      = strikes.index(atm)
+    ordered = strikes[ai:] if direction == "call" else list(reversed(strikes[:ai + 1]))
     for strike in ordered:
-        occ   = _build_occ(ticker, expiry, strike, opt_type)
+        occ   = strike_map[strike]
         quote = _live_option_quote(occ)
         if not quote:
             continue
-        ask    = float(quote.get("ask") or 0)
-        bid    = float(quote.get("bid") or 0)
+        ask = float(quote.get("ask") or 0)
+        bid = float(quote.get("bid") or 0)
         if ask <= 0:
             continue
         if ask < MIN_PREMIUM:
-            log.info(f"OTM walk stopped at {strike} — ask ${ask:.2f} below min")
+            log.info(f"OTM walk stopped {strike} ask below min")
             break
         spread = (ask - bid) / ask if ask else 1
         if spread >= MAX_SPREAD:
-            log.info(f"Strike {strike} skipped — spread {spread:.1%}")
             continue
         if MIN_PREMIUM <= ask <= MAX_PREMIUM:
-            log.info(f"Contract: {occ} | ask=${ask:.2f}/share (${ask*100:.0f}/contract)")
+            log.info(f"Contract {occ} ask {ask}")
             return occ, strike, ask
-        log.info(f"Strike {strike} ask=${ask:.2f} above max — moving OTM")
-    log.warning(f"No valid contract for {ticker} {direction} in ${MIN_PREMIUM}–${MAX_PREMIUM}")
+    log.warning(f"No contract in range for {ticker} {direction}")
     return None, None, None
-
 
 def _tt_place_order(payload: dict) -> str | None:
     resp = requests.post(
@@ -1482,10 +1489,11 @@ def exec_test():
         chain_status = resp.status_code
         strikes = []
         if chain_status == 200:
-            exps = resp.json()["data"].get("expirations", [])
-            texp = next((e for e in exps if e["expiration-date"] == expiry.strftime("%Y-%m-%d")), None)
-            if texp:
-                strikes = sorted(float(s["strike-price"]) for s in texp.get("strikes", []))
+            items0 = resp.json().get("data", {}).get("items", [])
+            for it0 in items0:
+                for ex0 in it0.get("expirations", []):
+                    if ex0.get("expiration-date") == expiry.strftime("%Y-%m-%d"):
+                        strikes = sorted(float(s["strike-price"]) for s in ex0.get("strikes", []) if s.get("strike-price"))
         sample = []
         if strikes and spot:
             atm = min(strikes, key=lambda s: abs(s - spot))
