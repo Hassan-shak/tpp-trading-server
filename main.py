@@ -445,15 +445,18 @@ def _spot_price(ticker: str) -> float | None:
 
 def _live_option_quote(occ_symbol: str) -> dict | None:
     try:
+        from urllib.parse import quote as _uq
         resp = requests.get(
-            f"{TT_BASE}/market-data/by-type",
+            f"{TT_BASE}/market-data/by-type?equity-option=" + _uq(occ_symbol, safe=""),
             headers=_tt_headers(),
-            params={"equity-option": occ_symbol},
             timeout=5,
         )
         if resp.status_code == 200:
-            items = resp.json()["data"]["items"]
+            items = resp.json().get("data", {}).get("items", [])
+            if not items:
+                log.warning("quote empty for " + occ_symbol)
             return items[0] if items else None
+        log.warning("quote http " + str(resp.status_code) + " for " + occ_symbol)
     except Exception as e:
         log.error(f"Quote fetch failed for {occ_symbol}: {e}")
     return None
