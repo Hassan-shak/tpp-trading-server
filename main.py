@@ -841,6 +841,97 @@ def _claude_budget_ok() -> bool:
     return True
 
 
+# -- session market structure (in-window memory) --------------------------------
+_mkt_structure: dict = {}
+
+
+def _hydrate_structure():
+    global _mkt_structure
+    try:
+        s = load_state()
+        saved = s.get("mkt_structure") or {}
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        _mkt_structure = {k: v for k, v in saved.items() if isinstance(v, dict) and v.get("date") == today}
+    except Exception as e:
+        log.warning("structure hydrate failed: " + str(e))
+
+
+def _persist_structure():
+    try:
+        s = load_state()
+        s["mkt_structure"] = _mkt_structure
+        _commit(s)
+    except Exception as e:
+        log.warning("structure persist failed: " + str(e))
+
+
+def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
+    """Track day open, running H/L, last-3 candles, and in-window level crosses."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    st = _mkt_structure.get(ticker)
+    if not st or st.get("date") != today:
+        st = {"date": today,
+              "day_open": candle.get("open"),
+              "day_high": candle.get("high"),
+              "day_low":  candle.get("low"),
+              "candles":  [],
+              "crosses":  {}}
+        _mkt_structure[ticker] = st
+    try:
+        if candle.get("high") is not None:
+            st["day_high"] = max(st.get("day_high") or candle["high"], candle["high"])
+        if candle.get("low") is not None:
+            st["day_low"] = min(st.get("day_low") or candle["low"], candle["low"])
+    except Exception:
+        pass
+    ct = str(candle.get("t") or "")
+    last = st["candles"][-1] if st.get("candles") else None
+    is_new = (not last) or (not ct) or (str(last.get("t") or "") != ct)
+    if is_new:
+        prev_close = last.get("close") if last else candle.get("open")
+        now_hm = datetime.now(ET).strftime("%H:%M")
+        cur_close = candle.get("close")
+        def _cross(level, key_dn, key_up, dn_lbl, up_lbl):
+            if not level or prev_close is None or cur_close is None:
+                return
+            if prev_close >= level > cur_close and key_dn not in st["crosses"]:
+                st["crosses"][key_dn] = now_hm
+                log.info("STRUCTURE: " + ticker + " " + dn_lbl + " " + str(level) + " at " + now_hm + " ET")
+            if prev_close <= level < cur_close and key_up not in st["crosses"]:
+                st["crosses"][key_up] = now_hm
+                log.info("STRUCTURE: " + ticker + " " + up_lbl + " " + str(level) + " at " + now_hm + " ET")
+        _cross(pml, "pml_break_down", "pml_reclaim_up", "BROKE DOWN through PML", "RECLAIMED UP through PML")
+        _cross(pmh, "pmh_reject_down", "pmh_break_up", "rejected back below PMH", "BROKE UP through PMH")
+        st["candles"] = (st.get("candles", []) + [candle])[-3:]
+        _persist_structure()
+    return st
+
+
+def _structure_context(ticker: str, pmh, pml) -> str:
+    st = _mkt_structure.get(ticker)
+    if not st:
+        return ""
+    L = ["SESSION STRUCTURE (authoritative in-window memory - a recorded cross DID occur in-window even if price has since moved; judge Condition A/B break-and-hold from these events, do NOT require witnessing the cross on the current candle):"]
+    L.append("  Day open: " + str(st.get("day_open")) + " | Session high: " + str(st.get("day_high")) + " | Session low: " + str(st.get("day_low")))
+    cr = st.get("crosses", {})
+    def _line(name, level, dn, up, dn_lbl, up_lbl):
+        if not level:
+            return
+        ev = []
+        if dn in cr:
+            ev.append(dn_lbl + " at " + cr[dn] + " ET")
+        if up in cr:
+            ev.append(up_lbl + " at " + cr[up] + " ET")
+        L.append("  " + name + " " + str(level) + ": " + ("; ".join(ev) if ev else "not crossed in-window yet"))
+    _line("PML", pml, "pml_break_down", "pml_reclaim_up", "BROKEN DOWN", "RECLAIMED UP")
+    _line("PMH", pmh, "pmh_reject_down", "pmh_break_up", "rejected back down", "BROKEN UP")
+    cs = st.get("candles", [])
+    if cs:
+        L.append("  Recent 1-min candles (O/H/L/C/V):")
+        for c in cs:
+            L.append("    " + str(c.get("open")) + "/" + str(c.get("high")) + "/" + str(c.get("low")) + "/" + str(c.get("close")) + "/" + str(c.get("volume")))
+    return chr(10).join(L)
+
 def _build_claude_prompt(alert_data: dict, session: dict) -> str:
     ticker     = alert_data.get("ticker",     "UNKNOWN")
     alert_type = alert_data.get("alert_type", "UNKNOWN")
@@ -887,6 +978,8 @@ SESSION STATE:
   consecutive_losses: {session.get('consecutive_losses', 0)}
   circuit_breaker:    {session.get('circuit_breaker', False)}
   open_position:      {session.get('open_position') is not None}
+
+{_structure_context(ticker, pmh, pml)}
 
 Analyze the 1-min setup on {ticker} and return your JSON decision.
 """.strip()
@@ -1046,7 +1139,7 @@ def get_latest_1min_candle(ticker: str) -> dict | None:
                 if bars:
                     b = bars[-1]
                     return {"open": b["o"], "high": b["h"], "low": b["l"],
-                            "close": b["c"], "volume": b["v"]}
+                            "close": b["c"], "volume": b["v"], "t": b.get("t")}
             else:
                 log.warning(f"1min candle {ticker} feed={feed} -> {resp.status_code}")
         except Exception as e:
@@ -1246,6 +1339,7 @@ def _scheduler_loop():
                             levels = get_key_levels(ticker)
                             if not candle:
                                 continue
+                            _update_structure(ticker, candle, levels.get("pmh"), levels.get("pml"))
                             alert_data = {
                                 "ticker":     ticker,
                                 "alert_type": "SCANNER_1MIN",
@@ -1615,6 +1709,20 @@ def order_test():
     except Exception as e:
         return jsonify({"ok": False, "reason": str(e)}), 500
 
+@app.route("/structure-test", methods=["GET"])
+def structure_test():
+    """Live proof of session-structure tracking. Read-only, no orders."""
+    try:
+        tk = str(request.args.get("ticker", "NVDA")).upper()
+        lv = get_key_levels(tk)
+        c = get_latest_1min_candle(tk)
+        if c:
+            _update_structure(tk, c, lv.get("pmh"), lv.get("pml"))
+        return jsonify({"candle": c, "structure": _mkt_structure.get(tk),
+                        "context": _structure_context(tk, lv.get("pmh"), lv.get("pml"))}), 200
+    except Exception as e:
+        return jsonify({"err": str(e)}), 500
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"status": "TPP Trading Server v5.0 — live"}), 200
@@ -1624,6 +1732,7 @@ def root():
 #  STARTUP
 # ══════════════════════════════════════════════════════════════════════════════
 load_state()
+_hydrate_structure()
 _ensure_scheduler()
 
 if __name__ == "__main__":
