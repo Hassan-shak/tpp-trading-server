@@ -1571,6 +1571,50 @@ def quote_test():
     except Exception as e:
         return jsonify({"err": str(e)}), 500
 
+@app.route("/order-test", methods=["GET"])
+def order_test():
+    """Validate the EXACT entry order payload against Tastytrade /orders/dry-run.
+    NO ORDER IS PLACED - dry-run only. Proves symbology + buying power + payload."""
+    try:
+        tk = str(request.args.get("ticker", "NVDA")).upper()
+        dr = str(request.args.get("direction", "call")).lower()
+        if tk not in TRADEABLE_TICKERS or dr not in ("call", "put"):
+            return jsonify({"ok": False, "reason": "invalid params"}), 400
+        occ, strike, ask = select_contract(tk, dr)
+        if not occ:
+            return jsonify({"ok": False, "reason": "no contract selected"}), 200
+        payload = {
+            "time-in-force": "Day",
+            "order-type":    "Market",
+            "legs": [{"instrument-type": "Equity Option", "symbol": occ,
+                      "quantity": 1, "action": "Buy to Open"}],
+        }
+        resp = requests.post(
+            f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders/dry-run",
+            headers=_tt_headers(),
+            json=payload,
+            timeout=10,
+        )
+        body = {}
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text[:300]}
+        d = body.get("data", {}) if isinstance(body, dict) else {}
+        bp = d.get("buying-power-effect", {})
+        return jsonify({
+            "ok": resp.status_code in (200, 201),
+            "http": resp.status_code,
+            "contract": {"occ": occ, "strike": strike, "ask": ask},
+            "order_status": (d.get("order", {}) or {}).get("status"),
+            "buying_power_change": bp.get("change-in-buying-power"),
+            "warnings": body.get("warnings") or d.get("warnings"),
+            "errors": body.get("error") or body.get("errors"),
+            "note": "DRY RUN via Tastytrade /orders/dry-run - nothing placed",
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"status": "TPP Trading Server v5.0 — live"}), 200
