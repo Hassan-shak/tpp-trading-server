@@ -408,40 +408,36 @@ def _next_friday() -> date:
 
 
 def _spot_price(ticker: str) -> float | None:
-    # Alpaca REST primary
-    try:
-        key    = os.environ.get("ALPACA_API_KEY", "")
-        secret = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
-        resp   = requests.get(
-            f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest",
-            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
-            params={"feed": "iex"},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            quote = resp.json().get("quote", {})
-            ask   = float(quote.get("ap", 0))
-            bid   = float(quote.get("bp", 0))
-            if ask and bid:
-                return (ask + bid) / 2
-    except Exception as e:
-        log.warning(f"Alpaca spot failed for {ticker}: {e}")
-    # Tastytrade fallback
-    try:
-        resp = requests.get(
-            f"{TT_BASE}/market-data/equities",
-            headers=_tt_headers(),
-            params={"symbols[]": ticker},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            items = resp.json()["data"]["items"]
-            if items:
-                return float(items[0].get("last", 0)) or None
-    except Exception as e:
-        log.error(f"Tastytrade spot fallback failed for {ticker}: {e}")
+    """Last trade from Alpaca with feed fallback; quote midpoint backup. (IEX quotes are sparse for some symbols; TT market-data is 403.)"""
+    key = os.environ.get("ALPACA_API_KEY", "")
+    sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+    hdr = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
+    for feed in ("iex", "sip", None):
+        try:
+            params = {"feed": feed} if feed else {}
+            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/trades/latest",
+                             headers=hdr, params=params, timeout=5)
+            if r.status_code == 200:
+                px = float(r.json().get("trade", {}).get("p") or 0)
+                if px:
+                    return px
+        except Exception as e:
+            log.warning(f"spot trade {ticker} feed={feed}: {e}")
+    for feed in ("iex", "sip", None):
+        try:
+            params = {"feed": feed} if feed else {}
+            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest",
+                             headers=hdr, params=params, timeout=5)
+            if r.status_code == 200:
+                q = r.json().get("quote", {})
+                a = float(q.get("ap") or 0)
+                b = float(q.get("bp") or 0)
+                if a and b:
+                    return (a + b) / 2
+        except Exception as e:
+            log.warning(f"spot quote {ticker} feed={feed}: {e}")
+    log.error(f"No spot price for {ticker} from any source")
     return None
-
 
 def _live_option_quote(occ_symbol: str) -> dict | None:
     """Option NBBO from Alpaca OPRA (included in Algo Trader Plus).
@@ -956,6 +952,12 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
             f"⚠️ Setup identified on **{ticker} {direction.upper()}** "
             f"but no contract available in the $75–$150 range. Passing on this one.",
         )
+        post_to_discord(
+            "daily-watchlist",
+            f"📚 **Setup we passed on — {ticker} {direction.upper()}** [{tier}]\n"
+            + (setup if setup else "Level-break setup confirmed by the model.")
+            + "\nPassed only because no contract fit the $0.75–$1.50 premium rule at selection time.",
+        )
         return False
 
     fill_price = enter_trade(occ)
@@ -993,6 +995,12 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
+    post_to_discord(
+        "daily-watchlist",
+        f"📚 **Setup breakdown — {ticker} {type_label}** [{tier}]\n"
+        + (setup if setup else "Level-break setup confirmed.")
+        + f"\nEntry ${fill_price:.2f} | Target ${target:.2f} (+40%) | Stop ${stop:.2f} (-25%)",
+    )
 
     set_open_position({
         "ticker":        ticker,
