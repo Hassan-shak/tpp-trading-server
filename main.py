@@ -771,6 +771,33 @@ Volume is a confirming factor in Condition B, not a hard gate.
 Consistent directional closes on low volume = valid setup.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONDITION C — GAP-DAY ANCHORS (pre-market levels + opening range)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When price opens away from PMH/PML (gap day), the SESSION STRUCTURE
+anchors are equally valid trigger levels with the SAME break-and-hold
+standard as Conditions A/B:
+  - PRE-MARKET HIGH / PRE-MARKET LOW (today 4:00-9:29 battle lines)
+  - OPENING-RANGE HIGH / LOW (first 5 minutes, locked at 9:35)
+
+A recorded break DOWN through any of these anchors with price holding
+below it = PUTS. A recorded reclaim/break UP with price holding above
+it = CALLS. Recorded crosses in SESSION STRUCTURE are authoritative.
+Confirmation = current candle holding beyond the anchor; volume is
+supportive but not a hard gate. Tag [TIER-2].
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONDITION D — OVERSOLD REVERSAL AT SUPPORT (and overbought mirror)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+After an extended flush well below the day open / opening-range low:
+  - A clear reversal candle prints AT a support reference
+    (pre-market low, session-low retest, prior-day low, round number)
+  - The reversal candle closes in its upper third
+  - The next candle holds the reclaim (does not close back below the
+    reversal candle midpoint)
+  → CALLS on that confirmation, tag [TIER-2].
+Mirror logic for an extended rip rejecting at resistance → PUTS.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEAD TICKER — THE ONLY VALID NO_TRADE REASON
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 A ticker is only "explicitly dead" when ALL of these are true together:
@@ -865,6 +892,30 @@ def _persist_structure():
         log.warning("structure persist failed: " + str(e))
 
 
+def _premarket_levels(ticker: str) -> dict:
+    """Today pre-market high/low from 1-min bars 04:00-09:29 ET (EDT offsets)."""
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    start = day + "T08:00:00Z"
+    end   = day + "T13:29:59Z"
+    for feed in ("iex", "sip", None):
+        try:
+            params = {"timeframe": "1Min", "start": start, "end": end, "limit": 1000}
+            if feed:
+                params["feed"] = feed
+            r = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                headers=_alpaca_headers(),
+                params=params,
+                timeout=6,
+            )
+            if r.status_code == 200:
+                bars = r.json().get("bars", [])
+                if bars:
+                    return {"high": max(b["h"] for b in bars), "low": min(b["l"] for b in bars)}
+        except Exception as e:
+            log.warning("premarket bars " + ticker + " feed=" + str(feed) + ": " + str(e))
+    return {"high": None, "low": None}
+
 def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
     """Track day open, running H/L, last-3 candles, and in-window level crosses."""
     today = datetime.now(ET).strftime("%Y-%m-%d")
@@ -877,11 +928,37 @@ def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
               "candles":  [],
               "crosses":  {}}
         _mkt_structure[ticker] = st
+        try:
+            _pmv = _premarket_levels(ticker)
+            st["pm_high"] = _pmv.get("high")
+            st["pm_low"]  = _pmv.get("low")
+            if st["pm_high"]:
+                log.info("STRUCTURE: " + ticker + " pre-market range " + str(st["pm_low"]) + "-" + str(st["pm_high"]))
+        except Exception as _pe:
+            log.warning("premarket levels failed " + ticker + ": " + str(_pe))
     try:
         if candle.get("high") is not None:
             st["day_high"] = max(st.get("day_high") or candle["high"], candle["high"])
         if candle.get("low") is not None:
             st["day_low"] = min(st.get("day_low") or candle["low"], candle["low"])
+    except Exception:
+        pass
+    try:
+        if not st.get("or_locked"):
+            _bt = str(candle.get("t") or "")
+            _bmin = None
+            if _bt:
+                _bdt = datetime.fromisoformat(_bt.replace("Z", "+00:00")).astimezone(ET)
+                _bmin = _bdt.hour * 60 + _bdt.minute
+            if _bmin is not None and 570 <= _bmin < 575:
+                if candle.get("high") is not None:
+                    st["or_high"] = max(st.get("or_high") or candle["high"], candle["high"])
+                if candle.get("low") is not None:
+                    st["or_low"] = min(st.get("or_low") or candle["low"], candle["low"])
+            _nowm = datetime.now(ET).hour * 60 + datetime.now(ET).minute
+            if _nowm >= 575 and st.get("or_high") is not None and not st.get("or_locked"):
+                st["or_locked"] = True
+                log.info("STRUCTURE: " + ticker + " opening range locked " + str(st.get("or_low")) + "-" + str(st.get("or_high")))
     except Exception:
         pass
     ct = str(candle.get("t") or "")
@@ -902,6 +979,11 @@ def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
                 log.info("STRUCTURE: " + ticker + " " + up_lbl + " " + str(level) + " at " + now_hm + " ET")
         _cross(pml, "pml_break_down", "pml_reclaim_up", "BROKE DOWN through PML", "RECLAIMED UP through PML")
         _cross(pmh, "pmh_reject_down", "pmh_break_up", "rejected back below PMH", "BROKE UP through PMH")
+        _cross(st.get("pm_low"), "pmlow_break_down", "pmlow_reclaim_up", "BROKE DOWN through PRE-MARKET LOW", "RECLAIMED UP through PRE-MARKET LOW")
+        _cross(st.get("pm_high"), "pmhigh_reject_down", "pmhigh_break_up", "rejected below PRE-MARKET HIGH", "BROKE UP through PRE-MARKET HIGH")
+        if st.get("or_locked"):
+            _cross(st.get("or_low"), "orl_break_down", "orl_reclaim_up", "BROKE DOWN through OPENING-RANGE LOW", "RECLAIMED UP through OPENING-RANGE LOW")
+            _cross(st.get("or_high"), "orh_reject_down", "orh_break_up", "rejected below OPENING-RANGE HIGH", "BROKE UP through OPENING-RANGE HIGH")
         st["candles"] = (st.get("candles", []) + [candle])[-3:]
         _persist_structure()
     return st
@@ -925,6 +1007,13 @@ def _structure_context(ticker: str, pmh, pml) -> str:
         L.append("  " + name + " " + str(level) + ": " + ("; ".join(ev) if ev else "not crossed in-window yet"))
     _line("PML", pml, "pml_break_down", "pml_reclaim_up", "BROKEN DOWN", "RECLAIMED UP")
     _line("PMH", pmh, "pmh_reject_down", "pmh_break_up", "rejected back down", "BROKEN UP")
+    _line("PRE-MARKET LOW", st.get("pm_low"), "pmlow_break_down", "pmlow_reclaim_up", "BROKEN DOWN", "RECLAIMED UP")
+    _line("PRE-MARKET HIGH", st.get("pm_high"), "pmhigh_reject_down", "pmhigh_break_up", "rejected back down", "BROKEN UP")
+    if st.get("or_locked"):
+        _line("OPENING-RANGE LOW", st.get("or_low"), "orl_break_down", "orl_reclaim_up", "BROKEN DOWN", "RECLAIMED UP")
+        _line("OPENING-RANGE HIGH", st.get("or_high"), "orh_reject_down", "orh_break_up", "rejected back down", "BROKEN UP")
+    elif st.get("or_high") is not None:
+        L.append("  Opening range: forming (locks 9:35) currently " + str(st.get("or_low")) + "-" + str(st.get("or_high")))
     cs = st.get("candles", [])
     if cs:
         L.append("  Recent 1-min candles (O/H/L/C/V):")
