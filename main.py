@@ -798,6 +798,45 @@ After an extended flush well below the day open / opening-range low:
 Mirror logic for an extended rip rejecting at resistance → PUTS.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SETUP LIBRARY — RESTORED FROM THE FULL PLAYBOOK (evaluate alongside A-D)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use the INDICATORS line and candle history in SESSION STRUCTURE.
+If indicators show "warming up", rely on Conditions A-D only.
+
+SETUP 1 — PMH/PML MOMENTUM BREAKOUT
+  1-min candle CLOSES above PMH (calls) / below PML (puts).
+  Trigger-candle volume >= 1.5x the 10-candle average.
+  RSI14 < 68 for calls / > 32 for puts (ignore RSI if volume >= 3.0x).
+  Price above both 8 & 21 EMA (calls) or below both (puts).
+  Marubozu exception: volume > 3.0x with a full-body candle = enter
+  immediately, cap target at +15%, stop to entry after 30 seconds.
+  → APPROVE [TIER-1]
+
+SETUP 2 — EMA BOUNCE / STRUCTURAL RETEST
+  Bullish engulfing or pin-bar REJECTION off the 8 or 21 EMA (calls;
+  mirror for puts), or a retest-and-hold of a previously broken
+  PMH/PML/anchor. NEVER on a mere touch - require the confirmation
+  candle. → APPROVE [TIER-2]
+
+SETUP 3 — BULL FLAG / ASCENDING TRIANGLE (CALLS)
+  Strong initial leg up, then downward-sloping consolidation.
+  Early entry: flag bottom tests 8/21 EMA AND RSI14 dips below ~50.
+  Breakout entry: 1-min candle breaks the flag upper trendline or
+  flat-top resistance with expanding volume. → APPROVE [TIER-2]
+
+SETUP 4 — BEAR FLAG / DESCENDING TRIANGLE (PUTS)
+  Strong initial leg down, then upward-drifting consolidation.
+  Early entry: flag top rejects off 8/21 EMA AND RSI14 recovers to ~50.
+  Breakdown entry: 1-min candle breaks the flag lower support or
+  flat-bottom with expanding volume. → APPROVE [TIER-2]
+
+SETUP 5 — TREND CONTINUATION (EMA RIDE)
+  Consistent HH/HL (calls) or LH/LL (puts) with clean 8 EMA bounces.
+  REQUIRED: the 8/21 EMA spread must be WIDENING. Flat or tangling
+  EMAs = chop = NO TRADE under this setup. Enter the minor
+  consolidations along the 8 EMA. → APPROVE [TIER-2]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEAD TICKER — THE ONLY VALID NO_TRADE REASON
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 A ticker is only "explicitly dead" when ALL of these are true together:
@@ -984,10 +1023,54 @@ def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
         if st.get("or_locked"):
             _cross(st.get("or_low"), "orl_break_down", "orl_reclaim_up", "BROKE DOWN through OPENING-RANGE LOW", "RECLAIMED UP through OPENING-RANGE LOW")
             _cross(st.get("or_high"), "orh_reject_down", "orh_break_up", "rejected below OPENING-RANGE HIGH", "BROKE UP through OPENING-RANGE HIGH")
-        st["candles"] = (st.get("candles", []) + [candle])[-3:]
+        st["candles"] = (st.get("candles", []) + [candle])[-30:]
         _persist_structure()
     return st
 
+
+def _indicators(candles: list) -> dict:
+    """8/21 EMA, RSI(14), 10-candle volume avg, EMA-spread widening from 1-min candles."""
+    out = {"ema8": None, "ema21": None, "rsi14": None, "spread_widening": None}
+    try:
+        closes = [c.get("close") for c in candles if c.get("close") is not None]
+        vols = [c.get("volume") or 0 for c in candles]
+        n = len(closes)
+        def _ema_of(series, period):
+            if len(series) < period:
+                return None
+            k = 2.0 / (period + 1)
+            e = sum(series[:period]) / float(period)
+            for x in series[period:]:
+                e = x * k + e * (1 - k)
+            return e
+        e8 = _ema_of(closes, 8)
+        e21 = _ema_of(closes, 21)
+        out["ema8"] = round(e8, 2) if e8 is not None else None
+        out["ema21"] = round(e21, 2) if e21 is not None else None
+        if n >= 15:
+            gains = 0.0
+            losses = 0.0
+            for i in range(n - 14, n):
+                d = closes[i] - closes[i - 1]
+                if d >= 0:
+                    gains += d
+                else:
+                    losses -= d
+            avg_l = losses / 14.0
+            avg_g = gains / 14.0
+            out["rsi14"] = 100.0 if avg_l == 0 else round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 1)
+        if len(vols) >= 10:
+            out["vol_avg10"] = int(sum(vols[-10:]) / 10.0)
+            out["last_vol"] = vols[-1]
+        if e8 is not None and e21 is not None:
+            out["spread"] = round(abs(e8 - e21), 3)
+            p8 = _ema_of(closes[:-3], 8)
+            p21 = _ema_of(closes[:-3], 21)
+            if p8 is not None and p21 is not None:
+                out["spread_widening"] = abs(e8 - e21) > abs(p8 - p21)
+    except Exception as e:
+        log.warning("indicators failed: " + str(e))
+    return out
 
 def _structure_context(ticker: str, pmh, pml) -> str:
     st = _mkt_structure.get(ticker)
@@ -1015,9 +1098,19 @@ def _structure_context(ticker: str, pmh, pml) -> str:
     elif st.get("or_high") is not None:
         L.append("  Opening range: forming (locks 9:35) currently " + str(st.get("or_low")) + "-" + str(st.get("or_high")))
     cs = st.get("candles", [])
+    try:
+        ind = _indicators(cs)
+        if ind.get("ema8") is not None:
+            _sw = ind.get("spread_widening")
+            _swtxt = " WIDENING" if _sw else (" narrowing/flat" if _sw is not None else "")
+            L.append("  INDICATORS (1-min): 8EMA " + str(ind.get("ema8")) + " | 21EMA " + str(ind.get("ema21")) + " | RSI14 " + str(ind.get("rsi14")) + " | last vol " + str(ind.get("last_vol")) + " vs 10-avg " + str(ind.get("vol_avg10")) + " | EMA spread " + str(ind.get("spread")) + _swtxt)
+        elif cs:
+            L.append("  INDICATORS: warming up (" + str(len(cs)) + " candles so far - EMAs/RSI need 8/21/15)")
+    except Exception:
+        pass
     if cs:
-        L.append("  Recent 1-min candles (O/H/L/C/V):")
-        for c in cs:
+        L.append("  Recent 1-min candles (O/H/L/C/V, oldest first):")
+        for c in cs[-8:]:
             L.append("    " + str(c.get("open")) + "/" + str(c.get("high")) + "/" + str(c.get("low")) + "/" + str(c.get("close")) + "/" + str(c.get("volume")))
     return chr(10).join(L)
 
