@@ -1172,9 +1172,9 @@ Analyze the 1-min setup on {ticker} and return your JSON decision.
 """.strip()
 
 
-def call_claude(alert_data: dict, session: dict) -> dict | None:
+def call_claude(alert_data: dict, session: dict, replay: bool = False) -> dict | None:
     global _claude_calls
-    if not _claude_budget_ok():
+    if not replay and not _claude_budget_ok():
         return None
     try:
         response = _claude_client.messages.create(
@@ -1190,7 +1190,8 @@ def call_claude(alert_data: dict, session: dict) -> dict | None:
                 "content": _build_claude_prompt(alert_data, session),
             }],
         )
-        _claude_calls += 1
+        if not replay:
+            _claude_calls += 1
         raw = response.content[0].text.strip()
         log.info(f"Claude raw: {raw[:200]}")
         if raw.startswith("```"):
@@ -1960,8 +1961,21 @@ def replay_test():
     ticker = str(request.args.get("ticker", "TSLA")).upper()
     day    = str(request.args.get("date", ""))
     use_claude = str(request.args.get("claude", "0")) == "1"
+    # Chunking: Render's proxy caps requests near 100s, so a full-day Claude
+    # replay (60+ sequential calls) can never return in one request. Evaluate
+    # bars [claude_from, claude_to) per request (default 15-bar chunk).
+    try:
+        c_from = int(request.args.get("claude_from", "0"))
+        c_to   = int(request.args.get("claude_to", str(c_from + 15)))
+    except ValueError:
+        return jsonify({"error": "claude_from/claude_to must be integers"}), 400
     if not day:
         return jsonify({"error": "date=YYYY-MM-DD required"}), 400
+    # Never run replays inside the live scanning window: replay swaps live
+    # session state and would race the scanner thread.
+    _nw = datetime.now(ET)
+    if _nw.strftime("%Y-%m-%d") != day and (9, 20) <= (_nw.hour, _nw.minute) <= (10, 35) and _nw.weekday() < 5:
+        return jsonify({"error": "replay disabled during live window (9:20-10:35 ET)"}), 409
 
     # prior-day PMH/PML for that date
     p_start = (date.fromisoformat(day) - timedelta(days=7)).isoformat()
@@ -1987,17 +2001,18 @@ def replay_test():
     saved = _mkt_structure.pop(ticker, None)   # protect live state
     timeline, approvals = [], []
     try:
-        for b in bars:
+        for _bi, b in enumerate(bars):
             c = {"open": b["o"], "high": b["h"], "low": b["l"],
                  "close": b["c"], "volume": b["v"], "t": b.get("t")}
             st = _update_structure(ticker, c, pmh, pml, day=day)
             row = {"t": b.get("t"), "close": b["c"], "volume": b["v"]}
-            if use_claude:
+            if use_claude and c_from <= _bi < c_to:
                 alert = {"ticker": ticker, "alert_type": "REPLAY_1MIN",
                          "close": c["close"], "open": c["open"], "high": c["high"],
                          "low": c["low"], "volume": c["volume"], "pmh": pmh, "pml": pml}
                 d = call_claude(alert, {"trade_count": 0, "consecutive_losses": 0,
-                                        "circuit_breaker": False, "open_position": None})
+                                        "circuit_breaker": False, "open_position": None},
+                                replay=True)
                 if d:
                     row["decision"] = d.get("decision")
                     row["reason"] = d.get("reason", "")[:160]
@@ -2011,6 +2026,12 @@ def replay_test():
                   "or_low": final.get("or_low"), "or_high": final.get("or_high"),
                   "day_high": final.get("day_high"), "day_low": final.get("day_low"),
                   "crosses": final.get("crosses", {}), "bars": len(bars),
+                  "claude_from": c_from if use_claude else None,
+                  "claude_to": min(c_to, len(bars)) if use_claude else None,
+                  "next_chunk": (day and use_claude and c_to < len(bars)) and (
+                      "/replay-test?ticker=" + ticker + "&date=" + day
+                      + "&claude=1&claude_from=" + str(c_to)
+                      + "&claude_to=" + str(min(c_to + 15, len(bars)))) or None,
                   "approvals": approvals, "timeline": timeline}
     finally:
         if saved is not None:
