@@ -29,7 +29,7 @@ import hashlib
 import logging
 import time as time_module
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import pytz
 import requests
 import anthropic as anthropic_sdk
@@ -62,7 +62,7 @@ TT_PASS            = os.environ["TASTYTRADE_PASSWORD"]
 TT_ACCOUNT         = os.environ["TASTYTRADE_ACCOUNT_NUMBER"]
 DISCORD_API        = "https://discord.com/api/v10"
 CLAUDE_MODEL       = "claude-sonnet-4-6"
-MAX_DAILY_CALLS    = 150
+MAX_DAILY_CALLS    = 220
 MIN_PREMIUM        = 0.75   # per share → $75/contract
 MAX_PREMIUM        = 1.50   # per share → $150/contract
 MAX_SPREAD         = 0.05   # 5% bid-ask spread cap
@@ -931,9 +931,9 @@ def _persist_structure():
         log.warning("structure persist failed: " + str(e))
 
 
-def _premarket_levels(ticker: str) -> dict:
-    """Today pre-market high/low from 1-min bars 04:00-09:29 ET (EDT offsets)."""
-    day = datetime.now(ET).strftime("%Y-%m-%d")
+def _premarket_levels(ticker: str, day: str | None = None) -> dict:
+    """Pre-market high/low from 1-min bars 04:00-09:29 ET (EDT offsets)."""
+    day = day or datetime.now(ET).strftime("%Y-%m-%d")
     start = day + "T08:00:00Z"
     end   = day + "T13:29:59Z"
     for feed in ("iex", "sip", None):
@@ -955,9 +955,9 @@ def _premarket_levels(ticker: str) -> dict:
             log.warning("premarket bars " + ticker + " feed=" + str(feed) + ": " + str(e))
     return {"high": None, "low": None}
 
-def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
-    """Track day open, running H/L, last-3 candles, and in-window level crosses."""
-    today = datetime.now(ET).strftime("%Y-%m-%d")
+def _update_structure(ticker: str, candle: dict, pmh, pml, day: str | None = None) -> dict:
+    """Track day open, running H/L, candle history, and in-window level crosses."""
+    today = day or datetime.now(ET).strftime("%Y-%m-%d")
     st = _mkt_structure.get(ticker)
     if not st or st.get("date") != today:
         st = {"date": today,
@@ -968,7 +968,7 @@ def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
               "crosses":  {}}
         _mkt_structure[ticker] = st
         try:
-            _pmv = _premarket_levels(ticker)
+            _pmv = _premarket_levels(ticker, day=today)
             st["pm_high"] = _pmv.get("high")
             st["pm_low"]  = _pmv.get("low")
             if st["pm_high"]:
@@ -994,7 +994,7 @@ def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
                     st["or_high"] = max(st.get("or_high") or candle["high"], candle["high"])
                 if candle.get("low") is not None:
                     st["or_low"] = min(st.get("or_low") or candle["low"], candle["low"])
-            _nowm = datetime.now(ET).hour * 60 + datetime.now(ET).minute
+            _nowm = _bmin if _bmin is not None else (datetime.now(ET).hour * 60 + datetime.now(ET).minute)
             if _nowm >= 575 and st.get("or_high") is not None and not st.get("or_locked"):
                 st["or_locked"] = True
                 log.info("STRUCTURE: " + ticker + " opening range locked " + str(st.get("or_low")) + "-" + str(st.get("or_high")))
@@ -1005,7 +1005,12 @@ def _update_structure(ticker: str, candle: dict, pmh, pml) -> dict:
     is_new = (not last) or (not ct) or (str(last.get("t") or "") != ct)
     if is_new:
         prev_close = last.get("close") if last else candle.get("open")
-        now_hm = datetime.now(ET).strftime("%H:%M")
+        try:
+            _ct2 = str(candle.get("t") or "")
+            now_hm = (datetime.fromisoformat(_ct2.replace("Z", "+00:00"))
+                      .astimezone(ET).strftime("%H:%M")) if _ct2 else datetime.now(ET).strftime("%H:%M")
+        except Exception:
+            now_hm = datetime.now(ET).strftime("%H:%M")
         cur_close = candle.get("close")
         def _cross(level, key_dn, key_up, dn_lbl, up_lbl):
             if not level or prev_close is None or cur_close is None:
@@ -1303,30 +1308,72 @@ def _alpaca_headers() -> dict:
     }
 
 
-def get_latest_1min_candle(ticker: str) -> dict | None:
-    """Latest 1-min bar. Feed fallback iex -> sip -> default (SIP realtime embargoed on basic plans)."""
+def _fetch_1min_bars(ticker: str, start_utc_iso: str, end_utc_iso: str | None = None,
+                     limit: int = 500) -> list:
+    """1-min bars ascending from an EXPLICIT start. Alpaca defaults start=midnight
+    + sort=asc, so any call without start returns the FIRST bars of the day —
+    the bug that fed a frozen 4 AM candle to the scanner for a week."""
     for feed in ("iex", "sip", None):
         try:
-            params = {"timeframe": "1Min", "limit": 2}
+            params = {"timeframe": "1Min", "start": start_utc_iso,
+                      "limit": limit, "sort": "asc"}
+            if end_utc_iso:
+                params["end"] = end_utc_iso
             if feed:
                 params["feed"] = feed
             resp = requests.get(
                 f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
                 headers=_alpaca_headers(),
                 params=params,
-                timeout=5,
+                timeout=6,
             )
             if resp.status_code == 200:
                 bars = resp.json().get("bars", [])
                 if bars:
-                    b = bars[-1]
-                    return {"open": b["o"], "high": b["h"], "low": b["l"],
-                            "close": b["c"], "volume": b["v"], "t": b.get("t")}
+                    return bars
             else:
-                log.warning(f"1min candle {ticker} feed={feed} -> {resp.status_code}")
+                log.warning(f"1min bars {ticker} feed={feed} -> {resp.status_code}")
         except Exception as e:
-            log.warning(f"1min candle {ticker} feed={feed}: {e}")
+            log.warning(f"1min bars {ticker} feed={feed}: {e}")
+    return []
+
+
+def get_latest_1min_candle(ticker: str) -> dict | None:
+    """TRUE latest completed 1-min bar (explicit start 30 min back, take last)."""
+    start = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bars = _fetch_1min_bars(ticker, start, limit=40)
+    if bars:
+        b = bars[-1]
+        return {"open": b["o"], "high": b["h"], "low": b["l"],
+                "close": b["c"], "volume": b["v"], "t": b.get("t")}
     return None
+
+
+def _ingest_new_bars(ticker: str, pmh, pml) -> dict | None:
+    """Fetch every 1-min bar since 9:30 ET (or since the last seen bar) and replay
+    each NEW bar through _update_structure in order. This is the ONLY way the
+    structure engine sees the market — one bar per tick loses bars whenever a
+    tick is slow or skipped. Returns the newest candle."""
+    st = _mkt_structure.get(ticker)
+    last_t = ""
+    if st and st.get("candles"):
+        last_t = str(st["candles"][-1].get("t") or "")
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    start = last_t if last_t else (day + "T13:30:00Z")  # 9:30 EDT
+    bars = _fetch_1min_bars(ticker, start, limit=200)
+    newest = None
+    for b in bars:
+        bt = str(b.get("t") or "")
+        if last_t and bt <= last_t:
+            continue
+        c = {"open": b["o"], "high": b["h"], "low": b["l"],
+             "close": b["c"], "volume": b["v"], "t": bt}
+        _update_structure(ticker, c, pmh, pml)
+        newest = c
+    if newest:
+        return newest
+    st = _mkt_structure.get(ticker)
+    return st["candles"][-1] if st and st.get("candles") else None
 
 def get_key_levels(ticker: str) -> dict:
     """PMH/PML/prev_close from last COMPLETED daily bar (explicit start: Alpaca defaults start=today -> empty pre-open)."""
@@ -1517,11 +1564,10 @@ def _scheduler_loop():
                         for ticker in ["NVDA", "TSLA"]:
                             if not all_gates_pass(ticker, signal_type="entry"):
                                 continue
-                            candle = get_latest_1min_candle(ticker)
                             levels = get_key_levels(ticker)
+                            candle = _ingest_new_bars(ticker, levels.get("pmh"), levels.get("pml"))
                             if not candle:
                                 continue
-                            _update_structure(ticker, candle, levels.get("pmh"), levels.get("pml"))
                             alert_data = {
                                 "ticker":     ticker,
                                 "alert_type": "SCANNER_1MIN",
@@ -1904,6 +1950,75 @@ def structure_test():
                         "context": _structure_context(tk, lv.get("pmh"), lv.get("pml"))}), 200
     except Exception as e:
         return jsonify({"err": str(e)}), 500
+
+@app.route("/replay-test", methods=["GET"])
+def replay_test():
+    """Replay any past session through the EXACT live decision path.
+    /replay-test?ticker=TSLA&date=2026-07-20            -> structure/cross timeline only (free)
+    /replay-test?ticker=TSLA&date=2026-07-20&claude=1   -> + a real Claude decision per bar (~66 calls)
+    Never places orders. Never posts to Discord. Does not touch live session state."""
+    ticker = str(request.args.get("ticker", "TSLA")).upper()
+    day    = str(request.args.get("date", ""))
+    use_claude = str(request.args.get("claude", "0")) == "1"
+    if not day:
+        return jsonify({"error": "date=YYYY-MM-DD required"}), 400
+
+    # prior-day PMH/PML for that date
+    p_start = (date.fromisoformat(day) - timedelta(days=7)).isoformat()
+    pmh = pml = None
+    for feed in ("iex", "sip", None):
+        try:
+            params = {"timeframe": "1Day", "limit": 10, "start": p_start, "end": day + "T00:00:00Z"}
+            if feed:
+                params["feed"] = feed
+            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                             headers=_alpaca_headers(), params=params, timeout=6)
+            if r.status_code == 200 and r.json().get("bars"):
+                b = r.json()["bars"][-1]
+                pmh, pml = b["h"], b["l"]
+                break
+        except Exception:
+            pass
+
+    bars = _fetch_1min_bars(ticker, day + "T13:24:00Z", day + "T14:31:00Z", limit=200)
+    if not bars:
+        return jsonify({"error": "no bars for that date/ticker"}), 404
+
+    saved = _mkt_structure.pop(ticker, None)   # protect live state
+    timeline, approvals = [], []
+    try:
+        for b in bars:
+            c = {"open": b["o"], "high": b["h"], "low": b["l"],
+                 "close": b["c"], "volume": b["v"], "t": b.get("t")}
+            st = _update_structure(ticker, c, pmh, pml, day=day)
+            row = {"t": b.get("t"), "close": b["c"], "volume": b["v"]}
+            if use_claude:
+                alert = {"ticker": ticker, "alert_type": "REPLAY_1MIN",
+                         "close": c["close"], "open": c["open"], "high": c["high"],
+                         "low": c["low"], "volume": c["volume"], "pmh": pmh, "pml": pml}
+                d = call_claude(alert, {"trade_count": 0, "consecutive_losses": 0,
+                                        "circuit_breaker": False, "open_position": None})
+                if d:
+                    row["decision"] = d.get("decision")
+                    row["reason"] = d.get("reason", "")[:160]
+                    if d.get("decision") == "APPROVE":
+                        approvals.append({"t": b.get("t"), "direction": d.get("direction"),
+                                          "tier": d.get("tier"), "reason": d.get("reason", "")})
+            timeline.append(row)
+        final = _mkt_structure.get(ticker, {})
+        result = {"ticker": ticker, "date": day, "pmh": pmh, "pml": pml,
+                  "pm_high": final.get("pm_high"), "pm_low": final.get("pm_low"),
+                  "or_low": final.get("or_low"), "or_high": final.get("or_high"),
+                  "day_high": final.get("day_high"), "day_low": final.get("day_low"),
+                  "crosses": final.get("crosses", {}), "bars": len(bars),
+                  "approvals": approvals, "timeline": timeline}
+    finally:
+        if saved is not None:
+            _mkt_structure[ticker] = saved
+        else:
+            _mkt_structure.pop(ticker, None)
+    return jsonify(result), 200
+
 
 @app.route("/", methods=["GET"])
 def root():
