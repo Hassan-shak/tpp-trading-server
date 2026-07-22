@@ -1169,6 +1169,14 @@ SESSION STATE:
 {_structure_context(ticker, pmh, pml)}
 
 Analyze the 1-min setup on {ticker} and return your JSON decision.
+
+OUTPUT CONTRACT (mandatory):
+- Respond with ONLY the JSON object, starting with {{ — no preamble, no prose, no code fences.
+- The "reason" field is REQUIRED for BOTH APPROVE and NO_TRADE: 1-2 sentences in Junior's voice naming the condition/setup and the level. Never leave it empty.
+
+ENTRY FRESHNESS RULE:
+- A break-based entry (Condition A, Condition C, Setup 1) is only valid if the triggering cross occurred within the LAST 5 candles, or price is retesting the broken level right now.
+- Do not chase an extended move: if the break happened earlier and price has already traveled far from the level and sits at/near session extremes, that is NO_TRADE unless a fresh Condition D reversal or a new break prints.
 """.strip()
 
 
@@ -1214,38 +1222,45 @@ def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: st
     global _claude_calls
     if not replay and not _claude_budget_ok():
         return None
-    try:
-        response = _claude_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=512,
-            system=[{
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{
-                "role":    "user",
-                "content": _build_claude_prompt(alert_data, session, as_of=as_of),
-            }],
-        )
-        if not replay:
-            _claude_calls += 1
-        raw = response.content[0].text.strip()
-        log.info(f"Claude raw: {raw[:200]}")
-        decision = _extract_json_object(raw)
-        log.info(
-            f"Claude: {decision.get('decision')} | "
-            f"ticker={decision.get('ticker')} | "
-            f"direction={decision.get('direction')} | "
-            f"tier={decision.get('tier')}"
-        )
-        return decision
-    except json.JSONDecodeError as e:
-        log.error(f"Claude JSON parse failed: {e}")
-        return None
-    except Exception as e:
-        log.error(f"Claude API call failed: {e}")
-        return None
+    prompt = _build_claude_prompt(alert_data, session, as_of=as_of)
+    last_err = None
+    for attempt in (1, 2):
+        try:
+            response = _claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1024,
+                system=[{
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{
+                    "role":    "user",
+                    "content": prompt,
+                }],
+            )
+            if not replay:
+                _claude_calls += 1
+            raw = response.content[0].text.strip()
+            log.info(f"Claude raw: {raw[:200]}")
+            decision = _extract_json_object(raw)
+            log.info(
+                f"Claude: {decision.get('decision')} | "
+                f"ticker={decision.get('ticker')} | "
+                f"direction={decision.get('direction')} | "
+                f"tier={decision.get('tier')}"
+            )
+            return decision
+        except json.JSONDecodeError as e:
+            last_err = f"JSON parse failed: {e}"
+            log.error(f"Claude {last_err} (attempt {attempt}/2)")
+        except Exception as e:
+            last_err = f"API call failed: {e}"
+            log.error(f"Claude {last_err} (attempt {attempt}/2)")
+        if attempt == 1:
+            time_module.sleep(1.5)
+    log.error(f"Claude decision unrecoverable after 2 attempts: {last_err}")
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
