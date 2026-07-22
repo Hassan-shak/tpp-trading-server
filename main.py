@@ -528,7 +528,14 @@ def select_contract(ticker: str, direction: str) -> tuple:
     log.warning(f"No contract in range for {ticker} {direction}")
     return None, None, None
 
+_last_order_error = None
+_last_order_id    = None
+
+
 def _tt_place_order(payload: dict) -> str | None:
+    global _last_order_error, _last_order_id
+    _last_order_error = None
+    _last_order_id    = None
     resp = requests.post(
         f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders",
         headers=_tt_headers(),
@@ -537,33 +544,68 @@ def _tt_place_order(payload: dict) -> str | None:
     )
     if resp.status_code not in (200, 201):
         log.error(f"Order failed {resp.status_code}: {resp.text}")
+        try:
+            _err = resp.json().get("error", {})
+            _msgs = [e.get("message", "") for e in _err.get("errors", []) if e.get("message")]
+            _last_order_error = "; ".join(_msgs) or _err.get("message") or f"HTTP {resp.status_code}"
+        except Exception:
+            _last_order_error = f"HTTP {resp.status_code}"
         return None
     order_id = str(resp.json()["data"]["order"]["id"])
     log.info(f"Order placed → ID {order_id}")
+    global _last_order_id
+    _last_order_id = order_id
     return order_id
 
 
-def _tt_poll_fill(order_id: str, timeout: int) -> float | None:
-    deadline = time_module.time() + timeout
-    while time_module.time() < deadline:
+def _tt_order_status(order_id: str) -> tuple[str, float | None]:
+    """One robust status check. Handles both response shapes (order directly
+    under data, or nested under data.order) and case-insensitive statuses.
+    Returns (status_lower, fill_price_or_None)."""
+    try:
         resp = requests.get(
             f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders/{order_id}",
             headers=_tt_headers(), timeout=5,
         )
         if resp.status_code != 200:
-            time_module.sleep(2)
-            continue
-        order  = resp.json()["data"]["order"]
-        status = order.get("status", "")
-        if status == "Filled":
-            fill = float(order["legs"][0].get("average-fill-price", 0))
+            return f"http_{resp.status_code}", None
+        d = resp.json().get("data", {}) or {}
+        order = d.get("order", d)
+        status = str(order.get("status", "")).strip().lower()
+        fill = None
+        legs = order.get("legs") or []
+        if legs:
+            try:
+                fill = float(legs[0].get("average-fill-price") or 0) or None
+            except (TypeError, ValueError):
+                fill = None
+        return status, fill
+    except Exception as e:
+        return f"error_{e.__class__.__name__}", None
+
+
+def _tt_poll_fill(order_id: str, timeout: int) -> float | None:
+    deadline = time_module.time() + timeout
+    first = True
+    while time_module.time() < deadline:
+        status, fill = _tt_order_status(order_id)
+        if first:
+            log.info(f"Order {order_id} first poll status: {status}")
+            first = False
+        if status == "filled" and fill:
             log.info(f"FILLED {order_id} @ ${fill:.2f}/share (${fill*100:.0f}/contract)")
             return fill
-        if status in ("Cancelled", "Rejected", "Expired"):
+        if status in ("cancelled", "canceled", "rejected", "expired"):
             log.warning(f"Order {order_id}: {status}")
             return None
-        time_module.sleep(3)
-    log.warning(f"Order {order_id} timed out — cancelling")
+        time_module.sleep(2)
+    # Timeout: one FINAL check before doing anything destructive — a filled
+    # order must never be cancelled or abandoned.
+    status, fill = _tt_order_status(order_id)
+    if status == "filled" and fill:
+        log.info(f"FILLED (final check) {order_id} @ ${fill:.2f}/share")
+        return fill
+    log.warning(f"Order {order_id} timed out unfilled (status={status}) — cancelling")
     _tt_cancel_order(order_id)
     return None
 
@@ -936,7 +978,7 @@ def _premarket_levels(ticker: str, day: str | None = None) -> dict:
     day = day or datetime.now(ET).strftime("%Y-%m-%d")
     start = day + "T08:00:00Z"
     end   = day + "T13:29:59Z"
-    for feed in ("iex", "sip", None):
+    for feed in ("sip", "iex", None):
         try:
             params = {"timeframe": "1Min", "start": start, "end": end, "limit": 1000}
             if feed:
@@ -1290,12 +1332,36 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         return False
 
     fill_price = enter_trade(occ)
+    if not fill_price and _last_order_id and not _last_order_error:
+        # Order reached the broker but confirmation failed — never walk away.
+        _st, _fp = _tt_order_status(_last_order_id)
+        if _st == "filled" and _fp:
+            log.warning(f"ADOPTED orphan fill {_last_order_id} @ ${_fp:.2f}")
+            fill_price = _fp
+        else:
+            send_emergency_dm(
+                f"UNCONFIRMED ORDER — {ticker} {direction.upper()} {occ} "
+                f"order ID {_last_order_id} status={_st}. CHECK BROKER NOW — "
+                f"a fill here is NOT tracked and has NO stop loss."
+            )
     if not fill_price:
-        post_to_discord(
-            "day-trade-signals",
-            f"⚠️ Order placed for **{ticker}** but fill not confirmed within 60s. "
-            f"No position recorded — check broker.",
-        )
+        if _last_order_error:
+            # Order REJECTED by broker — never reached the market. Keep the
+            # signals channel clean; ops detail goes to daily-watchlist + DM.
+            post_to_discord(
+                "daily-watchlist",
+                f"⚠️ Signal fired on **{ticker} {direction.upper()}** [{tier}] but the "
+                f"broker rejected the order — {_last_order_error} No position opened.",
+            )
+            send_emergency_dm(
+                f"ORDER REJECTED — {ticker} {direction.upper()} {occ}: {_last_order_error}"
+            )
+        else:
+            post_to_discord(
+                "day-trade-signals",
+                f"⚠️ Order placed for **{ticker}** but fill not confirmed within 60s. "
+                f"No position recorded — check broker.",
+            )
         return False
 
     log.info(f"FILLED: {occ} @ ${fill_price:.2f}/share")
@@ -1510,9 +1576,10 @@ def _scheduler_loop():
 
     while True:
         try:
-            now   = datetime.now(ET)
-            today = now.date()
-            t     = now.time()
+            now     = datetime.now(ET)
+            today   = now.date()
+            today_s = today.isoformat()
+            t       = now.time()
 
             # Skip everything on weekends and holidays
             is_trading_day = (
@@ -1524,7 +1591,7 @@ def _scheduler_loop():
 
                 # ── Watchlist 9:15 AM ─────────────────────────────────────
                 from datetime import time as dtime
-                if dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today:
+                if dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s:
                     log.info("JOB: daily watchlist")
                     try:
                         rows = []
@@ -1580,32 +1647,32 @@ def _scheduler_loop():
                                         " - window opens 9:30 AM ET, alerts on confirmed setups only.")
                         else:
                             log.warning("Watchlist skipped - no level data for either ticker")
-                        last_watchlist_date = today
-                        _sp = load_state(); _sp["last_watchlist_date"] = today; _commit(_sp)
+                        last_watchlist_date = today_s
+                        _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
                     except Exception as e:
                         log.error(f"Watchlist job error: {e}")
 
                 # ── 9:45 AM status update ─────────────────────────────────
-                if dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today:
+                if dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s:
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
                         _post_scanning_update("9:45 AM", "No forced trades — entries hit #day-trade-signals only on confirmed setups.")
                         log.info("9:45 status update posted")
                     else:
                         log.info("9:45 status update skipped — trade already active")
-                    last_945_date = today
-                    _sp = load_state(); _sp["last_945_date"] = today; _commit(_sp)
+                    last_945_date = today_s
+                    _sp = load_state(); _sp["last_945_date"] = today_s; _commit(_sp)
 
                 # ── 10:15 AM status update ────────────────────────────────
-                if dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today:
+                if dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today_s:
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
                         _post_scanning_update("10:15 AM — final stretch", "Window closes 10:30 — if nothing sets up we sit out. No forced trades.")
                         log.info("10:15 status update posted")
                     else:
                         log.info("10:15 status update skipped — trade already active")
-                    last_1015_date = today
-                    _sp = load_state(); _sp["last_1015_date"] = today; _commit(_sp)
+                    last_1015_date = today_s
+                    _sp = load_state(); _sp["last_1015_date"] = today_s; _commit(_sp)
 
                 # ── 1-min scanner 9:25–10:30 AM ──────────────────────────
                 if dtime(9, 25) <= t <= dtime(10, 30) and _in_window():
