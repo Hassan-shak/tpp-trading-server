@@ -1119,7 +1119,7 @@ def _structure_context(ticker: str, pmh, pml) -> str:
             L.append("    " + str(c.get("open")) + "/" + str(c.get("high")) + "/" + str(c.get("low")) + "/" + str(c.get("close")) + "/" + str(c.get("volume")))
     return chr(10).join(L)
 
-def _build_claude_prompt(alert_data: dict, session: dict) -> str:
+def _build_claude_prompt(alert_data: dict, session: dict, as_of: str | None = None) -> str:
     ticker     = alert_data.get("ticker",     "UNKNOWN")
     alert_type = alert_data.get("alert_type", "UNKNOWN")
     close      = alert_data.get("close",      "N/A")
@@ -1144,7 +1144,7 @@ def _build_claude_prompt(alert_data: dict, session: dict) -> str:
         level_lines.append(f"PML (TradingView verified): {pml}")
     level_context = "\n".join(level_lines) if level_lines else "No specific level in alert."
 
-    now = datetime.now(ET).strftime("%H:%M ET")
+    now = as_of or datetime.now(ET).strftime("%H:%M ET")
     return f"""
 ALERT RECEIVED — {now}
 Ticker:     {ticker}
@@ -1172,7 +1172,7 @@ Analyze the 1-min setup on {ticker} and return your JSON decision.
 """.strip()
 
 
-def call_claude(alert_data: dict, session: dict, replay: bool = False) -> dict | None:
+def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: str | None = None) -> dict | None:
     global _claude_calls
     if not replay and not _claude_budget_ok():
         return None
@@ -1187,7 +1187,7 @@ def call_claude(alert_data: dict, session: dict, replay: bool = False) -> dict |
             }],
             messages=[{
                 "role":    "user",
-                "content": _build_claude_prompt(alert_data, session),
+                "content": _build_claude_prompt(alert_data, session, as_of=as_of),
             }],
         )
         if not replay:
@@ -2010,9 +2010,17 @@ def replay_test():
                 alert = {"ticker": ticker, "alert_type": "REPLAY_1MIN",
                          "close": c["close"], "open": c["open"], "high": c["high"],
                          "low": c["low"], "volume": c["volume"], "pmh": pmh, "pml": pml}
+                try:
+                    _bt_et = (datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00"))
+                              .astimezone(ET).strftime("%H:%M ET"))
+                except Exception:
+                    _bt_et = None
                 d = call_claude(alert, {"trade_count": 0, "consecutive_losses": 0,
                                         "circuit_breaker": False, "open_position": None},
-                                replay=True)
+                                replay=True, as_of=_bt_et)
+                if not d:
+                    row["decision"] = "ERROR"
+                    row["reason"] = "call_claude returned no decision (parse/API failure)"
                 if d:
                     row["decision"] = d.get("decision")
                     row["reason"] = d.get("reason", "")[:160]
