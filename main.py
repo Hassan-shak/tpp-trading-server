@@ -1172,6 +1172,44 @@ Analyze the 1-min setup on {ticker} and return your JSON decision.
 """.strip()
 
 
+def _extract_json_object(text: str) -> dict:
+    """Parse the first complete JSON object found anywhere in the model's reply.
+    The model sometimes prefixes prose ("Looking at this setup: ...") or wraps
+    the JSON in ``` fences; the old strict parser raised on both and silently
+    ate decisions on exactly the bars where a setup was forming."""
+    t = text.strip()
+    if t.startswith("```"):
+        parts = t.split("```")
+        t = parts[1] if len(parts) > 1 else t
+        if t[:4].lower() == "json":
+            t = t[4:]
+        t = t.strip()
+    i = t.find("{")
+    if i == -1:
+        raise json.JSONDecodeError("no JSON object found", t[:50] or " ", 0)
+    depth, in_str, esc = 0, False, False
+    for j in range(i, len(t)):
+        ch = t[j]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = in_str
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(t[i:j + 1])
+    raise json.JSONDecodeError("unbalanced JSON object", t[:50] or " ", 0)
+
+
 def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: str | None = None) -> dict | None:
     global _claude_calls
     if not replay and not _claude_budget_ok():
@@ -1194,12 +1232,7 @@ def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: st
             _claude_calls += 1
         raw = response.content[0].text.strip()
         log.info(f"Claude raw: {raw[:200]}")
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        decision = json.loads(raw)
+        decision = _extract_json_object(raw)
         log.info(
             f"Claude: {decision.get('decision')} | "
             f"ticker={decision.get('ticker')} | "
