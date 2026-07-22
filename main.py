@@ -553,7 +553,6 @@ def _tt_place_order(payload: dict) -> str | None:
         return None
     order_id = str(resp.json()["data"]["order"]["id"])
     log.info(f"Order placed → ID {order_id}")
-    global _last_order_id
     _last_order_id = order_id
     return order_id
 
