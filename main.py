@@ -530,6 +530,7 @@ def select_contract(ticker: str, direction: str) -> tuple:
 
 _last_order_error = None
 _last_order_id    = None
+_last_order_ask   = None
 
 
 def _tt_place_order(payload: dict) -> str | None:
@@ -557,6 +558,31 @@ def _tt_place_order(payload: dict) -> str | None:
     return order_id
 
 
+def _extract_fill_price(order: dict) -> float | None:
+    """Fill price from any of the places Tastytrade puts it: leg average,
+    per-fill records (weighted), or order-level average. Today's live fill
+    (486701499) proved status parses while the price field we read is empty."""
+    def _f(v):
+        try:
+            x = float(v)
+            return x if x > 0 else None
+        except (TypeError, ValueError):
+            return None
+    for leg in (order.get("legs") or []):
+        p = _f(leg.get("average-fill-price"))
+        if p:
+            return p
+        tot_q = tot_pq = 0.0
+        for fl in (leg.get("fills") or []):
+            fp, fq = _f(fl.get("fill-price")), _f(fl.get("quantity"))
+            if fp and fq:
+                tot_pq += fp * fq
+                tot_q  += fq
+        if tot_q:
+            return tot_pq / tot_q
+    return _f(order.get("average-fill-price"))
+
+
 def _tt_order_status(order_id: str) -> tuple[str, float | None]:
     """One robust status check. Handles both response shapes (order directly
     under data, or nested under data.order) and case-insensitive statuses.
@@ -571,16 +597,20 @@ def _tt_order_status(order_id: str) -> tuple[str, float | None]:
         d = resp.json().get("data", {}) or {}
         order = d.get("order", d)
         status = str(order.get("status", "")).strip().lower()
-        fill = None
-        legs = order.get("legs") or []
-        if legs:
-            try:
-                fill = float(legs[0].get("average-fill-price") or 0) or None
-            except (TypeError, ValueError):
-                fill = None
-        return status, fill
+        return status, _extract_fill_price(order)
     except Exception as e:
         return f"error_{e.__class__.__name__}", None
+
+
+def _resolve_filled_price(order_id: str, fill: float | None) -> float:
+    """A confirmed-filled order MUST yield a price. Fall back to the ask we
+    placed at (close enough for stop/target math) rather than ever orphaning."""
+    if fill:
+        log.info(f"FILLED {order_id} @ ${fill:.2f}/share (${fill*100:.0f}/contract)")
+        return fill
+    fb = _last_order_ask or 0.0
+    log.warning(f"FILLED {order_id} but price unreadable — using placement ask ${fb:.2f} as fill estimate")
+    return fb
 
 
 def _tt_poll_fill(order_id: str, timeout: int) -> float | None:
@@ -591,21 +621,22 @@ def _tt_poll_fill(order_id: str, timeout: int) -> float | None:
         if first:
             log.info(f"Order {order_id} first poll status: {status}")
             first = False
-        if status == "filled" and fill:
-            log.info(f"FILLED {order_id} @ ${fill:.2f}/share (${fill*100:.0f}/contract)")
-            return fill
+        if status == "filled":
+            return _resolve_filled_price(order_id, fill)
         if status in ("cancelled", "canceled", "rejected", "expired"):
             log.warning(f"Order {order_id}: {status}")
             return None
         time_module.sleep(2)
-    # Timeout: one FINAL check before doing anything destructive — a filled
-    # order must never be cancelled or abandoned.
+    # Timeout: one FINAL check. Cancel ONLY a still-working order — a filled
+    # order is accepted (with fallback pricing), never cancelled, never orphaned.
     status, fill = _tt_order_status(order_id)
-    if status == "filled" and fill:
-        log.info(f"FILLED (final check) {order_id} @ ${fill:.2f}/share")
-        return fill
-    log.warning(f"Order {order_id} timed out unfilled (status={status}) — cancelling")
-    _tt_cancel_order(order_id)
+    if status == "filled":
+        return _resolve_filled_price(order_id, fill)
+    if status in ("live", "received", "routed", "in-flight", "contingent"):
+        log.warning(f"Order {order_id} timed out working (status={status}) — cancelling")
+        _tt_cancel_order(order_id)
+    else:
+        log.warning(f"Order {order_id} timed out in state '{status}' — NOT cancelling; check broker")
     return None
 
 
@@ -1316,6 +1347,8 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     setup = claude_decision.get("setup_description", "")
 
     occ, strike, ask = select_contract(ticker, direction)
+    global _last_order_ask
+    _last_order_ask = ask
     if not occ:
         post_to_discord(
             "day-trade-signals",
@@ -1334,9 +1367,9 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     if not fill_price and _last_order_id and not _last_order_error:
         # Order reached the broker but confirmation failed — never walk away.
         _st, _fp = _tt_order_status(_last_order_id)
-        if _st == "filled" and _fp:
-            log.warning(f"ADOPTED orphan fill {_last_order_id} @ ${_fp:.2f}")
-            fill_price = _fp
+        if _st == "filled":
+            fill_price = _resolve_filled_price(_last_order_id, _fp)
+            log.warning(f"ADOPTED orphan fill {_last_order_id} @ ${fill_price:.2f}")
         else:
             send_emergency_dm(
                 f"UNCONFIRMED ORDER — {ticker} {direction.upper()} {occ} "
