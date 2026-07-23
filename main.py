@@ -1469,11 +1469,15 @@ def _ingest_new_bars(ticker: str, pmh, pml) -> dict | None:
     structure engine sees the market — one bar per tick loses bars whenever a
     tick is slow or skipped. Returns the newest candle."""
     st = _mkt_structure.get(ticker)
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    floor = day + "T13:30:00Z"  # 9:30 EDT — session bars only
+    if st and st.get("candles"):
+        # purge any pre-open seed candles (e.g. from /structure-test hits)
+        st["candles"] = [c for c in st["candles"] if str(c.get("t") or "") >= floor]
     last_t = ""
     if st and st.get("candles"):
         last_t = str(st["candles"][-1].get("t") or "")
-    day = datetime.now(ET).strftime("%Y-%m-%d")
-    start = last_t if last_t else (day + "T13:30:00Z")  # 9:30 EDT
+    start = last_t if (last_t and last_t >= floor) else floor
     bars = _fetch_1min_bars(ticker, start, limit=200)
     newest = None
     for b in bars:
@@ -1677,11 +1681,12 @@ def _scheduler_loop():
                 if dtime(9, 25) <= t <= dtime(10, 30) and _in_window():
                     try:
                         for ticker in ["NVDA", "TSLA"]:
-                            if not all_gates_pass(ticker, signal_type="entry"):
-                                continue
+                            # Structure stays fresh every tick, gates or not
                             levels = get_key_levels(ticker)
                             candle = _ingest_new_bars(ticker, levels.get("pmh"), levels.get("pml"))
                             if not candle:
+                                continue
+                            if not all_gates_pass(ticker, signal_type="entry"):
                                 continue
                             alert_data = {
                                 "ticker":     ticker,
