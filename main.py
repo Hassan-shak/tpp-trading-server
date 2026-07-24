@@ -335,12 +335,69 @@ def _gate_cooldown(ticker: str, signal_type: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+EARNINGS_BLACKOUT = os.environ.get("EARNINGS_BLACKOUT", "")
+_earnings_set = {p.strip().upper() for p in EARNINGS_BLACKOUT.split(",") if p.strip()}
+
+
+def _gate_earnings(ticker: str) -> tuple[bool, str]:
+    """Blocks a ticker on its earnings-day session. Env EARNINGS_BLACKOUT holds
+    comma-separated TICKER:YYYY-MM-DD entries maintained weekly from the
+    earnings calendar. Post-earnings gap days are allowed by design."""
+    key = f"{ticker.upper()}:{datetime.now(ET).strftime('%Y-%m-%d')}"
+    if key in _earnings_set:
+        return False, f"earnings blackout ({key})"
+    return True, "ok"
+
+
+_broker_pos_cache = (0.0, [])
+
+
+def _tt_open_option_positions() -> list:
+    """Live option positions at the broker — the ground truth the gates trust."""
+    global _broker_pos_cache
+    ts, cached = _broker_pos_cache
+    if time_module.time() - ts < 20:
+        return cached
+    try:
+        resp = requests.get(
+            f"{TT_BASE}/accounts/{TT_ACCOUNT}/positions",
+            headers=_tt_headers(), timeout=6,
+        )
+        if resp.status_code != 200:
+            log.warning(f"broker positions check -> {resp.status_code}")
+            return cached
+        items = resp.json().get("data", {}).get("items", []) or []
+        live = [i for i in items
+                if "option" in str(i.get("instrument-type", "")).lower()
+                and abs(float(i.get("quantity") or 0)) > 0]
+        _broker_pos_cache = (time_module.time(), live)
+        return live
+    except Exception as e:
+        log.warning(f"broker positions check failed: {e}")
+        return cached
+
+
+def _gate_broker_flat(signal_type: str) -> tuple[bool, str]:
+    """Entries require the BROKER to show no open option positions — state files
+    can lie (orphans), the broker cannot. Kills stacking permanently, including
+    across overlapping instances during deploys."""
+    if signal_type != "entry":
+        return True, "n/a"
+    live = _tt_open_option_positions()
+    if live:
+        syms = ", ".join(_fmt_occ(str(p.get("symbol", "?"))) for p in live[:3])
+        return False, f"broker shows {len(live)} open position(s): {syms}"
+    return True, "flat"
+
+
 def all_gates_pass(ticker: str, signal_type: str = "entry") -> bool:
     checks = [
         ("market_day",      _gate_market_day),
         ("window",          _gate_window),
         ("ticker",          lambda: _gate_ticker(ticker)),
+        ("earnings",        lambda: _gate_earnings(ticker)),
         ("blackout",        _gate_blackout),
+        ("broker_flat",     lambda: _gate_broker_flat(signal_type)),
         ("circuit_breaker", _gate_circuit_breaker),
         ("max_trades",      _gate_max_trades),
         ("open_position",   _gate_open_position),
@@ -531,6 +588,7 @@ def select_contract(ticker: str, direction: str) -> tuple:
 _last_order_error = None
 _last_order_id    = None
 _last_order_ask   = None
+_boot_ts          = time_module.time()
 
 
 def _tt_place_order(payload: dict) -> str | None:
@@ -581,6 +639,24 @@ def _extract_fill_price(order: dict) -> float | None:
         if tot_q:
             return tot_pq / tot_q
     return _f(order.get("average-fill-price"))
+
+
+_MONTHS = ["", "JAN", "FEB", "MARCH", "APRIL", "MAY", "JUNE",
+           "JULY", "AUG", "SEPT", "OCT", "NOV", "DEC"]
+
+
+def _fmt_occ(occ: str) -> str:
+    """OCC symbol -> member-readable: 'NVDA  260724P00205000' -> 'NVDA JULY 24 $205 PUT'."""
+    try:
+        sym = occ.split()[0]
+        tail = occ.replace(" ", "")[len(sym):]
+        mo, dy = int(tail[2:4]), int(tail[4:6])
+        cp = "CALL" if tail[6].upper() == "C" else "PUT"
+        strike = int(tail[7:]) / 1000
+        strike_s = f"${strike:.1f}".rstrip("0").rstrip(".") if strike % 1 else f"${int(strike)}"
+        return f"{sym} {_MONTHS[mo]} {dy} {strike_s} {cp}"
+    except Exception:
+        return occ
 
 
 def _tt_order_status(order_id: str) -> tuple[str, float | None]:
@@ -739,8 +815,12 @@ def monitor_open_position():
 
     reason = None
 
+    # 0. Forced flatten 3:45 PM ET — nothing is ever held overnight
+    if now.time() >= dtime(15, 45):
+        reason = "EOD FLATTEN 3:45 ET (no overnight holds)"
+
     # 1. Profit target +40%
-    if pnl_pct >= 0.40:
+    elif pnl_pct >= 0.40:
         reason = "PROFIT TARGET +40%"
 
     # 2. Trailing stop — arms at +10%, trails 15% below peak
@@ -762,7 +842,7 @@ def monitor_open_position():
         close_time    = datetime.now(ET).strftime("%H:%M ET")
         post_to_discord(
             "profits-and-recaps",
-            f"{emoji} **{occ} CLOSED** — {reason}\n"
+            f"{emoji} **{_fmt_occ(occ)} CLOSED** — {reason}\n"
             f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
             f"P&L: {pnl_pct_final:+.1%} "
             f"({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
@@ -1349,6 +1429,12 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     occ, strike, ask = select_contract(ticker, direction)
     global _last_order_ask
     _last_order_ask = ask
+    if occ:
+        post_to_discord(
+            "day-trade-signals",
+            f"📤 **Order placed — Buying {_fmt_occ(occ)} @ ~${ask:.2f}**\n"
+            f"Waiting on fill confirmation from the broker…",
+        )
     if not occ:
         post_to_discord(
             "day-trade-signals",
@@ -1372,7 +1458,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
             log.warning(f"ADOPTED orphan fill {_last_order_id} @ ${fill_price:.2f}")
         else:
             send_emergency_dm(
-                f"UNCONFIRMED ORDER — {ticker} {direction.upper()} {occ} "
+                f"UNCONFIRMED ORDER — {_fmt_occ(occ)} ({occ}) "
                 f"order ID {_last_order_id} status={_st}. CHECK BROKER NOW — "
                 f"a fill here is NOT tracked and has NO stop loss."
             )
@@ -1391,8 +1477,8 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         else:
             post_to_discord(
                 "day-trade-signals",
-                f"⚠️ Order placed for **{ticker}** but fill not confirmed within 60s. "
-                f"No position recorded — check broker.",
+                f"⚠️ Order placed for **{_fmt_occ(occ)}** — fill NOT confirmed by the broker. "
+                f"No position recorded. Do not chase this one until a fill confirmation posts.",
             )
         return False
 
@@ -1415,8 +1501,8 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "day-trade-signals",
         f"@everyone\n\n"
         f"{arrow} **{ticker} {type_label}** [{tier}]\n\n"
-        f"**Contract:** `{occ}`\n"
-        f"**Entry:** ${fill_price:.2f}/share (${cost:.0f}/contract) @ {entry_time}\n"
+        f"**Contract:** {_fmt_occ(occ)}\n"
+        f"✅ **Fill confirmed:** ${fill_price:.2f}/share (${cost:.0f}/contract) @ {entry_time}\n"
         f"**Target:** ${target:.2f} (+40%)\n"
         f"**Stop:** ${stop:.2f} (-25%)\n\n"
         f"{setup}",
@@ -1683,6 +1769,27 @@ def _scheduler_loop():
                                         " - window opens 9:30 AM ET, alerts on confirmed setups only.")
                         else:
                             log.warning("Watchlist skipped - no level data for either ticker")
+                        try:
+                            _sb_lines = []
+                            for _t in ["NVDA", "TSLA"]:
+                                _c_occ, _cs, _ca = select_contract(_t, "call")
+                                _p_occ, _ps, _pa = select_contract(_t, "put")
+                                if _c_occ or _p_occ:
+                                    _parts = []
+                                    if _c_occ:
+                                        _parts.append(f"📈 breakout → **{_fmt_occ(_c_occ)}** (~${_ca:.2f})")
+                                    if _p_occ:
+                                        _parts.append(f"📉 breakdown → **{_fmt_occ(_p_occ)}** (~${_pa:.2f})")
+                                    _sb_lines.append(f"**{_t}:** " + "  |  ".join(_parts))
+                            if _sb_lines:
+                                post_to_discord(
+                                    "daily-watchlist",
+                                    "🎯 **Contracts on standby — have these loaded, enter ONLY when the entry signal fires:**\n"
+                                    + "\n".join(_sb_lines)
+                                    + "\n_Premiums move by the open — the entry signal names the final contract and price._",
+                                )
+                        except Exception as _sb_e:
+                            log.warning(f"standby contracts post failed: {_sb_e}")
                         last_watchlist_date = today_s
                         _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
                     except Exception as e:
@@ -1719,6 +1826,8 @@ def _scheduler_loop():
                             candle = _ingest_new_bars(ticker, levels.get("pmh"), levels.get("pml"))
                             if not candle:
                                 continue
+                            if time_module.time() - _boot_ts < 120:
+                                continue  # boot grace: ingest yes, entries no
                             if not all_gates_pass(ticker, signal_type="entry"):
                                 continue
                             alert_data = {
@@ -2103,6 +2212,25 @@ def structure_test():
                         "context": _structure_context(tk, lv.get("pmh"), lv.get("pml"))}), 200
     except Exception as e:
         return jsonify({"err": str(e)}), 500
+
+@app.route("/fill-test", methods=["GET"])
+def fill_test():
+    """Runs the live fill reader against REAL past order IDs from this account.
+    Default IDs = the nine July 23 fills. Read-only; places nothing."""
+    default_ids = ("486657096,486664254,486671221,486671958,486701499,"
+                   "486710469,486726217,486731376,486770060")
+    ids = [i.strip() for i in request.args.get("ids", default_ids).split(",") if i.strip()]
+    rows, ok = [], 0
+    for oid in ids[:20]:
+        status, fill = _tt_order_status(oid)
+        good = (status == "filled" and fill is not None)
+        ok += 1 if good else 0
+        rows.append({"order_id": oid, "status": status,
+                     "fill_price": fill, "pass": good})
+    return jsonify({"tested": len(rows), "passed": ok,
+                    "verdict": "CERTIFIED" if ok == len(rows) else "FAILING",
+                    "rows": rows}), 200
+
 
 @app.route("/replay-test", methods=["GET"])
 def replay_test():
