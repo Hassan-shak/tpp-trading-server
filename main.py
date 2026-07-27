@@ -99,6 +99,7 @@ import uuid as _uuid
 import fcntl as _fcntl
 
 _BOOT_ID        = _uuid.uuid4().hex[:6]
+_IMPORT_PID     = os.getpid()
 _BOOT_TIME_ET   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 _SCHED_LOCKFILE = "/tmp/tpp_scheduler.lock"
 _HEARTBEAT_FILE = "/tmp/tpp_heartbeat.json"
@@ -243,10 +244,24 @@ def load_state() -> dict:
     return _state
 
 
+_state_lock = threading.RLock()
+
+
 def _commit(s: dict):
     global _state
-    _state = s
-    _save_state(s)
+    with _state_lock:
+        _state = s
+        _save_state(s)
+
+
+def _locked_update(mutator):
+    """Atomically load -> mutate -> commit under the state lock."""
+    with _state_lock:
+        s = load_state()
+        mutator(s)
+        _state_locked_commit = s
+        _commit(s)
+        return s
 
 
 def get_trade_count() -> int:
@@ -262,22 +277,26 @@ def is_max_trades_reached() -> bool:
     return load_state()["trade_count"] >= 2
 
 def increment_trade_count():
-    s = load_state()
-    s["trade_count"] += 1
-    log.info(f"Trade count → {s['trade_count']}")
-    _commit(s)
+    with _state_lock:
+        s = load_state()
+        s["trade_count"] += 1
+        log.info(f"Trade count → {s['trade_count']}")
+        _commit(s)
 
 def set_open_position(position: dict):
-    s = load_state()
-    s["open_position"] = position
-    _commit(s)
+    with _state_lock:
+        s = load_state()
+        s["open_position"] = position
+        _commit(s)
 
 def clear_open_position():
-    s = load_state()
-    s["open_position"] = None
-    _commit(s)
+    with _state_lock:
+        s = load_state()
+        s["open_position"] = None
+        _commit(s)
 
 def record_trade_result(win: bool):
+  with _state_lock:
     s = load_state()
     if win:
         s["consecutive_losses"] = 0
@@ -349,6 +368,11 @@ def send_emergency_dm(message: str):
     )
     if dm.status_code not in (200, 201):
         log.error(f"DM channel creation failed: {dm.text}")
+        try:
+            post_to_discord("daily-watchlist",
+                            "🚨 **SYSTEM ALERT (DM delivery failed)** — " + message)
+        except Exception:
+            pass
         return
     requests.post(
         f"{DISCORD_API}/channels/{dm.json()['id']}/messages",
@@ -900,17 +924,15 @@ def enter_trade(occ_symbol: str, qty: int = 1) -> float | None:
 def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1) -> str | None:
     sp       = _stop_pct()
     trigger  = round(fill_price * (1 - sp), 2)
-    limit    = round(fill_price * (1 - sp - 0.05), 2)
     order_id = _tt_place_order({
         "time-in-force": "Day",
-        "order-type":    "Stop Limit",
+        "order-type":    "Stop",
         "stop-trigger":  str(trigger),
-        "price":         str(limit),
         "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
                   "quantity": qty, "action": "Sell to Close"}],
     })
     if order_id:
-        log.info(f"Stop-limit: trigger=${trigger} limit=${limit} → {order_id}")
+        log.info(f"Stop-market: trigger=${trigger} → {order_id}")
     else:
         log.critical(f"STOP LOSS FAILED for {occ_symbol} — MANUAL INTERVENTION NEEDED")
     return order_id
@@ -922,6 +944,7 @@ def close_position_tt(occ_symbol: str, reason: str, current_bid: float, qty: int
         "time-in-force": "Day",
         "order-type":    "Limit",
         "price":         str(round(current_bid, 2)),
+        "price-effect":  "Credit",
         "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
                   "quantity": qty, "action": "Sell to Close"}],
     })
@@ -936,8 +959,24 @@ def close_position_tt(occ_symbol: str, reason: str, current_bid: float, qty: int
             "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
                       "quantity": qty, "action": "Sell to Close"}],
         })
-        fill = _tt_poll_fill(mkt_id, FILL_TIMEOUT) if mkt_id else current_bid
-    return fill or current_bid
+        fill = _tt_poll_fill(mkt_id, FILL_TIMEOUT) if mkt_id else None
+    if fill:
+        return fill
+    # No confirmed fill. Ask the broker whether we are actually flat before
+    # declaring ANY outcome — a fabricated exit price detaches state from
+    # reality (the phantom-exit bug class).
+    try:
+        still_open = any(str(p.get("symbol", "")).replace(" ", "") == occ_symbol.replace(" ", "")
+                         and float(p.get("quantity") or 0) > 0
+                         for p in _tt_open_option_positions())
+    except Exception:
+        still_open = True   # cannot verify -> assume open, never fake an exit
+    if still_open:
+        log.critical(f"CLOSE FAILED for {occ_symbol} — position still open at broker")
+        send_emergency_dm(f"CLOSE FAILED — {occ_symbol} still open at broker. Will retry next tick.")
+        return None
+    log.warning(f"Close fill unconfirmed but broker shows flat — using ${current_bid:.2f} approx")
+    return current_bid
 
 
 def cancel_resting_stop(stop_order_id: str | None):
@@ -983,7 +1022,12 @@ def monitor_open_position():
     if now.time() >= dtime(15, 45):
         reason = "EOD FLATTEN 3:45 ET (no overnight holds)"
 
-    # 1. Profit target +40%
+    # 1. HARD STOP — software enforcement of the max loss, independent of the
+    #    resting broker stop (covers rejected stops and gaps through the trigger)
+    elif pnl_pct <= -_stop_pct():
+        reason = f"HARD STOP {-_stop_pct():+.0%} (software)"
+
+    # 2. Profit target +40%
     elif pnl_pct >= 0.40:
         reason = "PROFIT TARGET +40%"
 
@@ -994,13 +1038,20 @@ def monitor_open_position():
     # 3. 10-min chop circuit
     else:
         mins_in = (now - entry_time).total_seconds() / 60
-        if mins_in >= 10 and abs(pnl_pct) < 0.05 and pnl_pct <= -0.15:
-            reason = "CHOP CIRCUIT -15%"
+        if mins_in >= 10 and (abs(pnl_pct) < 0.05 or pnl_pct <= -0.15):
+            reason = "CHOP CIRCUIT (stagnant or -15%)"
 
     if reason:
         _q            = int(pos.get("qty") or 1)
-        exit_price    = close_position_tt(occ, reason, current_bid, _q)
         cancel_resting_stop(pos.get("stop_order_id"))
+        exit_price    = close_position_tt(occ, reason, current_bid, _q)
+        if exit_price is None:
+            # Close did not go through — position stays tracked; re-arm a stop
+            # so we are never unprotected while retrying, and try again next tick.
+            if pos.get("stop_order_id"):
+                pos["stop_order_id"] = place_stop_loss(occ, fill_price, _q)
+                set_open_position(pos)
+            return
         pnl_dollar    = (exit_price - fill_price) * 100 * _q
         pnl_pct_final = (exit_price - fill_price) / fill_price
         emoji         = "✅" if exit_price > fill_price else "❌"
@@ -1654,10 +1705,43 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     log.info(f"FILLED: {occ} @ ${fill_price:.2f}/share")
 
     stop_order_id = place_stop_loss(occ, fill_price, qty)
-    if not stop_order_id:
+    stop_verified = False
+    if stop_order_id:
+        try:
+            _sst, _ = _tt_order_status(stop_order_id)
+            stop_verified = str(_sst).lower() not in ("rejected", "cancelled", "canceled", "expired", "error", "unknown")
+        except Exception:
+            stop_verified = True   # order id exists; verification glitch is not a reason to flatten
+    if not stop_verified:
+        # No confirmed protection at the broker -> we do not hold the position. Period.
         send_emergency_dm(
-            f"STOP LOSS FAILED — {occ} filled @ ${fill_price:.2f} — SET MANUALLY NOW"
+            f"STOP FAILED — {occ} filled @ ${fill_price:.2f} x{qty} — AUTO-FLATTENING NOW "
+            f"({_last_order_error or 'stop order not working at broker'})"
         )
+        _q2 = _live_option_quote(occ) or {}
+        _bid2 = float(_q2.get("bid") or 0) or round(fill_price * 0.98, 2)
+        _exit = close_position_tt(occ, "STOP PLACEMENT FAILED — auto-flatten (no unprotected positions)", _bid2, qty)
+        if _exit is None:
+            send_emergency_dm(f"EMERGENCY: {occ} has NO STOP and auto-flatten FAILED — CLOSE MANUALLY NOW")
+            post_to_discord("day-trade-signals",
+                            f"⚠️ **{_fmt_occ(occ)}** entry filled but protective orders are failing at the broker — "
+                            f"manual intervention in progress. Do not follow this entry.")
+            set_open_position({"ticker": ticker, "direction": direction, "occ_symbol": occ,
+                               "qty": qty, "fill_price": fill_price, "stop_order_id": None,
+                               "target_price": round(fill_price * 1.40, 2), "peak_pnl": 0.0,
+                               "entry_time": datetime.now(ET).isoformat()})
+            return True
+        _pnl_d = round((_exit - fill_price) * 100 * qty, 2)
+        clear_open_position()
+        post_to_discord(
+            "day-trade-signals",
+            f"⚠️ **{ticker} {('CALL' if direction == 'call' else 'PUT')} — entry filled @ ${fill_price:.2f} x{qty}, "
+            f"but the stop-loss order was rejected by the broker.**\n"
+            f"Safety rule: no position is ever held without a working stop — closed immediately @ ${_exit:.2f} "
+            f"({'+' if _pnl_d >= 0 else ''}${abs(_pnl_d):.0f}). Investigating the rejection; standing down on this signal.",
+        )
+        log.critical(f"STOP-FAIL AUTO-FLATTEN complete for {occ}: entry ${fill_price:.2f} exit ${_exit:.2f}")
+        return True
 
     arrow      = "🟢" if direction == "call" else "🔴"
     type_label = "CALL" if direction == "call" else "PUT"
@@ -1674,7 +1758,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"**Contract:** {_fmt_occ(occ)}\n"
         f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
         f"**Target:** ${target:.2f} (+40%)\n"
-        f"**Stop:** ${stop:.2f} ({stop_lbl})\n\n"
+        f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n\n"
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
@@ -1874,6 +1958,18 @@ def _scheduler_loop():
             today   = now.date()
             today_s = today.isoformat()
             t       = now.time()
+
+            # v11.3 INGEST-FIRST: keep session structure fresh before anything
+            # else in this tick can slow down or fail. Nothing may starve the
+            # scanner's memory again.
+            if (today.weekday() < 5 and today not in MARKET_HOLIDAYS_2026
+                    and (9, 25) <= (now.hour, now.minute) <= (15, 50)):
+                for _tk in ("NVDA", "TSLA"):
+                    try:
+                        _lv = get_key_levels(_tk)
+                        _ingest_new_bars(_tk, _lv.get("pmh"), _lv.get("pml"))
+                    except Exception as _ie:
+                        log.warning(f"ingest-first {_tk}: {_ie}")
 
             # Skip everything on weekends and holidays
             is_trading_day = (
@@ -2154,8 +2250,10 @@ def flatten():
     quote      = _live_option_quote(occ)
     bid        = float(quote.get("bid", fill_price * 0.90)) if quote else fill_price * 0.90
 
-    exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid, int(pos.get("qty") or 1))
     cancel_resting_stop(pos.get("stop_order_id"))
+    exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid, int(pos.get("qty") or 1))
+    if exit_price is None:
+        return jsonify({"status": "close_failed", "detail": "position still open at broker — retry"}), 502
 
     pnl_pct    = (exit_price - fill_price) / fill_price
     pnl_dollar = (exit_price - fill_price) * 100
@@ -2543,11 +2641,41 @@ def root():
 # ══════════════════════════════════════════════════════════════════════════════
 #  STARTUP
 # ══════════════════════════════════════════════════════════════════════════════
-load_state()
-_hydrate_structure()
-_adopt_broker_positions()
-_ensure_scheduler()
+_boot_done = False
+_boot_guard = threading.Lock()
+
+
+def _boot_in_worker():
+    """v11.2: ALL boot work happens here, in the process that serves HTTP —
+    never at module import. This makes the app immune to gunicorn preload /
+    fork topology: master imports nothing but definitions; the worker that
+    answers requests is the same process that runs the scheduler, owns the
+    structure, and holds the state. Called from gunicorn.conf.py
+    post_worker_init, from Flask's first request as a fallback, and from
+    __main__ for direct runs."""
+    global _boot_done, _BOOT_ID
+    with _boot_guard:
+        if _boot_done:
+            return
+        _boot_done = True
+    if os.getpid() != _IMPORT_PID:
+        # We are a forked child of a preloading master — mint our own identity
+        _BOOT_ID = _uuid.uuid4().hex[:6]
+    log.info(f"[{_BOOT_ID}] worker boot (pid {os.getpid()}, import pid {_IMPORT_PID}) — "
+             "state/structure/adoption/scheduler starting IN THIS PROCESS")
+    load_state()
+    _hydrate_structure()
+    _adopt_broker_positions()
+    _ensure_scheduler()
+
+
+@app.before_request
+def _boot_fallback():
+    if not _boot_done:
+        _boot_in_worker()
+
 
 if __name__ == "__main__":
+    _boot_in_worker()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
