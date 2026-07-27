@@ -31,6 +31,7 @@ import time as time_module
 import threading
 from datetime import datetime, date, timedelta, timezone
 import pytz
+import re
 import requests
 import anthropic as anthropic_sdk
 from flask import Flask, request, jsonify
@@ -92,6 +93,103 @@ FOMC_DECISION_DAYS_2026 = {
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
+
+# ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
+import uuid as _uuid
+import fcntl as _fcntl
+
+_BOOT_ID        = _uuid.uuid4().hex[:6]
+_BOOT_TIME_ET   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+_SCHED_LOCKFILE = "/tmp/tpp_scheduler.lock"
+_HEARTBEAT_FILE = "/tmp/tpp_heartbeat.json"
+_sched_lock_fd  = None   # held forever by the elected scheduler process
+
+
+def _try_acquire_scheduler_lock() -> bool:
+    """Cross-process election: only ONE process in this container may run the
+    scheduler, no matter how many gunicorn workers exist. The flock is held
+    for the life of the winning process and dies with it."""
+    global _sched_lock_fd
+    try:
+        fd = open(_SCHED_LOCKFILE, "w")
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        fd.write(f"{os.getpid()} {_BOOT_ID}\n")
+        fd.flush()
+        _sched_lock_fd = fd   # keep the fd (and the lock) alive forever
+        return True
+    except OSError:
+        return False
+
+
+def _beat_heartbeat():
+    try:
+        with open(_HEARTBEAT_FILE, "w") as f:
+            json.dump({"ts": time_module.time(), "boot_id": _BOOT_ID,
+                       "pid": os.getpid()}, f)
+    except Exception:
+        pass
+
+
+def _read_heartbeat() -> dict | None:
+    try:
+        with open(_HEARTBEAT_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ── v11.1: POSITION SIZING + RISK MODES (was: quantity hardcoded to 1) ────────
+# high_vol : 10% of net-liq per trade, 25% max stop  (~2.5% acct risk)
+# normal   : 20% of net-liq per trade, 20% max stop  (~4.0% acct risk)
+RISK_MODES = {
+    "high_vol": {"alloc": 0.10, "stop": 0.25},
+    "normal":   {"alloc": 0.20, "stop": 0.20},
+}
+RISK_MODE      = os.environ.get("RISK_MODE", "high_vol").strip().lower()
+NO_TRADE_DATES = {d.strip() for d in
+                  os.environ.get("NO_TRADE_DATES", "2026-07-29").split(",") if d.strip()}
+MAX_CONTRACTS  = int(os.environ.get("MAX_CONTRACTS", "10"))
+
+
+def _risk() -> dict:
+    return RISK_MODES.get(RISK_MODE, RISK_MODES["high_vol"])
+
+
+def _stop_pct() -> float:
+    return _risk()["stop"]
+
+
+def _no_trade_today() -> bool:
+    return datetime.now(ET).date().isoformat() in NO_TRADE_DATES
+
+
+def _account_net_liq() -> float | None:
+    try:
+        r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/balances",
+                         headers=_tt_headers(), timeout=6)
+        if r.status_code != 200:
+            return None
+        nl = float(r.json().get("data", {}).get("net-liquidating-value") or 0)
+        return nl if nl > 0 else None
+    except Exception as e:
+        log.warning(f"net-liq fetch failed: {e}")
+        return None
+
+
+def _position_size(premium: float) -> int:
+    """Contracts = (net_liq * alloc%) / (premium * 100), min 1, capped.
+    If the balance can't be read, fail safe to 1 contract."""
+    if premium <= 0:
+        return 1
+    nl = _account_net_liq()
+    if not nl:
+        log.warning("Sizing: net-liq unavailable — defaulting to 1 contract")
+        return 1
+    qty = int((nl * _risk()["alloc"]) // (premium * 100))
+    qty = max(1, min(qty, MAX_CONTRACTS))
+    log.info(f"Sizing [{RISK_MODE}]: net_liq=${nl:.0f} alloc={_risk()['alloc']:.0%} "
+             f"premium=${premium:.2f} -> {qty} contract(s)")
+    return qty
 _state: dict = {}
 
 
@@ -220,10 +318,11 @@ def post_to_discord(channel: str, message: str) -> bool:
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
         "Content-Type":  "application/json",
     }
+    stamped = f"{message}\n-# ⚙️ {_BOOT_ID}"
     resp = requests.post(
         f"{DISCORD_API}/channels/{channel_id}/messages",
         headers=headers,
-        json={"content": message},
+        json={"content": stamped},
         timeout=10,
     )
     if resp.status_code in (200, 201):
@@ -377,6 +476,69 @@ def _tt_open_option_positions() -> list:
         return cached
 
 
+def _adopt_broker_positions():
+    """v11 boot step: the broker is ground truth. If the account holds an open
+    option position that this process's state doesn't know about (orphaned by a
+    restart/redeploy), adopt it so the monitor, trailing stop, and 3:45 flatten
+    reattach. Never again does a restart leave a live position unmanaged."""
+    try:
+        s = load_state()
+        if s.get("open_position"):
+            return
+        live = _tt_open_option_positions()
+        if not live:
+            return
+        if len(live) > 1:
+            log.critical(f"[{_BOOT_ID}] ADOPTION SKIPPED — broker shows "
+                         f"{len(live)} open option positions; manual review needed")
+            post_to_discord("daily-watchlist",
+                            "⚠️ System reattached after restart and found multiple "
+                            "open positions at the broker — holding off on automation, "
+                            "manual review in progress.")
+            return
+        item = live[0]
+        occ  = str(item.get("symbol", "")).strip()
+        qty  = float(item.get("quantity") or 0)
+        if qty <= 0 or not occ:
+            log.critical(f"[{_BOOT_ID}] ADOPTION SKIPPED — unsupported position "
+                         f"(qty={qty}, symbol={occ!r})")
+            return
+        # underlying ticker = leading alpha chars of the OCC symbol
+        und = re.match(r"[A-Z]+", occ.replace(" ", ""))
+        ticker = und.group(0) if und else "?"
+        basis = float(item.get("average-open-price") or 0)
+        if basis <= 0:
+            q = _live_option_quote(occ)
+            basis = float((q or {}).get("bid") or 0) or 0.01
+        direction = "short" if ("P" in occ.replace(" ", "")[-9:]) else "long"
+        set_open_position({
+            "ticker":        ticker,
+            "direction":     direction,
+            "occ_symbol":    occ,
+            "qty":           int(qty),
+            "fill_price":    basis,
+            "stop_order_id": None,          # software-managed exits only
+            "target_price":  round(basis * 1.40, 2),
+            "peak_pnl":      0.0,
+            "entry_time":    datetime.now(ET).isoformat(),
+            "adopted":       True,
+        })
+        log.critical(f"[{_BOOT_ID}] ADOPTED broker position {occ} basis ${basis:.2f} "
+                     "— monitor/trailing/3:45 flatten reattached")
+        post_to_discord("daily-watchlist",
+                        f"♻️ Reattached to open position **{_fmt_occ(occ)}** after a "
+                        f"restart — managing per playbook (target +40%, trailing stop, "
+                        f"3:45 ET flatten).")
+    except Exception as e:
+        log.critical(f"[{_BOOT_ID}] Position adoption failed: {e}")
+
+
+def _gate_no_trade_date(signal_type: str) -> tuple[bool, str]:
+    if signal_type == "entry" and _no_trade_today():
+        return False, f"no-trade date (FOMC/high-risk day) — entries disabled"
+    return True, "clear"
+
+
 def _gate_broker_flat(signal_type: str) -> tuple[bool, str]:
     """Entries require the BROKER to show no open option positions — state files
     can lie (orphans), the broker cannot. Kills stacking permanently, including
@@ -396,6 +558,7 @@ def all_gates_pass(ticker: str, signal_type: str = "entry") -> bool:
         ("window",          _gate_window),
         ("ticker",          lambda: _gate_ticker(ticker)),
         ("earnings",        lambda: _gate_earnings(ticker)),
+        ("no_trade_date",   lambda: _gate_no_trade_date(signal_type)),
         ("blackout",        _gate_blackout),
         ("broker_flat",     lambda: _gate_broker_flat(signal_type)),
         ("circuit_breaker", _gate_circuit_breaker),
@@ -724,26 +887,27 @@ def _tt_cancel_order(order_id: str):
     log.info(f"Cancelled order {order_id}")
 
 
-def enter_trade(occ_symbol: str) -> float | None:
+def enter_trade(occ_symbol: str, qty: int = 1) -> float | None:
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Market",
         "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
-                  "quantity": 1, "action": "Buy to Open"}],
+                  "quantity": qty, "action": "Buy to Open"}],
     })
     return _tt_poll_fill(order_id, FILL_TIMEOUT) if order_id else None
 
 
-def place_stop_loss(occ_symbol: str, fill_price: float) -> str | None:
-    trigger  = round(fill_price * 0.75, 2)
-    limit    = round(fill_price * 0.70, 2)
+def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1) -> str | None:
+    sp       = _stop_pct()
+    trigger  = round(fill_price * (1 - sp), 2)
+    limit    = round(fill_price * (1 - sp - 0.05), 2)
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Stop Limit",
         "stop-trigger":  str(trigger),
         "price":         str(limit),
         "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
-                  "quantity": 1, "action": "Sell to Close"}],
+                  "quantity": qty, "action": "Sell to Close"}],
     })
     if order_id:
         log.info(f"Stop-limit: trigger=${trigger} limit=${limit} → {order_id}")
@@ -752,14 +916,14 @@ def place_stop_loss(occ_symbol: str, fill_price: float) -> str | None:
     return order_id
 
 
-def close_position_tt(occ_symbol: str, reason: str, current_bid: float) -> float:
+def close_position_tt(occ_symbol: str, reason: str, current_bid: float, qty: int = 1) -> float:
     log.info(f"Closing {occ_symbol} — {reason}")
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Limit",
         "price":         str(round(current_bid, 2)),
         "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
-                  "quantity": 1, "action": "Sell to Close"}],
+                  "quantity": qty, "action": "Sell to Close"}],
     })
     fill = _tt_poll_fill(order_id, CLOSE_TIMEOUT) if order_id else None
     if not fill:
@@ -770,7 +934,7 @@ def close_position_tt(occ_symbol: str, reason: str, current_bid: float) -> float
             "time-in-force": "Day",
             "order-type":    "Market",
             "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
-                      "quantity": 1, "action": "Sell to Close"}],
+                      "quantity": qty, "action": "Sell to Close"}],
         })
         fill = _tt_poll_fill(mkt_id, FILL_TIMEOUT) if mkt_id else current_bid
     return fill or current_bid
@@ -834,9 +998,10 @@ def monitor_open_position():
             reason = "CHOP CIRCUIT -15%"
 
     if reason:
-        exit_price    = close_position_tt(occ, reason, current_bid)
+        _q            = int(pos.get("qty") or 1)
+        exit_price    = close_position_tt(occ, reason, current_bid, _q)
         cancel_resting_stop(pos.get("stop_order_id"))
-        pnl_dollar    = (exit_price - fill_price) * 100
+        pnl_dollar    = (exit_price - fill_price) * 100 * _q
         pnl_pct_final = (exit_price - fill_price) / fill_price
         emoji         = "✅" if exit_price > fill_price else "❌"
         close_time    = datetime.now(ET).strftime("%H:%M ET")
@@ -845,7 +1010,8 @@ def monitor_open_position():
             f"{emoji} **{_fmt_occ(occ)} CLOSED** — {reason}\n"
             f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
             f"P&L: {pnl_pct_final:+.1%} "
-            f"({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
+            f"({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f} total on "
+            f"{int(pos.get('qty') or 1)} contract(s))",
         )
         clear_open_position()
         record_trade_result(win=(exit_price > fill_price))
@@ -855,7 +1021,7 @@ def monitor_open_position():
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLAUDE BRAIN — v5.0 SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════════════
-_claude_client    = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+_claude_client    = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
 _claude_calls     = 0
 _claude_call_date = None
 
@@ -1449,7 +1615,10 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         )
         return False
 
-    fill_price = enter_trade(occ)
+    _entry_q = _live_option_quote(occ)
+    _entry_ask = float((_entry_q or {}).get("ask") or 0)
+    qty = _position_size(_entry_ask)
+    fill_price = enter_trade(occ, qty)
     if not fill_price and _last_order_id and not _last_order_error:
         # Order reached the broker but confirmation failed — never walk away.
         _st, _fp = _tt_order_status(_last_order_id)
@@ -1484,7 +1653,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     log.info(f"FILLED: {occ} @ ${fill_price:.2f}/share")
 
-    stop_order_id = place_stop_loss(occ, fill_price)
+    stop_order_id = place_stop_loss(occ, fill_price, qty)
     if not stop_order_id:
         send_emergency_dm(
             f"STOP LOSS FAILED — {occ} filled @ ${fill_price:.2f} — SET MANUALLY NOW"
@@ -1493,8 +1662,9 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     arrow      = "🟢" if direction == "call" else "🔴"
     type_label = "CALL" if direction == "call" else "PUT"
     target     = round(fill_price * 1.40, 2)
-    stop       = round(fill_price * 0.75, 2)
-    cost       = round(fill_price * 100,  2)
+    stop       = round(fill_price * (1 - _stop_pct()), 2)
+    cost       = round(fill_price * 100 * qty,  2)
+    stop_lbl   = f"-{int(_stop_pct()*100)}%"
     entry_time = datetime.now(ET).strftime("%H:%M ET")
 
     post_to_discord(
@@ -1502,9 +1672,9 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"@everyone\n\n"
         f"{arrow} **{ticker} {type_label}** [{tier}]\n\n"
         f"**Contract:** {_fmt_occ(occ)}\n"
-        f"✅ **Fill confirmed:** ${fill_price:.2f}/share (${cost:.0f}/contract) @ {entry_time}\n"
+        f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
         f"**Target:** ${target:.2f} (+40%)\n"
-        f"**Stop:** ${stop:.2f} (-25%)\n\n"
+        f"**Stop:** ${stop:.2f} ({stop_lbl})\n\n"
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
@@ -1512,13 +1682,14 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "daily-watchlist",
         f"📚 **Setup breakdown — {ticker} {type_label}** [{tier}]\n"
         + (setup if setup else "Level-break setup confirmed.")
-        + f"\nEntry ${fill_price:.2f} | Target ${target:.2f} (+40%) | Stop ${stop:.2f} (-25%)",
+        + f"\nEntry ${fill_price:.2f} x{qty} | Target ${target:.2f} (+40%) | Stop ${stop:.2f} ({stop_lbl})",
     )
 
     set_open_position({
         "ticker":        ticker,
         "direction":     direction,
         "occ_symbol":    occ,
+        "qty":           qty,
         "fill_price":    fill_price,
         "stop_order_id": stop_order_id,
         "target_price":  round(fill_price * 1.40, 2),
@@ -1683,7 +1854,7 @@ def _post_scanning_update(label: str, closing: str):
             "End with exactly this line: " + closing + "\n"
             "LIVE DATA:\n" + "\n".join(rows)
         )
-        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
         _rp = _cl.messages.create(model=CLAUDE_MODEL, max_tokens=400, messages=[{"role": "user", "content": _pr}])
         post_to_discord("daily-watchlist", _rp.content[0].text.strip())
     except Exception as _e:
@@ -1698,6 +1869,7 @@ def _scheduler_loop():
 
     while True:
         try:
+            _beat_heartbeat()
             now     = datetime.now(ET)
             today   = now.date()
             today_s = today.isoformat()
@@ -1713,7 +1885,22 @@ def _scheduler_loop():
 
                 # ── Watchlist 9:15 AM ─────────────────────────────────────
                 from datetime import time as dtime
-                if dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s:
+                if (dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s
+                        and _no_trade_today()):
+                    log.info("JOB: no-trade day notice (FOMC/high-risk)")
+                    post_to_discord(
+                        "daily-watchlist",
+                        "@everyone 🛑 **No trades today — FOMC day.**\n"
+                        "Fed rate decision at 2:00 PM ET with the press conference at 2:30 "
+                        "means whipsaw risk all session, and our edge is the opening-range "
+                        "playbook — not Fed roulette. Capital protection IS a position. "
+                        "Back at it tomorrow with the same rules.",
+                    )
+                    last_watchlist_date = today_s
+                    _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
+
+                if (dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s
+                        and not _no_trade_today()):
                     log.info("JOB: daily watchlist")
                     try:
                         rows = []
@@ -1752,7 +1939,7 @@ def _scheduler_loop():
                                 "DATA:\n" + "\n".join(data_lines)
                             )
                             try:
-                                _wl_client = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+                                _wl_client = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
                                 _wl_resp = _wl_client.messages.create(
                                     model=CLAUDE_MODEL, max_tokens=600,
                                     messages=[{"role": "user", "content": wl_prompt}],
@@ -1796,7 +1983,8 @@ def _scheduler_loop():
                         log.error(f"Watchlist job error: {e}")
 
                 # ── 9:45 AM status update ─────────────────────────────────
-                if dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s:
+                if (dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s
+                        and not _no_trade_today()):
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
                         _post_scanning_update("9:45 AM", "No forced trades — entries hit #day-trade-signals only on confirmed setups.")
@@ -1807,7 +1995,8 @@ def _scheduler_loop():
                     _sp = load_state(); _sp["last_945_date"] = today_s; _commit(_sp)
 
                 # ── 10:15 AM status update ────────────────────────────────
-                if dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today_s:
+                if (dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today_s
+                        and not _no_trade_today()):
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
                         _post_scanning_update("10:15 AM — final stretch", "Window closes 10:30 — if nothing sets up we sit out. No forced trades.")
@@ -1869,11 +2058,16 @@ def _scheduler_loop():
 def _ensure_scheduler():
     global _scheduler_started
     with _scheduler_lock:
-        if not _scheduler_started:
-            _scheduler_started = True
-            t = threading.Thread(target=_scheduler_loop, daemon=True)
-            t.start()
-            log.info("Scheduler started — all jobs registered")
+        if _scheduler_started:
+            return
+        if not _try_acquire_scheduler_lock():
+            log.warning(f"[{_BOOT_ID}] Scheduler election LOST — another process "
+                        "holds the lock; this worker serves HTTP only")
+            return
+        _scheduler_started = True
+        t = threading.Thread(target=_scheduler_loop, daemon=True)
+        t.start()
+        log.info(f"[{_BOOT_ID}] Scheduler election WON (pid {os.getpid()}) — loop started")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1960,7 +2154,7 @@ def flatten():
     quote      = _live_option_quote(occ)
     bid        = float(quote.get("bid", fill_price * 0.90)) if quote else fill_price * 0.90
 
-    exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid)
+    exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid, int(pos.get("qty") or 1))
     cancel_resting_stop(pos.get("stop_order_id"))
 
     pnl_pct    = (exit_price - fill_price) / fill_price
@@ -2004,9 +2198,21 @@ def status():
     s   = load_state()
     now = datetime.now(ET)
     pos = s.get("open_position")
+    hb = _read_heartbeat()
+    hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
     return jsonify({
         "status":             "online",
-        "version":            "v5.0",
+        "version":            "v11",
+        "boot_id":            _BOOT_ID,
+        "boot_time_et":       _BOOT_TIME_ET,
+        "serving_pid":        os.getpid(),
+        "scheduler_in_this_process": _sched_lock_fd is not None,
+        "heartbeat_boot_id":  hb.get("boot_id") if hb else None,
+        "heartbeat_age_s":    hb_age,
+        "risk_mode":          RISK_MODE,
+        "alloc_pct":          _risk()["alloc"],
+        "stop_pct":           _stop_pct(),
+        "no_trade_today":     _no_trade_today(),
         "time_et":            now.strftime("%Y-%m-%d %H:%M:%S ET"),
         "trade_count":        s["trade_count"],
         "circuit_breaker":    s["circuit_breaker"],
@@ -2063,7 +2269,7 @@ def wl_test():
             "3-4 sentences per ticker max. End with exactly one line: Window opens 9:30 AM ET - alerts fire on confirmed setups only.\n"
             "DATA:\n" + "\n".join(data_lines)
         )
-        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
         _rp = _cl.messages.create(model=CLAUDE_MODEL, max_tokens=600, messages=[{"role": "user", "content": _pr}])
         return jsonify({"ok": True, "rows": rows, "watchlist": _rp.content[0].text.strip()}), 200
     except Exception as e:
@@ -2339,6 +2545,7 @@ def root():
 # ══════════════════════════════════════════════════════════════════════════════
 load_state()
 _hydrate_structure()
+_adopt_broker_positions()
 _ensure_scheduler()
 
 if __name__ == "__main__":
