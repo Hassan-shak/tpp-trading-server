@@ -55,7 +55,9 @@ ET = pytz.timezone("America/New_York")
 TRADEABLE_TICKERS  = {"NVDA", "TSLA"}
 WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "")
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
-JUNIOR_USER_ID     = os.environ.get("JUNIOR_DISCORD_USER_ID", "")
+# Comma-separated list of Discord user IDs — every ID gets every alert/pre-flight DM
+JUNIOR_USER_IDS    = [u.strip() for u in
+                      os.environ.get("JUNIOR_DISCORD_USER_ID", "").split(",") if u.strip()]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 TT_BASE            = "https://api.tastytrade.com"
 TT_USER            = os.environ["TASTYTRADE_USERNAME"]
@@ -353,8 +355,8 @@ def post_to_discord(channel: str, message: str) -> bool:
     return False
 
 
-def send_emergency_dm(message: str):
-    if not JUNIOR_USER_ID:
+def send_emergency_dm(message: str, prefix: str = "🚨 **TPP ALERT** 🚨"):
+    if not JUNIOR_USER_IDS:
         log.warning("JUNIOR_DISCORD_USER_ID not set — cannot DM")
         try:
             post_to_discord("daily-watchlist",
@@ -366,27 +368,34 @@ def send_emergency_dm(message: str):
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
         "Content-Type":  "application/json",
     }
-    dm = requests.post(
-        f"{DISCORD_API}/users/@me/channels",
-        headers=headers,
-        json={"recipient_id": JUNIOR_USER_ID},
-        timeout=10,
-    )
-    if dm.status_code not in (200, 201):
-        log.error(f"DM channel creation failed: {dm.text}")
+    delivered = 0
+    for uid in JUNIOR_USER_IDS:
+        try:
+            dm = requests.post(
+                f"{DISCORD_API}/users/@me/channels",
+                headers=headers,
+                json={"recipient_id": uid},
+                timeout=10,
+            )
+            if dm.status_code not in (200, 201):
+                log.error(f"DM channel creation failed for {uid}: {dm.text}")
+                continue
+            requests.post(
+                f"{DISCORD_API}/channels/{dm.json()['id']}/messages",
+                headers=headers,
+                json={"content": f"{prefix}\n{message}"},
+                timeout=10,
+            )
+            delivered += 1
+        except Exception as e:
+            log.error(f"DM to {uid} failed: {e}")
+    if delivered == 0:
         try:
             post_to_discord("daily-watchlist",
                             "🚨 **SYSTEM ALERT (DM delivery failed)** — " + message)
         except Exception:
             pass
-        return
-    requests.post(
-        f"{DISCORD_API}/channels/{dm.json()['id']}/messages",
-        headers=headers,
-        json={"content": f"🚨 **TPP ALERT** 🚨\n{message}"},
-        timeout=10,
-    )
-    log.warning(f"Emergency DM sent: {message}")
+    log.warning(f"Emergency DM sent to {delivered}/{len(JUNIOR_USER_IDS)} recipient(s)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2051,6 +2060,48 @@ def _scheduler_loop():
 
             if is_trading_day:
 
+                # ── 9:00 AM self pre-flight — DM the vitals before the day ──
+                if (dtime(8, 55) <= t <= dtime(9, 14)
+                        and load_state().get("last_preflight_date") != today_s):
+                    with _state_lock:
+                        _sp = load_state(); _sp["last_preflight_date"] = today_s; _commit(_sp)
+                    log.info("JOB: 9:00 pre-flight self-check")
+                    lines, bad = [], False
+                    try:
+                        nl = _account_net_liq()
+                        if nl:
+                            lines.append(f"✅ Broker auth OK — Net Liq ${nl:,.2f}")
+                        else:
+                            lines.append("❌ Broker balance UNREADABLE — sizing will fail-safe to 1 contract")
+                            bad = True
+                    except Exception as e:
+                        lines.append(f"❌ Broker check failed: {e}"); bad = True
+                    try:
+                        _c = get_latest_1min_candle("TSLA")
+                        lines.append("✅ Market data flowing" if _c else "❌ Market data: no candle returned")
+                        bad = bad or not _c
+                    except Exception as e:
+                        lines.append(f"❌ Market data failed: {e}"); bad = True
+                    try:
+                        live_pos = _tt_open_option_positions()
+                        if live_pos:
+                            lines.append(f"⚠️ Broker shows {len(live_pos)} open position(s) pre-market — verify")
+                            bad = True
+                        else:
+                            lines.append("✅ Broker flat")
+                    except Exception as e:
+                        lines.append(f"❌ Position check failed: {e}"); bad = True
+                    _s0 = load_state()
+                    lines.append(f"{'🛑 FOMC/no-trade day — entries OFF' if _no_trade_today() else '✅ Trading day'}"
+                                 f" | mode {RISK_MODE} ({_risk()['alloc']:.0%}/trade, {_stop_pct():.0%} stop)")
+                    lines.append(f"✅ v{'11.6'} boot {_BOOT_ID} | trades {_s0.get('trade_count', 0)}/2 | "
+                                 f"circuit {'ON' if _s0.get('circuit_breaker') else 'off'}")
+                    send_emergency_dm(
+                        "\n".join(lines) + "\nWindow 9:30–10:30 ET. Watchlist posts 9:15.",
+                        prefix=("🚨 **TPP PRE-FLIGHT — ATTENTION NEEDED** 🚨" if bad
+                                else "✅ **TPP PRE-FLIGHT — ALL SYSTEMS GREEN**"),
+                    )
+
                 # ── Watchlist 9:15 AM ─────────────────────────────────────
                 from datetime import time as dtime
                 if (dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s
@@ -2372,7 +2423,7 @@ def status():
     hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
     return jsonify({
         "status":             "online",
-        "version":            "v11.5",
+        "version":            "v11.6",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
