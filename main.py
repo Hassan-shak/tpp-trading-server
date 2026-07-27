@@ -150,6 +150,7 @@ RISK_MODE      = os.environ.get("RISK_MODE", "high_vol").strip().lower()
 NO_TRADE_DATES = {d.strip() for d in
                   os.environ.get("NO_TRADE_DATES", "2026-07-29").split(",") if d.strip()}
 MAX_CONTRACTS  = int(os.environ.get("MAX_CONTRACTS", "10"))
+MAX_OTM_PCT    = float(os.environ.get("MAX_OTM_PCT", "0.06"))
 
 
 def _risk() -> dict:
@@ -355,6 +356,11 @@ def post_to_discord(channel: str, message: str) -> bool:
 def send_emergency_dm(message: str):
     if not JUNIOR_USER_ID:
         log.warning("JUNIOR_DISCORD_USER_ID not set — cannot DM")
+        try:
+            post_to_discord("daily-watchlist",
+                            "🚨 **SYSTEM ALERT (DM not configured)** — " + message)
+        except Exception:
+            pass
         return
     headers = {
         "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
@@ -541,7 +547,7 @@ def _adopt_broker_positions():
             "occ_symbol":    occ,
             "qty":           int(qty),
             "fill_price":    basis,
-            "stop_order_id": None,          # software-managed exits only
+            "stop_order_id": place_stop_loss(occ, basis, int(qty)),
             "target_price":  round(basis * 1.40, 2),
             "peak_pnl":      0.0,
             "entry_time":    datetime.now(ET).isoformat(),
@@ -751,6 +757,14 @@ def select_contract(ticker: str, direction: str) -> tuple:
     atm     = min(strikes, key=lambda s: abs(s - spot))
     ai      = strikes.index(atm)
     ordered = strikes[ai:] if direction == "call" else list(reversed(strikes[:ai + 1]))
+
+    # v11.4: risk-budget-first selection. Per-contract budget = this trade's
+    # dollar allocation; take the CLOSEST strike we can afford within
+    # MAX_OTM_PCT of spot. Higher delta, same dollars at risk. The old
+    # premium band remains as a fallback so a small account still trades.
+    _nl = _account_net_liq()
+    budget_ask = (_nl * _risk()["alloc"] / 100.0) if _nl else None
+    quotes = []
     for strike in ordered:
         occ   = strike_map[strike]
         quote = _live_option_quote(occ)
@@ -760,14 +774,25 @@ def select_contract(ticker: str, direction: str) -> tuple:
         bid = float(quote.get("bid") or 0)
         if ask <= 0:
             continue
-        if ask < MIN_PREMIUM:
-            log.info(f"OTM walk stopped {strike} ask below min")
-            break
         spread = (ask - bid) / ask if ask else 1
+        quotes.append((strike, occ, ask, spread))
+        if ask < MIN_PREMIUM:
+            break   # far enough OTM that premiums died — stop pulling quotes
+
+    if budget_ask:
+        for strike, occ, ask, spread in quotes:
+            if spread >= MAX_SPREAD or ask < MIN_PREMIUM:
+                continue
+            if ask <= budget_ask and abs(strike - spot) / spot <= MAX_OTM_PCT:
+                log.info(f"Contract {occ} ask {ask} (budget-first, "
+                         f"{abs(strike - spot) / spot:.1%} OTM, budget ${budget_ask:.2f})")
+                return occ, strike, ask
+
+    for strike, occ, ask, spread in quotes:   # legacy premium-band fallback
         if spread >= MAX_SPREAD:
             continue
         if MIN_PREMIUM <= ask <= MAX_PREMIUM:
-            log.info(f"Contract {occ} ask {ask}")
+            log.info(f"Contract {occ} ask {ask} (premium-band fallback)")
             return occ, strike, ask
     log.warning(f"No contract in range for {ticker} {direction}")
     return None, None, None
@@ -1546,6 +1571,9 @@ OUTPUT CONTRACT (mandatory):
 ENTRY FRESHNESS RULE:
 - A break-based entry (Condition A, Condition C, Setup 1) is only valid if the triggering cross occurred within the LAST 5 candles, or price is retesting the broken level right now.
 - Do not chase an extended move: if the break happened earlier and price has already traveled far from the level and sits at/near session extremes, that is NO_TRADE unless a fresh Condition D reversal or a new break prints.
+
+REJECTION-THEN-RECLAIM GUARD:
+- If the SAME anchor recorded a rejection within the last 3 candles, do NOT approve an entry through that anchor off a single candle. Require the CURRENT candle AND the PRIOR candle to both close beyond the anchor before treating it as a confirmed break/reclaim. One-candle flips at a contested level are chop, not confirmation.
 """.strip()
 
 
@@ -2300,7 +2328,7 @@ def status():
     hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
     return jsonify({
         "status":             "online",
-        "version":            "v11",
+        "version":            "v11.4",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
