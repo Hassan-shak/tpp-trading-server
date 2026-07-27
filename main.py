@@ -1024,6 +1024,40 @@ def monitor_open_position():
     fill_price = float(pos["fill_price"])
     entry_time = datetime.fromisoformat(pos["entry_time"])
     peak_pnl   = float(pos.get("peak_pnl", 0.0))
+    _q         = int(pos.get("qty") or 1)
+
+    # v11.5: if the resting broker stop has FILLED, that IS the exit — tell
+    # members immediately, reconcile state, record the loss. Never let a
+    # stop fill pass silently.
+    _sid = pos.get("stop_order_id")
+    if _sid:
+        try:
+            _st, _sfill = _tt_order_status(_sid)
+        except Exception:
+            _st, _sfill = None, None
+        if str(_st).lower() == "filled":
+            exit_px = float(_sfill or fill_price * (1 - _stop_pct()))
+            pnl_d   = (exit_px - fill_price) * 100 * _q
+            pnl_p   = (exit_px - fill_price) / fill_price
+            post_to_discord(
+                "day-trade-signals",
+                f"🛑 **STOP HIT — {_fmt_occ(occ)}**\n"
+                f"The stop-loss triggered at the broker and the position is CLOSED "
+                f"@ ${exit_px:.2f} ({pnl_p:+.1%}). If you followed this trade, close your "
+                f"contracts NOW if you haven't already. Loss taken per the risk plan — "
+                f"that's the stop doing its job.",
+            )
+            post_to_discord(
+                "profits-and-recaps",
+                f"❌ **{_fmt_occ(occ)} CLOSED** — STOP LOSS (broker)\n"
+                f"Entry: ${fill_price:.2f} → Exit: ${exit_px:.2f} "
+                f"({datetime.now(ET).strftime('%H:%M ET')})\n"
+                f"P&L: {pnl_p:+.1%} ({'+' if pnl_d >= 0 else ''}${abs(pnl_d):.0f} total on {_q} contract(s))",
+            )
+            clear_open_position()
+            record_trade_result(win=(exit_px > fill_price))
+            log.info(f"Broker stop filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
+            return
 
     quote = _live_option_quote(occ)
     if not quote:
@@ -1067,7 +1101,17 @@ def monitor_open_position():
             reason = "CHOP CIRCUIT (stagnant or -15%)"
 
     if reason:
-        _q            = int(pos.get("qty") or 1)
+        _tag = ("🎯 TAKE PROFIT" if "PROFIT TARGET" in reason
+                else "🔒 LOCK IT IN" if "TRAILING" in reason
+                else "🛑 STOP" if "HARD STOP" in reason
+                else "⏰ CLOSING" )
+        post_to_discord(
+            "day-trade-signals",
+            f"{_tag} — **{_fmt_occ(occ)}**\n"
+            f"Close your contracts NOW — {reason}. "
+            f"Current bid ~${current_bid:.2f} ({pnl_pct:+.1%} from ${fill_price:.2f} entry). "
+            f"Exact fill posts in #profits-and-recaps in a moment.",
+        )
         cancel_resting_stop(pos.get("stop_order_id"))
         exit_price    = close_position_tt(occ, reason, current_bid, _q)
         if exit_price is None:
@@ -2328,7 +2372,7 @@ def status():
     hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
     return jsonify({
         "status":             "online",
-        "version":            "v11.4",
+        "version":            "v11.5",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
