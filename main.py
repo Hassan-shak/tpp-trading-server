@@ -2061,7 +2061,7 @@ def _scheduler_loop():
             if is_trading_day:
 
                 # ── 9:00 AM self pre-flight — DM the vitals before the day ──
-                if (dtime(8, 55) <= t <= dtime(9, 14)
+                if ((8, 55) <= (now.hour, now.minute) <= (9, 14)
                         and load_state().get("last_preflight_date") != today_s):
                     with _state_lock:
                         _sp = load_state(); _sp["last_preflight_date"] = today_s; _commit(_sp)
