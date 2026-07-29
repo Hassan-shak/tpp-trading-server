@@ -957,6 +957,20 @@ def enter_trade(occ_symbol: str, qty: int = 1) -> float | None:
     return _tt_poll_fill(order_id, FILL_TIMEOUT) if order_id else None
 
 
+def _tick(px: float, side: str = "nearest") -> float:
+    """Snap a price to Tastytrade's valid increment grid: $0.05 at/above $3.00,
+    $0.01 below. side='down' floors (use for sell limits so the price stays
+    marketable); 'up' ceils; default rounds to nearest."""
+    if px < 3.00:
+        return round(px, 2)
+    import math
+    if side == "down":
+        return round(math.floor(px / 0.05) * 0.05, 2)
+    if side == "up":
+        return round(math.ceil(px / 0.05) * 0.05, 2)
+    return round(round(px / 0.05) * 0.05, 2)
+
+
 def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
                       trigger_override: float | None = None) -> tuple[str | None, str | None]:
     """v11.7: rest BOTH exits at the broker as one OCO complex order —
@@ -964,8 +978,8 @@ def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
     filling cancels the other atomically at the broker. Returns
     (complex_order_id, None) on success, (None, None) on failure (caller
     falls back to plain stop + software target — the pre-v11.7 behavior)."""
-    target  = round(fill_price * 1.40, 2)
-    trigger = trigger_override if trigger_override else round(fill_price * (1 - _stop_pct()), 2)
+    target  = _tick(fill_price * 1.40)
+    trigger = _tick(trigger_override) if trigger_override else _tick(fill_price * (1 - _stop_pct()))
     payload = {
         "type": "OCO",
         "orders": [
@@ -1047,7 +1061,7 @@ def _complex_order_fill(complex_id: str) -> tuple[str | None, float | None]:
 def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1,
                     trigger_override: float | None = None) -> str | None:
     sp       = _stop_pct()
-    trigger  = trigger_override if trigger_override else round(fill_price * (1 - sp), 2)
+    trigger  = _tick(trigger_override) if trigger_override else _tick(fill_price * (1 - sp))
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Stop",
@@ -1067,7 +1081,7 @@ def close_position_tt(occ_symbol: str, reason: str, current_bid: float, qty: int
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Limit",
-        "price":         str(round(current_bid, 2)),
+        "price":         str(_tick(current_bid, side="down")),
         "price-effect":  "Credit",
         "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
                   "quantity": qty, "action": "Sell to Close"}],
@@ -1217,7 +1231,7 @@ def monitor_open_position():
     if peak_pnl >= 0.10:
         _floor_now = float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
         _peak_bid  = fill_price * (1 + peak_pnl)
-        _desired   = round(max(fill_price, _peak_bid * 0.80), 2)
+        _desired   = _tick(max(fill_price, _peak_bid * 0.80))
         if _desired >= _floor_now + 0.05:
             _new_oco = None
             if pos.get("oco_id"):
@@ -2618,8 +2632,8 @@ def oco_test():
     if not occ:
         return jsonify({"ok": False, "error": "no contract found"}), 200
     fill = float(ask or 1.00)
-    target  = round(fill * 1.40, 2)
-    trigger = round(fill * (1 - _stop_pct()), 2)
+    target  = _tick(fill * 1.40)
+    trigger = _tick(fill * (1 - _stop_pct()))
     payload = {
         "type": "OCO",
         "orders": [
