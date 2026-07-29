@@ -556,7 +556,9 @@ def _adopt_broker_positions():
             "occ_symbol":    occ,
             "qty":           int(qty),
             "fill_price":    basis,
-            "stop_order_id": place_stop_loss(occ, basis, int(qty)),
+            "oco_id":        (place_oco_bracket(occ, basis, int(qty))[0]),
+            "stop_order_id": None,
+            "floor_trigger": round(basis * (1 - _stop_pct()), 2),
             "target_price":  round(basis * 1.40, 2),
             "peak_pnl":      0.0,
             "entry_time":    datetime.now(ET).isoformat(),
@@ -955,9 +957,97 @@ def enter_trade(occ_symbol: str, qty: int = 1) -> float | None:
     return _tt_poll_fill(order_id, FILL_TIMEOUT) if order_id else None
 
 
-def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1) -> str | None:
+def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
+                      trigger_override: float | None = None) -> tuple[str | None, str | None]:
+    """v11.7: rest BOTH exits at the broker as one OCO complex order —
+    a limit sell at the +40% target and a stop-market underneath. Either leg
+    filling cancels the other atomically at the broker. Returns
+    (complex_order_id, None) on success, (None, None) on failure (caller
+    falls back to plain stop + software target — the pre-v11.7 behavior)."""
+    target  = round(fill_price * 1.40, 2)
+    trigger = trigger_override if trigger_override else round(fill_price * (1 - _stop_pct()), 2)
+    payload = {
+        "type": "OCO",
+        "orders": [
+            {
+                "time-in-force": "Day",
+                "order-type":    "Limit",
+                "price":         str(target),
+                "price-effect":  "Credit",
+                "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
+                          "quantity": qty, "action": "Sell to Close"}],
+            },
+            {
+                "time-in-force": "Day",
+                "order-type":    "Stop",
+                "stop-trigger":  str(trigger),
+                "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
+                          "quantity": qty, "action": "Sell to Close"}],
+            },
+        ],
+    }
+    try:
+        r = requests.post(f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders",
+                          headers=_tt_headers(), json=payload, timeout=10)
+        if r.status_code in (200, 201):
+            cid = str(r.json().get("data", {}).get("complex-order", {}).get("id")
+                      or r.json().get("data", {}).get("id") or "")
+            if cid:
+                log.info(f"OCO bracket placed: target ${target} / stop ${trigger} → complex {cid}")
+                return cid, None
+        log.error(f"OCO bracket rejected {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        log.error(f"OCO bracket failed: {e}")
+    return None, None
+
+
+def _cancel_complex_order(complex_id: str | None):
+    if not complex_id:
+        return
+    try:
+        requests.delete(f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders/{complex_id}",
+                        headers=_tt_headers(), timeout=10)
+        log.info(f"Complex order {complex_id} cancelled")
+    except Exception as e:
+        log.warning(f"Complex cancel {complex_id}: {e}")
+
+
+def _complex_order_fill(complex_id: str) -> tuple[str | None, float | None]:
+    """Inspect an OCO's legs. Returns ('target'|'stop', fill_price) if a leg
+    filled, else (None, None)."""
+    try:
+        r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders/{complex_id}",
+                         headers=_tt_headers(), timeout=8)
+        if r.status_code != 200:
+            return None, None
+        data = r.json().get("data", {})
+        orders = (data.get("complex-order", data) or {}).get("orders", []) or []
+        for o in orders:
+            if str(o.get("status", "")).lower() == "filled":
+                kind = "stop" if o.get("stop-trigger") else "target"
+                fills = []
+                for leg in o.get("legs", []) or []:
+                    for f in leg.get("fills", []) or []:
+                        try:
+                            fills.append((float(f.get("fill-price") or 0),
+                                          float(f.get("quantity") or 0)))
+                        except Exception:
+                            pass
+                if fills:
+                    tq = sum(q for _, q in fills) or 1
+                    px = sum(p * q for p, q in fills) / tq
+                else:
+                    px = None
+                return kind, px
+    except Exception as e:
+        log.warning(f"Complex status {complex_id}: {e}")
+    return None, None
+
+
+def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1,
+                    trigger_override: float | None = None) -> str | None:
     sp       = _stop_pct()
-    trigger  = round(fill_price * (1 - sp), 2)
+    trigger  = trigger_override if trigger_override else round(fill_price * (1 - sp), 2)
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Stop",
@@ -1038,6 +1128,44 @@ def monitor_open_position():
     # v11.5: if the resting broker stop has FILLED, that IS the exit — tell
     # members immediately, reconcile state, record the loss. Never let a
     # stop fill pass silently.
+    _oco = pos.get("oco_id")
+    if _oco:
+        _kind, _px = _complex_order_fill(_oco)
+        if _kind:
+            exit_px = float(_px or (fill_price * 1.40 if _kind == "target"
+                                    else float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))))
+            pnl_d = (exit_px - fill_price) * 100 * _q
+            pnl_p = (exit_px - fill_price) / fill_price
+            if _kind == "target":
+                head = f"🎯 **TARGET HIT — {_fmt_occ(occ)}**"
+                body = (f"The +40% profit target filled at the broker — position CLOSED "
+                        f"@ ${exit_px:.2f} ({pnl_p:+.1%}). If you followed this trade, "
+                        f"take your profit NOW if you haven't already. 📈")
+            elif exit_px > fill_price:
+                head = f"🔒 **TRAILING FLOOR HIT — {_fmt_occ(occ)}**"
+                body = (f"The ratcheted stop filled at the broker and LOCKED IN the gain — "
+                        f"position CLOSED @ ${exit_px:.2f} ({pnl_p:+.1%}). If you followed "
+                        f"this trade, close NOW if you haven't already.")
+            else:
+                head = f"🛑 **STOP HIT — {_fmt_occ(occ)}**"
+                body = (f"The stop-loss triggered at the broker and the position is CLOSED "
+                        f"@ ${exit_px:.2f} ({pnl_p:+.1%}). If you followed this trade, close "
+                        f"your contracts NOW if you haven't already. Loss taken per the risk "
+                        f"plan — that's the stop doing its job.")
+            post_to_discord("day-trade-signals", f"{head}\n{body}")
+            post_to_discord(
+                "profits-and-recaps",
+                f"{'✅' if exit_px > fill_price else '❌'} **{_fmt_occ(occ)} CLOSED** — "
+                f"{'TARGET' if _kind == 'target' else ('TRAILING FLOOR' if exit_px > fill_price else 'STOP LOSS')} (broker OCO)\n"
+                f"Entry: ${fill_price:.2f} → Exit: ${exit_px:.2f} "
+                f"({datetime.now(ET).strftime('%H:%M ET')})\n"
+                f"P&L: {pnl_p:+.1%} ({'+' if pnl_d >= 0 else ''}${abs(pnl_d):.0f} total on {_q} contract(s))",
+            )
+            clear_open_position()
+            record_trade_result(win=(exit_px > fill_price))
+            log.info(f"OCO {_kind} filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
+            return
+
     _sid = pos.get("stop_order_id")
     if _sid:
         try:
@@ -1084,6 +1212,57 @@ def monitor_open_position():
         pos["peak_pnl"] = peak_pnl
         set_open_position(pos)
 
+    # v11.7 RATCHET: once the trade is +10%, the resting broker floor climbs —
+    # first to breakeven, then behind the peak (80% of peak bid), never down.
+    if peak_pnl >= 0.10:
+        _floor_now = float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
+        _peak_bid  = fill_price * (1 + peak_pnl)
+        _desired   = round(max(fill_price, _peak_bid * 0.80), 2)
+        if _desired >= _floor_now + 0.05:
+            _new_oco = None
+            if pos.get("oco_id"):
+                _cancel_complex_order(pos.get("oco_id"))
+                _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
+                if _new_oco:
+                    pos["oco_id"] = _new_oco
+                    pos["floor_trigger"] = _desired
+                else:
+                    # never sit unprotected: fall back to a plain stop at the new floor
+                    _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
+                    pos["oco_id"] = None
+                    pos["stop_order_id"] = _sid2
+                    pos["floor_trigger"] = _desired if _sid2 else _floor_now
+                    send_emergency_dm(f"RATCHET: OCO re-place failed for {occ}; "
+                                      f"plain stop {'set' if _sid2 else 'ALSO FAILED'} at ${_desired:.2f}")
+            elif pos.get("stop_order_id"):
+                cancel_resting_stop(pos.get("stop_order_id"))
+                _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
+                pos["stop_order_id"] = _sid2
+                pos["floor_trigger"] = _desired if _sid2 else _floor_now
+            if not pos.get("trail_armed_posted"):
+                pos["trail_armed_posted"] = True
+                post_to_discord(
+                    "day-trade-signals",
+                    f"🔔 **{_fmt_occ(occ)} — trade is {pnl_pct:+.1%}, trailing engaged.**\n"
+                    f"Broker floor raised to ${float(pos['floor_trigger']):.2f} "
+                    f"(breakeven or better locked). It ratchets up as the trade runs — "
+                    f"worst case from here is roughly flat, not a loss.",
+                )
+            set_open_position(pos)
+
+    # v11.7: in-trade update every 30 minutes so members are never in the dark
+    _lu = float(pos.get("last_update_ts") or 0)
+    if time_module.time() - _lu >= 1800:
+        pos["last_update_ts"] = time_module.time()
+        set_open_position(pos)
+        post_to_discord(
+            "day-trade-signals",
+            f"📊 **Open trade update — {_fmt_occ(occ)}**\n"
+            f"Bid ${current_bid:.2f} | P&L {pnl_pct:+.1%} (entry ${fill_price:.2f}) | "
+            f"peak {peak_pnl:+.1%} | protective floor ${float(pos.get('floor_trigger') or fill_price * (1 - _stop_pct())):.2f}\n"
+            f"Target ${round(fill_price * 1.40, 2):.2f} — managed automatically; exit call posts the moment anything fires.",
+        )
+
     reason = None
 
     # 0. Forced flatten 3:45 PM ET — nothing is ever held overnight
@@ -1121,6 +1300,7 @@ def monitor_open_position():
             f"Current bid ~${current_bid:.2f} ({pnl_pct:+.1%} from ${fill_price:.2f} entry). "
             f"Exact fill posts in #profits-and-recaps in a moment.",
         )
+        _cancel_complex_order(pos.get("oco_id"))
         cancel_resting_stop(pos.get("stop_order_id"))
         exit_price    = close_position_tt(occ, reason, current_bid, _q)
         if exit_price is None:
@@ -1785,8 +1965,11 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     log.info(f"FILLED: {occ} @ ${fill_price:.2f}/share")
 
-    stop_order_id = place_stop_loss(occ, fill_price, qty)
+    oco_id, _ = place_oco_bracket(occ, fill_price, qty)
+    stop_order_id = None if oco_id else place_stop_loss(occ, fill_price, qty)
     stop_verified = False
+    if oco_id:
+        stop_verified = True   # bracket accepted atomically by the broker
     if stop_order_id:
         try:
             _sst, _ = _tt_order_status(stop_order_id)
@@ -1839,7 +2022,11 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"**Contract:** {_fmt_occ(occ)}\n"
         f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
         f"**Target:** ${target:.2f} (+40%)\n"
-        f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n\n"
+        + (f"**Bracket resting at broker ✅** — target ${target:.2f} & stop ${stop:.2f} ({stop_lbl}) as one OCO: "
+           f"either fills, the other cancels\n"
+           if oco_id else
+           f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
+        + "Trailing: arms at +10%, then the stop floor ratchets up behind the peak\n\n"
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
@@ -1857,6 +2044,9 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "qty":           qty,
         "fill_price":    fill_price,
         "stop_order_id": stop_order_id,
+        "oco_id":        oco_id,
+        "floor_trigger": round(fill_price * (1 - _stop_pct()), 2),
+        "last_update_ts": time_module.time(),
         "target_price":  round(fill_price * 1.40, 2),
         "peak_pnl":      0.0,
         "entry_time":    datetime.now(ET).isoformat(),
@@ -2034,7 +2224,6 @@ def _scheduler_loop():
 
     while True:
         try:
-            _beat_heartbeat()
             now     = datetime.now(ET)
             today   = now.date()
             today_s = today.isoformat()
@@ -2268,6 +2457,10 @@ def _scheduler_loop():
                 except Exception as e:
                     log.error(f"Position monitor error: {e}")
 
+            # v11.7: heartbeat at the END — a fresh beat now proves the entire
+            # iteration completed, not just that the loop woke up (Jul 28 lesson)
+            _beat_heartbeat()
+
         except Exception as e:
             log.error(f"Scheduler loop error: {e}")
 
@@ -2373,6 +2566,7 @@ def flatten():
     quote      = _live_option_quote(occ)
     bid        = float(quote.get("bid", fill_price * 0.90)) if quote else fill_price * 0.90
 
+    _cancel_complex_order(pos.get("oco_id"))
     cancel_resting_stop(pos.get("stop_order_id"))
     exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid, int(pos.get("qty") or 1))
     if exit_price is None:
@@ -2414,6 +2608,40 @@ def kill():
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
+@app.route("/oco-test")
+def oco_test():
+    """Validate the v11.7 OCO bracket payload against Tastytrade's dry-run
+    endpoint. NO ORDER IS PLACED. Proves the complex-order shape is accepted
+    before the first live trade uses it."""
+    ticker = (request.args.get("ticker") or "TSLA").upper()
+    occ, strike, ask = select_contract(ticker, "call")
+    if not occ:
+        return jsonify({"ok": False, "error": "no contract found"}), 200
+    fill = float(ask or 1.00)
+    target  = round(fill * 1.40, 2)
+    trigger = round(fill * (1 - _stop_pct()), 2)
+    payload = {
+        "type": "OCO",
+        "orders": [
+            {"time-in-force": "Day", "order-type": "Limit", "price": str(target),
+             "price-effect": "Credit",
+             "legs": [{"instrument-type": "Equity Option", "symbol": occ,
+                       "quantity": 1, "action": "Sell to Close"}]},
+            {"time-in-force": "Day", "order-type": "Stop", "stop-trigger": str(trigger),
+             "legs": [{"instrument-type": "Equity Option", "symbol": occ,
+                       "quantity": 1, "action": "Sell to Close"}]},
+        ],
+    }
+    try:
+        r = requests.post(f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders/dry-run",
+                          headers=_tt_headers(), json=payload, timeout=10)
+        return jsonify({"ok": r.status_code in (200, 201), "http": r.status_code,
+                        "contract": occ, "target": target, "stop": trigger,
+                        "detail": (r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text[:400])}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+
 @app.route("/status", methods=["GET"])
 def status():
     s   = load_state()
@@ -2423,7 +2651,7 @@ def status():
     hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
     return jsonify({
         "status":             "online",
-        "version":            "v11.6",
+        "version":            "v11.7",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
