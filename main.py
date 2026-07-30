@@ -1226,43 +1226,44 @@ def monitor_open_position():
         pos["peak_pnl"] = peak_pnl
         set_open_position(pos)
 
-    # v11.7 RATCHET: once the trade is +10%, the resting broker floor climbs —
-    # first to breakeven, then behind the peak (80% of peak bid), never down.
-    if peak_pnl >= 0.10:
-        _floor_now = float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
-        _peak_bid  = fill_price * (1 + peak_pnl)
-        _desired   = _tick(max(fill_price, _peak_bid * 0.80))
-        if _desired >= _floor_now + 0.05:
-            _new_oco = None
-            if pos.get("oco_id"):
-                _cancel_complex_order(pos.get("oco_id"))
-                _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
-                if _new_oco:
-                    pos["oco_id"] = _new_oco
-                    pos["floor_trigger"] = _desired
-                else:
-                    # never sit unprotected: fall back to a plain stop at the new floor
-                    _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
-                    pos["oco_id"] = None
-                    pos["stop_order_id"] = _sid2
-                    pos["floor_trigger"] = _desired if _sid2 else _floor_now
-                    send_emergency_dm(f"RATCHET: OCO re-place failed for {occ}; "
-                                      f"plain stop {'set' if _sid2 else 'ALSO FAILED'} at ${_desired:.2f}")
-            elif pos.get("stop_order_id"):
-                cancel_resting_stop(pos.get("stop_order_id"))
+    # v11.8 MULTI-TIER PROFIT PROTECTION (max 2 stop replacements per trade):
+    #   Stage 1: peak >= +10%  -> stop moves to BREAK-EVEN
+    #   Stage 2: peak >= +25%  -> stop moves to ENTRY +10% (gain locked)
+    # Deterministic ladder — eliminates green-to-red trades with minimal churn.
+    _stage = int(pos.get("ratchet_stage") or 0)
+    _want  = 2 if peak_pnl >= 0.25 else (1 if peak_pnl >= 0.10 else 0)
+    if _want > _stage:
+        _desired = _tick(fill_price * (1.10 if _want == 2 else 1.00))
+        _label   = "+10% profit locked" if _want == 2 else "break-even locked"
+        _ok = False
+        if pos.get("oco_id"):
+            _cancel_complex_order(pos.get("oco_id"))
+            _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
+            if _new_oco:
+                pos["oco_id"] = _new_oco
+                _ok = True
+            else:
                 _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
+                pos["oco_id"] = None
                 pos["stop_order_id"] = _sid2
-                pos["floor_trigger"] = _desired if _sid2 else _floor_now
-            if not pos.get("trail_armed_posted"):
-                pos["trail_armed_posted"] = True
-                post_to_discord(
-                    "day-trade-signals",
-                    f"🔔 **{_fmt_occ(occ)} — trade is {pnl_pct:+.1%}, trailing engaged.**\n"
-                    f"Broker floor raised to ${float(pos['floor_trigger']):.2f} "
-                    f"(breakeven or better locked). It ratchets up as the trade runs — "
-                    f"worst case from here is roughly flat, not a loss.",
-                )
-            set_open_position(pos)
+                _ok = bool(_sid2)
+                send_emergency_dm(f"TIER {_want}: OCO re-place failed for {occ}; "
+                                  f"plain stop {'set' if _sid2 else 'ALSO FAILED'} at ${_desired:.2f}")
+        elif pos.get("stop_order_id"):
+            cancel_resting_stop(pos.get("stop_order_id"))
+            _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
+            pos["stop_order_id"] = _sid2
+            _ok = bool(_sid2)
+        if _ok:
+            pos["ratchet_stage"] = _want
+            pos["floor_trigger"] = _desired
+            post_to_discord(
+                "day-trade-signals",
+                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/2).**\n"
+                f"Stop moved to ${_desired:.2f} — {_label}. "
+                f"{'Worst case from here is a +10% winner.' if _want == 2 else 'This trade can no longer turn into a loss.'}",
+            )
+        set_open_position(pos)
 
     # v11.7: in-trade update every 30 minutes so members are never in the dark
     _lu = float(pos.get("last_update_ts") or 0)
@@ -2040,7 +2041,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
            f"either fills, the other cancels\n"
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
-        + "Trailing: arms at +10%, then the stop floor ratchets up behind the peak\n\n"
+        + "Protection tiers: +10% moves the stop to break-even, +25% locks +10% profit\n\n"
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
@@ -2060,6 +2061,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "stop_order_id": stop_order_id,
         "oco_id":        oco_id,
         "floor_trigger": round(fill_price * (1 - _stop_pct()), 2),
+        "ratchet_stage": 0,
         "last_update_ts": time_module.time(),
         "target_price":  round(fill_price * 1.40, 2),
         "peak_pnl":      0.0,
@@ -2665,7 +2667,7 @@ def status():
     hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
     return jsonify({
         "status":             "online",
-        "version":            "v11.7",
+        "version":            "v11.8",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
