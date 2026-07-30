@@ -201,6 +201,7 @@ def _blank_state(today: str) -> dict:
     return {
         "trade_count":        0,
         "consecutive_losses": 0,
+        "ticker_losses":      {},
         "circuit_breaker":    False,
         "open_position":      None,
         "last_reset_date":    today,
@@ -298,9 +299,13 @@ def clear_open_position():
         s["open_position"] = None
         _commit(s)
 
-def record_trade_result(win: bool):
+def record_trade_result(win: bool, ticker: str | None = None):
   with _state_lock:
     s = load_state()
+    if not win and ticker:
+        tl = s.setdefault("ticker_losses", {})
+        tl[ticker] = int(tl.get(ticker, 0)) + 1
+        log.info(f"Ticker loss recorded: {ticker} -> {tl[ticker]} (locked out for the day at 1)")
     if win:
         s["consecutive_losses"] = 0
         log.info("Win recorded — loss counter reset")
@@ -574,6 +579,29 @@ def _adopt_broker_positions():
         log.critical(f"[{_BOOT_ID}] Position adoption failed: {e}")
 
 
+def _gate_whipsaw(ticker: str, signal_type: str) -> tuple[bool, str]:
+    """Chop day detector: if any single anchor has been crossed 4+ times
+    in-window, the level structure is saw-toothing — entries off this ticker
+    are done for the day."""
+    if signal_type == "entry":
+        st = _mkt_structure.get(ticker) or {}
+        cc = st.get("cross_counts") or {}
+        if cc:
+            worst_level, worst_n = max(cc.items(), key=lambda kv: kv[1])
+            if worst_n >= 4:
+                return False, (f"{ticker} chop-locked — {worst_level} crossed "
+                               f"{worst_n}x in-window (whipsaw day)")
+    return True, "clear"
+
+
+def _gate_ticker_lockout(ticker: str, signal_type: str) -> tuple[bool, str]:
+    if signal_type == "entry":
+        losses = int((load_state().get("ticker_losses") or {}).get(ticker, 0))
+        if losses >= 1:
+            return False, f"{ticker} locked out — one loss per ticker per day (chop protection)"
+    return True, "clear"
+
+
 def _gate_no_trade_date(signal_type: str) -> tuple[bool, str]:
     if signal_type == "entry" and _no_trade_today():
         return False, f"no-trade date (FOMC/high-risk day) — entries disabled"
@@ -600,6 +628,8 @@ def all_gates_pass(ticker: str, signal_type: str = "entry") -> bool:
         ("ticker",          lambda: _gate_ticker(ticker)),
         ("earnings",        lambda: _gate_earnings(ticker)),
         ("no_trade_date",   lambda: _gate_no_trade_date(signal_type)),
+        ("ticker_lockout",  lambda: _gate_ticker_lockout(ticker, signal_type)),
+        ("whipsaw",         lambda: _gate_whipsaw(ticker, signal_type)),
         ("blackout",        _gate_blackout),
         ("broker_flat",     lambda: _gate_broker_flat(signal_type)),
         ("circuit_breaker", _gate_circuit_breaker),
@@ -1176,7 +1206,7 @@ def monitor_open_position():
                 f"P&L: {pnl_p:+.1%} ({'+' if pnl_d >= 0 else ''}${abs(pnl_d):.0f} total on {_q} contract(s))",
             )
             clear_open_position()
-            record_trade_result(win=(exit_px > fill_price))
+            record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"))
             log.info(f"OCO {_kind} filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
             return
 
@@ -1206,7 +1236,7 @@ def monitor_open_position():
                 f"P&L: {pnl_p:+.1%} ({'+' if pnl_d >= 0 else ''}${abs(pnl_d):.0f} total on {_q} contract(s))",
             )
             clear_open_position()
-            record_trade_result(win=(exit_px > fill_price))
+            record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"))
             log.info(f"Broker stop filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
             return
 
@@ -1338,7 +1368,7 @@ def monitor_open_position():
             f"{int(pos.get('qty') or 1)} contract(s))",
         )
         clear_open_position()
-        record_trade_result(win=(exit_price > fill_price))
+        record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"))
         log.info(f"Position closed — {occ} | {reason} | {pnl_pct_final:+.1%}")
 
 
@@ -1657,6 +1687,10 @@ def _update_structure(ticker: str, candle: dict, pmh, pml, day: str | None = Non
         def _cross(level, key_dn, key_up, dn_lbl, up_lbl):
             if not level or prev_close is None or cur_close is None:
                 return
+            _base = key_dn.rsplit("_", 2)[0]
+            if (prev_close >= level > cur_close) or (prev_close <= level < cur_close):
+                cc = st.setdefault("cross_counts", {})
+                cc[_base] = int(cc.get(_base, 0)) + 1
             if prev_close >= level > cur_close and key_dn not in st["crosses"]:
                 st["crosses"][key_dn] = now_hm
                 log.info("STRUCTURE: " + ticker + " " + dn_lbl + " " + str(level) + " at " + now_hm + " ET")
@@ -1726,6 +1760,7 @@ def _structure_context(ticker: str, pmh, pml) -> str:
     L = ["SESSION STRUCTURE (authoritative in-window memory - a recorded cross DID occur in-window even if price has since moved; judge Condition A/B break-and-hold from these events, do NOT require witnessing the cross on the current candle):"]
     L.append("  Day open: " + str(st.get("day_open")) + " | Session high: " + str(st.get("day_high")) + " | Session low: " + str(st.get("day_low")))
     cr = st.get("crosses", {})
+    cc = st.get("cross_counts", {})
     def _line(name, level, dn, up, dn_lbl, up_lbl):
         if not level:
             return
@@ -1734,7 +1769,9 @@ def _structure_context(ticker: str, pmh, pml) -> str:
             ev.append(dn_lbl + " at " + cr[dn] + " ET")
         if up in cr:
             ev.append(up_lbl + " at " + cr[up] + " ET")
-        L.append("  " + name + " " + str(level) + ": " + ("; ".join(ev) if ev else "not crossed in-window yet"))
+        _n = int(cc.get(dn.rsplit("_", 2)[0], 0))
+        cnt = (" [crossed " + str(_n) + "x in-window" + (" — CHOP ZONE, no entries off this anchor" if _n >= 3 else "") + "]") if _n else ""
+        L.append("  " + name + " " + str(level) + ": " + ("; ".join(ev) if ev else "not crossed in-window yet") + cnt)
     _line("PML", pml, "pml_break_down", "pml_reclaim_up", "BROKEN DOWN", "RECLAIMED UP")
     _line("PMH", pmh, "pmh_reject_down", "pmh_break_up", "rejected back down", "BROKEN UP")
     _line("PRE-MARKET LOW", st.get("pm_low"), "pmlow_break_down", "pmlow_reclaim_up", "BROKEN DOWN", "RECLAIMED UP")
@@ -1822,6 +1859,9 @@ ENTRY FRESHNESS RULE:
 
 REJECTION-THEN-RECLAIM GUARD:
 - If the SAME anchor recorded a rejection within the last 3 candles, do NOT approve an entry through that anchor off a single candle. Require the CURRENT candle AND the PRIOR candle to both close beyond the anchor before treating it as a confirmed break/reclaim. One-candle flips at a contested level are chop, not confirmation.
+
+WHIPSAW RULE:
+- CROSS COUNTS in the structure show how many times each anchor has been crossed in-window today. An anchor crossed 3 or more times is a CHOP ZONE — break or reclaim entries off that anchor are NO_TRADE for the rest of the session, no matter how clean the current candle looks. A level that keeps changing hands is churning, not breaking.
 """.strip()
 
 
@@ -2493,7 +2533,7 @@ def _ensure_scheduler():
                         "holds the lock; this worker serves HTTP only")
             return
         _scheduler_started = True
-        t = threading.Thread(target=_scheduler_loop, daemon=True)
+        t = threading.Thread(target=_scheduler_loop, daemon=True, name="tpp-scheduler")
         t.start()
         log.info(f"[{_BOOT_ID}] Scheduler election WON (pid {os.getpid()}) — loop started")
 
@@ -2600,7 +2640,7 @@ def flatten():
         f"P&L: {pnl_pct:+.1%} ({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
     )
     clear_open_position()
-    record_trade_result(win=(exit_price > fill_price))
+    record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"))
     log.info(f"Flatten complete — {occ} @ ${exit_price:.2f}")
     return jsonify({"status": "flattened", "exit_price": exit_price}), 200
 
@@ -2665,13 +2705,30 @@ def status():
     pos = s.get("open_position")
     hb = _read_heartbeat()
     hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
+    # v11.9 WATCHDOG: if this process claims the scheduler but the thread is
+    # dead, revive it on the spot (any /status hit — e.g. an uptime monitor —
+    # doubles as the resurrection trigger).
+    global _scheduler_started
+    _thread_alive = any(t.name == "tpp-scheduler" and t.is_alive() for t in threading.enumerate())
+    if _sched_lock_fd is not None and not _thread_alive:
+        log.critical(f"[{_BOOT_ID}] WATCHDOG: scheduler thread DEAD — reviving now")
+        with _scheduler_lock:
+            _scheduler_started = False
+        _ensure_scheduler()
+        try:
+            send_emergency_dm(f"WATCHDOG revived a dead scheduler thread (boot {_BOOT_ID}). "
+                              "Investigate logs, but trading continuity was preserved.")
+        except Exception:
+            pass
+        _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v11.8",
+        "version":            "v11.9",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
         "scheduler_in_this_process": _sched_lock_fd is not None,
+        "scheduler_thread_alive":    _thread_alive,
         "heartbeat_boot_id":  hb.get("boot_id") if hb else None,
         "heartbeat_age_s":    hb_age,
         "risk_mode":          RISK_MODE,
