@@ -52,7 +52,9 @@ ET = pytz.timezone("America/New_York")
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS & ENV
 # ══════════════════════════════════════════════════════════════════════════════
-TRADEABLE_TICKERS  = {"NVDA", "TSLA"}
+TICKERS            = [t.strip().upper() for t in
+                      os.environ.get("TRADEABLE_TICKERS", "NVDA,TSLA,SPY").split(",") if t.strip()]
+TRADEABLE_TICKERS  = set(TICKERS)
 WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "")
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 # Comma-separated list of Discord user IDs — every ID gets every alert/pre-flight DM
@@ -202,6 +204,7 @@ def _blank_state(today: str) -> dict:
         "trade_count":        0,
         "consecutive_losses": 0,
         "ticker_losses":      {},
+        "today_results":      [],
         "circuit_breaker":    False,
         "open_position":      None,
         "last_reset_date":    today,
@@ -299,13 +302,24 @@ def clear_open_position():
         s["open_position"] = None
         _commit(s)
 
-def record_trade_result(win: bool, ticker: str | None = None):
+def record_trade_result(win: bool, ticker: str | None = None,
+                        pnl_pct: float | None = None, pnl_dollar: float | None = None,
+                        direction: str | None = None):
   with _state_lock:
     s = load_state()
+    s.setdefault("today_results", []).append(
+        {"ticker": ticker or "?", "win": bool(win),
+         "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar})
     if not win and ticker:
         tl = s.setdefault("ticker_losses", {})
         tl[ticker] = int(tl.get(ticker, 0)) + 1
-        log.info(f"Ticker loss recorded: {ticker} -> {tl[ticker]} (locked out for the day at 1)")
+        if direction:
+            ld = s.setdefault("ticker_loss_dirs", {})
+            ld.setdefault(ticker, [])
+            if direction not in ld[ticker]:
+                ld[ticker].append(direction)
+        log.info(f"Ticker loss recorded: {ticker} {direction or ''} -> {tl[ticker]} "
+                 "(same direction locked for the day; opposite needs TIER-1)")
     if win:
         s["consecutive_losses"] = 0
         log.info("Win recorded — loss counter reset")
@@ -594,11 +608,18 @@ def _gate_whipsaw(ticker: str, signal_type: str) -> tuple[bool, str]:
     return True, "clear"
 
 
-def _gate_ticker_lockout(ticker: str, signal_type: str) -> tuple[bool, str]:
+def _gate_ticker_lockout(ticker: str, signal_type: str, direction: str | None = None) -> tuple[bool, str]:
+    """v12: directional. A loss on calls locks CALLS on that ticker for the day;
+    puts stay eligible (and vice versa) — but re-entry needs TIER-1 conviction,
+    enforced post-decision in execute path."""
     if signal_type == "entry":
-        losses = int((load_state().get("ticker_losses") or {}).get(ticker, 0))
-        if losses >= 1:
-            return False, f"{ticker} locked out — one loss per ticker per day (chop protection)"
+        s = load_state()
+        loss_dirs = (s.get("ticker_loss_dirs") or {}).get(ticker, [])
+        if direction and direction in loss_dirs:
+            return False, (f"{ticker} {direction.upper()}S locked out — lost on this "
+                           f"direction today (opposite direction still eligible at TIER-1)")
+        if not direction and int((s.get("ticker_losses") or {}).get(ticker, 0)) >= 2:
+            return False, f"{ticker} locked out — two losses today"
     return True, "clear"
 
 
@@ -621,14 +642,14 @@ def _gate_broker_flat(signal_type: str) -> tuple[bool, str]:
     return True, "flat"
 
 
-def all_gates_pass(ticker: str, signal_type: str = "entry") -> bool:
+def all_gates_pass(ticker: str, signal_type: str = "entry", direction: str | None = None) -> bool:
     checks = [
         ("market_day",      _gate_market_day),
         ("window",          _gate_window),
         ("ticker",          lambda: _gate_ticker(ticker)),
         ("earnings",        lambda: _gate_earnings(ticker)),
         ("no_trade_date",   lambda: _gate_no_trade_date(signal_type)),
-        ("ticker_lockout",  lambda: _gate_ticker_lockout(ticker, signal_type)),
+        ("ticker_lockout",  lambda: _gate_ticker_lockout(ticker, signal_type, direction)),
         ("whipsaw",         lambda: _gate_whipsaw(ticker, signal_type)),
         ("blackout",        _gate_blackout),
         ("broker_flat",     lambda: _gate_broker_flat(signal_type)),
@@ -1206,7 +1227,9 @@ def monitor_open_position():
                 f"P&L: {pnl_p:+.1%} ({'+' if pnl_d >= 0 else ''}${abs(pnl_d):.0f} total on {_q} contract(s))",
             )
             clear_open_position()
-            record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"))
+            record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"),
+                                pnl_pct=pnl_p, pnl_dollar=pnl_d,
+                        direction=pos.get("direction"))
             log.info(f"OCO {_kind} filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
             return
 
@@ -1236,7 +1259,9 @@ def monitor_open_position():
                 f"P&L: {pnl_p:+.1%} ({'+' if pnl_d >= 0 else ''}${abs(pnl_d):.0f} total on {_q} contract(s))",
             )
             clear_open_position()
-            record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"))
+            record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"),
+                                pnl_pct=pnl_p, pnl_dollar=pnl_d,
+                        direction=pos.get("direction"))
             log.info(f"Broker stop filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
             return
 
@@ -1297,7 +1322,7 @@ def monitor_open_position():
 
     # v11.7: in-trade update every 30 minutes so members are never in the dark
     _lu = float(pos.get("last_update_ts") or 0)
-    if time_module.time() - _lu >= 1800:
+    if time_module.time() - _lu >= int(os.environ.get("UPDATE_INTERVAL_MIN", "10")) * 60:
         pos["last_update_ts"] = time_module.time()
         set_open_position(pos)
         post_to_discord(
@@ -1368,7 +1393,9 @@ def monitor_open_position():
             f"{int(pos.get('qty') or 1)} contract(s))",
         )
         clear_open_position()
-        record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"))
+        record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"),
+                            pnl_pct=pnl_pct_final, pnl_dollar=pnl_dollar,
+                        direction=pos.get("direction"))
         log.info(f"Position closed — {occ} | {reason} | {pnl_pct_final:+.1%}")
 
 
@@ -1381,13 +1408,13 @@ _claude_call_date = None
 
 SYSTEM_PROMPT = """\
 You are Junior 2.0, the automated trading brain for The Portfolio Plug (TPP).
-You analyze real-time 1-minute chart data for NVDA and TSLA and decide whether
+You analyze real-time 1-minute chart data for the tracked tickers and decide whether
 to enter an options trade during the 9:30–10:30 AM ET trading window.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CORE IDENTITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Tickers traded: NVDA and TSLA only. No other tickers ever.
+- Tickers traded: only the tickers presented in the data. No other tickers ever.
 - Timeframe: 1-minute candles exclusively. All EMA, volume, and
   structure readings (HH/HL/LH/LL) are 1-min based.
 - Trading window: 9:30–10:30 AM ET. One window per day.
@@ -1525,7 +1552,7 @@ Low volume alone → NOT dead.
 NO_TRADE is only permitted when:
   - FOMC decision day (system will not call you on these days)
   - Active circuit breaker (system will not call you when tripped)
-  - BOTH NVDA and TSLA are explicitly dead per all 3 conditions above
+  - ALL tracked tickers are explicitly dead per all 3 conditions above
 
 If only one ticker is dead, analyze the other.
 
@@ -1841,6 +1868,7 @@ KEY LEVELS (TradingView verified — treat as ground truth):
 
 SESSION STATE:
   trade_count:        {session.get('trade_count', 0)} / 2
+  today_ticker_losses: {session.get('ticker_losses', {})} (loss directions: {session.get('ticker_loss_dirs', {})})
   consecutive_losses: {session.get('consecutive_losses', 0)}
   circuit_breaker:    {session.get('circuit_breaker', False)}
   open_position:      {session.get('open_position') is not None}
@@ -1859,6 +1887,9 @@ ENTRY FRESHNESS RULE:
 
 REJECTION-THEN-RECLAIM GUARD:
 - If the SAME anchor recorded a rejection within the last 3 candles, do NOT approve an entry through that anchor off a single candle. Require the CURRENT candle AND the PRIOR candle to both close beyond the anchor before treating it as a confirmed break/reclaim. One-candle flips at a contested level are chop, not confirmation.
+
+POST-LOSS RE-ENTRY RULE:
+- SESSION STATE shows today's losses per ticker and direction. After a loss on a ticker: the SAME direction is dead for the day. The OPPOSITE direction is allowed ONLY as TIER-1 — a decisive break of VWAP or the day's high/low with clearly above-average volume. An ordinary Tier-2 setup on a ticker that already cost us money today is NO_TRADE.
 
 WHIPSAW RULE:
 - CROSS COUNTS in the structure show how many times each anchor has been crossed in-window today. An anchor crossed 3 or more times is a CHOP ZONE — break or reclaim entries off that anchor are NO_TRADE for the rest of the session, no matter how clean the current candle looks. A level that keeps changing hands is churning, not breaking.
@@ -1958,6 +1989,28 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     tier  = claude_decision.get("tier", "TIER-1")
     setup = claude_decision.get("setup_description", "")
+
+    # v12: directional lockout + higher-bar re-entry, enforced with the decision in hand
+    _ok, _why = _gate_ticker_lockout(ticker, "entry", direction)
+    if not _ok:
+        log.info(f"BLOCKED post-decision: {_why}")
+        post_to_discord(
+            "daily-watchlist",
+            f"📚 **Setup we passed on — {ticker} {direction.upper()}** [{tier}]\n"
+            f"{setup}\n**Passed:** {_why}.",
+        )
+        return False
+    _s_now = load_state()
+    if int((_s_now.get("ticker_losses") or {}).get(ticker, 0)) >= 1 and str(tier).upper() != "TIER-1":
+        _why = (f"post-loss re-entry on {ticker} requires TIER-1 conviction "
+                f"(VWAP / day high-low break with above-average volume) — this signal is {tier}")
+        log.info(f"BLOCKED post-decision: {_why}")
+        post_to_discord(
+            "daily-watchlist",
+            f"📚 **Setup we passed on — {ticker} {direction.upper()}** [{tier}]\n"
+            f"{setup}\n**Passed:** {_why}.",
+        )
+        return False
 
     occ, strike, ask = select_contract(ticker, direction)
     global _last_order_ask
@@ -2247,859 +2300,16 @@ def _post_scanning_update(label: str, closing: str):
     """Claude-written live scanning update for #daily-watchlist — educational, real levels."""
     try:
         rows = []
-        for _tk in ["NVDA", "TSLA"]:
+        for _tk in TICKERS:
             _lvl = get_key_levels(_tk)
             _cd  = get_latest_1min_candle(_tk)
             _px  = (_cd or {}).get("close") or _spot_price(_tk)
             if _px and _lvl.get("pmh") and _lvl.get("pml"):
                 rows.append(_tk + ": price=$" + str(_px) + " PMH=$" + str(_lvl["pmh"]) + " PML=$" + str(_lvl["pml"]))
         if not rows:
-            post_to_discord("daily-watchlist", "Scanning NVDA and TSLA — waiting on confirmed level breaks. " + closing)
+            post_to_discord("daily-watchlist", "Scanning " + ", ".join(TICKERS) + " — waiting on confirmed level breaks. " + closing)
             return
         _pr = (
             "You are Junior from The Portfolio Plug posting a mid-window scanning update (" + label + ") in #daily-watchlist.\n"
-            "RULES: NVDA and TSLA only. Junior voice - direct, educational, zero fluff, no disclaimers. "
-            "For each ticker, 1-2 sentences: where price trades versus PMH and PML right now, "
-            "and exactly what has to happen for an entry (break and hold which level). "
-            "This teaches the playbook - it is NOT a signal. At most one emoji total. "
-            "End with exactly this line: " + closing + "\n"
-            "LIVE DATA:\n" + "\n".join(rows)
-        )
-        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
-        _rp = _cl.messages.create(model=CLAUDE_MODEL, max_tokens=400, messages=[{"role": "user", "content": _pr}])
-        post_to_discord("daily-watchlist", _rp.content[0].text.strip())
-    except Exception as _e:
-        log.error("Scanning update failed: " + str(_e))
-
-def _scheduler_loop():
-    log.info("Scheduler loop started")
-    _s0 = load_state()
-    last_watchlist_date   = _s0.get("last_watchlist_date")
-    last_945_date         = _s0.get("last_945_date")
-    last_1015_date        = _s0.get("last_1015_date")
-
-    while True:
-        try:
-            now     = datetime.now(ET)
-            today   = now.date()
-            today_s = today.isoformat()
-            t       = now.time()
-
-            # v11.3 INGEST-FIRST: keep session structure fresh before anything
-            # else in this tick can slow down or fail. Nothing may starve the
-            # scanner's memory again.
-            if (today.weekday() < 5 and today not in MARKET_HOLIDAYS_2026
-                    and (9, 25) <= (now.hour, now.minute) <= (15, 50)):
-                for _tk in ("NVDA", "TSLA"):
-                    try:
-                        _lv = get_key_levels(_tk)
-                        _ingest_new_bars(_tk, _lv.get("pmh"), _lv.get("pml"))
-                    except Exception as _ie:
-                        log.warning(f"ingest-first {_tk}: {_ie}")
-
-            # Skip everything on weekends and holidays
-            is_trading_day = (
-                today.weekday() < 5
-                and today not in MARKET_HOLIDAYS_2026
-            )
-
-            if is_trading_day:
-
-                # ── 9:00 AM self pre-flight — DM the vitals before the day ──
-                if ((8, 55) <= (now.hour, now.minute) <= (9, 14)
-                        and load_state().get("last_preflight_date") != today_s):
-                    with _state_lock:
-                        _sp = load_state(); _sp["last_preflight_date"] = today_s; _commit(_sp)
-                    log.info("JOB: 9:00 pre-flight self-check")
-                    lines, bad = [], False
-                    try:
-                        nl = _account_net_liq()
-                        if nl:
-                            lines.append(f"✅ Broker auth OK — Net Liq ${nl:,.2f}")
-                        else:
-                            lines.append("❌ Broker balance UNREADABLE — sizing will fail-safe to 1 contract")
-                            bad = True
-                    except Exception as e:
-                        lines.append(f"❌ Broker check failed: {e}"); bad = True
-                    try:
-                        _c = get_latest_1min_candle("TSLA")
-                        lines.append("✅ Market data flowing" if _c else "❌ Market data: no candle returned")
-                        bad = bad or not _c
-                    except Exception as e:
-                        lines.append(f"❌ Market data failed: {e}"); bad = True
-                    try:
-                        live_pos = _tt_open_option_positions()
-                        if live_pos:
-                            lines.append(f"⚠️ Broker shows {len(live_pos)} open position(s) pre-market — verify")
-                            bad = True
-                        else:
-                            lines.append("✅ Broker flat")
-                    except Exception as e:
-                        lines.append(f"❌ Position check failed: {e}"); bad = True
-                    _s0 = load_state()
-                    lines.append(f"{'🛑 FOMC/no-trade day — entries OFF' if _no_trade_today() else '✅ Trading day'}"
-                                 f" | mode {RISK_MODE} ({_risk()['alloc']:.0%}/trade, {_stop_pct():.0%} stop)")
-                    lines.append(f"✅ v{'11.6'} boot {_BOOT_ID} | trades {_s0.get('trade_count', 0)}/2 | "
-                                 f"circuit {'ON' if _s0.get('circuit_breaker') else 'off'}")
-                    send_emergency_dm(
-                        "\n".join(lines) + "\nWindow 9:30–10:30 ET. Watchlist posts 9:15.",
-                        prefix=("🚨 **TPP PRE-FLIGHT — ATTENTION NEEDED** 🚨" if bad
-                                else "✅ **TPP PRE-FLIGHT — ALL SYSTEMS GREEN**"),
-                    )
-
-                # ── Watchlist 9:15 AM ─────────────────────────────────────
-                from datetime import time as dtime
-                if (dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s
-                        and _no_trade_today()):
-                    log.info("JOB: no-trade day notice (FOMC/high-risk)")
-                    post_to_discord(
-                        "daily-watchlist",
-                        "@everyone 🛑 **No trades today — FOMC day.**\n"
-                        "Fed rate decision at 2:00 PM ET with the press conference at 2:30 "
-                        "means whipsaw risk all session, and our edge is the opening-range "
-                        "playbook — not Fed roulette. Capital protection IS a position. "
-                        "Back at it tomorrow with the same rules.",
-                    )
-                    last_watchlist_date = today_s
-                    _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
-
-                if (dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s
-                        and not _no_trade_today()):
-                    log.info("JOB: daily watchlist")
-                    try:
-                        rows = []
-                        for ticker in ["NVDA", "TSLA"]:
-                            lv  = get_key_levels(ticker)
-                            pmh = lv.get("pmh")
-                            pml = lv.get("pml")
-                            pc  = lv.get("prev_close")
-                            if pmh is None or pml is None:
-                                log.warning("Watchlist: no levels for " + ticker)
-                                continue
-                            spot = _spot_price(ticker) or pc
-                            gap  = round(((spot - pc) / pc) * 100, 2) if (spot and pc) else None
-                            poc  = round((pmh + pml) / 2, 2)
-                            rows.append({"ticker": ticker, "price": spot, "gap": gap,
-                                         "pmh": pmh, "pml": pml, "poc": poc})
-                        if rows:
-                            data_lines = []
-                            for r_ in rows:
-                                g = r_["gap"]
-                                gs = (("+" if g >= 0 else "") + str(g) + "%") if g is not None else "flat"
-                                data_lines.append(
-                                    r_["ticker"] + ": price=$" + str(r_["price"]) +
-                                    " gap=" + gs + " PMH=$" + str(r_["pmh"]) +
-                                    " PML=$" + str(r_["pml"]) + " POC=$" + str(r_["poc"]))
-                            wl_prompt = (
-                                "You are Junior from The Portfolio Plug. Write the morning "
-                                "watchlist post for #daily-watchlist.\n"
-                                "RULES: NVDA and TSLA ONLY - never mention any other ticker. "
-                                "Junior voice: direct, confident, educational, zero fluff, no disclaimers. "
-                                "For each ticker in its own block: bold ticker name, price, gap %, "
-                                "whether price sits near PMH (supply) or PML (demand), the POC level, "
-                                "and ONE clear sentence on what you are watching for (bounce, break, rejection). "
-                                "3-4 sentences per ticker max. End with exactly one line: "
-                                "Window opens 9:30 AM ET - alerts fire on confirmed setups only.\n"
-                                "DATA:\n" + "\n".join(data_lines)
-                            )
-                            try:
-                                _wl_client = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
-                                _wl_resp = _wl_client.messages.create(
-                                    model=CLAUDE_MODEL, max_tokens=600,
-                                    messages=[{"role": "user", "content": wl_prompt}],
-                                )
-                                post_to_discord("daily-watchlist", _wl_resp.content[0].text.strip())
-                            except Exception as we:
-                                log.error("Watchlist Claude call failed: " + str(we))
-                                for r_ in rows:
-                                    post_to_discord(
-                                        "daily-watchlist",
-                                        "**" + r_["ticker"] + "** | $" + str(r_["price"]) +
-                                        " | PMH $" + str(r_["pmh"]) + " / PML $" + str(r_["pml"]) +
-                                        " / POC $" + str(r_["poc"]) +
-                                        " - window opens 9:30 AM ET, alerts on confirmed setups only.")
-                        else:
-                            log.warning("Watchlist skipped - no level data for either ticker")
-                        try:
-                            _sb_lines = []
-                            for _t in ["NVDA", "TSLA"]:
-                                _c_occ, _cs, _ca = select_contract(_t, "call")
-                                _p_occ, _ps, _pa = select_contract(_t, "put")
-                                if _c_occ or _p_occ:
-                                    _parts = []
-                                    if _c_occ:
-                                        _parts.append(f"📈 breakout → **{_fmt_occ(_c_occ)}** (~${_ca:.2f})")
-                                    if _p_occ:
-                                        _parts.append(f"📉 breakdown → **{_fmt_occ(_p_occ)}** (~${_pa:.2f})")
-                                    _sb_lines.append(f"**{_t}:** " + "  |  ".join(_parts))
-                            if _sb_lines:
-                                post_to_discord(
-                                    "daily-watchlist",
-                                    "🎯 **Contracts on standby — have these loaded, enter ONLY when the entry signal fires:**\n"
-                                    + "\n".join(_sb_lines)
-                                    + "\n_Premiums move by the open — the entry signal names the final contract and price._",
-                                )
-                        except Exception as _sb_e:
-                            log.warning(f"standby contracts post failed: {_sb_e}")
-                        last_watchlist_date = today_s
-                        _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
-                    except Exception as e:
-                        log.error(f"Watchlist job error: {e}")
-
-                # ── 9:45 AM status update ─────────────────────────────────
-                if (dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s
-                        and not _no_trade_today()):
-                    s = load_state()
-                    if s["trade_count"] == 0 and not get_open_position():
-                        _post_scanning_update("9:45 AM", "No forced trades — entries hit #day-trade-signals only on confirmed setups.")
-                        log.info("9:45 status update posted")
-                    else:
-                        log.info("9:45 status update skipped — trade already active")
-                    last_945_date = today_s
-                    _sp = load_state(); _sp["last_945_date"] = today_s; _commit(_sp)
-
-                # ── 10:15 AM status update ────────────────────────────────
-                if (dtime(10, 15) <= t <= dtime(10, 29) and last_1015_date != today_s
-                        and not _no_trade_today()):
-                    s = load_state()
-                    if s["trade_count"] == 0 and not get_open_position():
-                        _post_scanning_update("10:15 AM — final stretch", "Window closes 10:30 — if nothing sets up we sit out. No forced trades.")
-                        log.info("10:15 status update posted")
-                    else:
-                        log.info("10:15 status update skipped — trade already active")
-                    last_1015_date = today_s
-                    _sp = load_state(); _sp["last_1015_date"] = today_s; _commit(_sp)
-
-                # ── 1-min scanner 9:25–10:30 AM ──────────────────────────
-                if dtime(9, 25) <= t <= dtime(10, 30) and _in_window():
-                    try:
-                        for ticker in ["NVDA", "TSLA"]:
-                            # Structure stays fresh every tick, gates or not
-                            levels = get_key_levels(ticker)
-                            candle = _ingest_new_bars(ticker, levels.get("pmh"), levels.get("pml"))
-                            if not candle:
-                                continue
-                            if time_module.time() - _boot_ts < 120:
-                                continue  # boot grace: ingest yes, entries no
-                            if not all_gates_pass(ticker, signal_type="entry"):
-                                continue
-                            alert_data = {
-                                "ticker":     ticker,
-                                "alert_type": "SCANNER_1MIN",
-                                "close":      candle.get("close"),
-                                "open":       candle.get("open"),
-                                "high":       candle.get("high"),
-                                "low":        candle.get("low"),
-                                "volume":     candle.get("volume"),
-                                "pmh":        levels.get("pmh"),
-                                "pml":        levels.get("pml"),
-                            }
-                            session  = load_state()
-                            decision = call_claude(alert_data, session)
-                            if decision and decision.get("decision") == "APPROVE":
-                                direction = decision.get("direction", "").lower()
-                                if direction in ("call", "put"):
-                                    execute_trade(ticker, direction, decision)
-                                    break
-                    except Exception as e:
-                        log.error(f"Scanner error: {e}")
-
-            # ── Position monitor — runs regardless of window/day ──────────
-            # Keeps managing past 10:30 AM if trade is still open
-            pos = get_open_position()
-            if pos or _in_window():
-                try:
-                    monitor_open_position()
-                except Exception as e:
-                    log.error(f"Position monitor error: {e}")
-
-            # v11.7: heartbeat at the END — a fresh beat now proves the entire
-            # iteration completed, not just that the loop woke up (Jul 28 lesson)
-            _beat_heartbeat()
-
-        except Exception as e:
-            log.error(f"Scheduler loop error: {e}")
-
-        time_module.sleep(60)  # tick every 60 seconds
-
-
-def _ensure_scheduler():
-    global _scheduler_started
-    with _scheduler_lock:
-        if _scheduler_started:
-            return
-        if not _try_acquire_scheduler_lock():
-            log.warning(f"[{_BOOT_ID}] Scheduler election LOST — another process "
-                        "holds the lock; this worker serves HTTP only")
-            return
-        _scheduler_started = True
-        t = threading.Thread(target=_scheduler_loop, daemon=True, name="tpp-scheduler")
-        t.start()
-        log.info(f"[{_BOOT_ID}] Scheduler election WON (pid {os.getpid()}) — loop started")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FLASK ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── /webhook ──────────────────────────────────────────────────────────────────
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    # Verify secret from JSON body (TradingView compatible)
-    data = request.get_json(force=True, silent=True) or {}
-    incoming_secret = data.get("secret", "")
-    if WEBHOOK_SECRET and not hmac.compare_digest(incoming_secret, WEBHOOK_SECRET):
-        log.warning("Webhook rejected — invalid signature")
-        return jsonify({"error": "unauthorized"}), 401
-
-    if not data:
-        return jsonify({"error": "no data"}), 400
-
-    ticker     = str(data.get("ticker", "")).upper()
-    alert_type = str(data.get("alert_type", "UNKNOWN"))
-
-    # -- sanitize TradingView template quirks + enrich levels server-side --
-    if "{{" in alert_type or not alert_type.strip():
-        alert_type = "PRICE_ALERT"
-        data["alert_type"] = alert_type
-    def _num(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-    for _k in ("pmh", "pml", "level", "close", "open", "high", "low", "volume"):
-        if _k in data:
-            data[_k] = _num(data[_k])
-    if ticker in TRADEABLE_TICKERS:
-        _lv = get_key_levels(ticker)
-        if _lv.get("pmh") and _lv.get("pml"):
-            data["pmh"] = _lv.get("pmh")
-            data["pml"] = _lv.get("pml")
-        elif not data.get("pmh") or not data.get("pml"):
-            data["pmh"] = None
-            data["pml"] = None
-        log.info(f"Webhook enriched {ticker}: PMH={data.get('pmh')} PML={data.get('pml')}")
-    log.info(f"WEBHOOK: {ticker} | {alert_type}")
-
-    if not all_gates_pass(ticker, signal_type="entry"):
-        return jsonify({"status": "blocked"}), 200
-
-    session  = load_state()
-    decision = call_claude(data, session)
-
-    if not decision:
-        return jsonify({"status": "claude_error"}), 200
-
-    if decision.get("decision") == "APPROVE":
-        d_ticker    = decision.get("ticker", ticker).upper()
-        d_direction = decision.get("direction", "").lower()
-        if d_direction not in ("call", "put"):
-            log.error(f"Invalid direction: {d_direction}")
-            return jsonify({"status": "invalid_direction"}), 200
-        success = execute_trade(d_ticker, d_direction, decision)
-        return jsonify({"status": "traded" if success else "execution_failed"}), 200
-
-    reason = decision.get("reason", "No reason given")
-    log.info(f"NO_TRADE: {reason}")
-    return jsonify({"status": "no_trade", "reason": reason}), 200
-
-
-# ── /flatten ──────────────────────────────────────────────────────────────────
-@app.route("/flatten", methods=["POST"])
-def flatten():
-    data = request.get_json(force=True, silent=True) or {}
-    if WEBHOOK_SECRET and not hmac.compare_digest(
-        data.get("secret", ""), WEBHOOK_SECRET
-    ):
-        return jsonify({"error": "unauthorized"}), 401
-
-    pos = get_open_position()
-    if not pos:
-        return jsonify({"status": "no_position"}), 200
-
-    occ        = pos["occ_symbol"]
-    fill_price = float(pos["fill_price"])
-    quote      = _live_option_quote(occ)
-    bid        = float(quote.get("bid", fill_price * 0.90)) if quote else fill_price * 0.90
-
-    _cancel_complex_order(pos.get("oco_id"))
-    cancel_resting_stop(pos.get("stop_order_id"))
-    exit_price = close_position_tt(occ, "MANUAL FLATTEN", bid, int(pos.get("qty") or 1))
-    if exit_price is None:
-        return jsonify({"status": "close_failed", "detail": "position still open at broker — retry"}), 502
-
-    pnl_pct    = (exit_price - fill_price) / fill_price
-    pnl_dollar = (exit_price - fill_price) * 100
-    emoji      = "✅" if exit_price > fill_price else "❌"
-    close_time = datetime.now(ET).strftime("%H:%M ET")
-
-    post_to_discord(
-        "profits-and-recaps",
-        f"{emoji} **{occ} CLOSED** — MANUAL FLATTEN\n"
-        f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
-        f"P&L: {pnl_pct:+.1%} ({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
-    )
-    clear_open_position()
-    record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"))
-    log.info(f"Flatten complete — {occ} @ ${exit_price:.2f}")
-    return jsonify({"status": "flattened", "exit_price": exit_price}), 200
-
-
-# ── /kill ─────────────────────────────────────────────────────────────────────
-@app.route("/kill", methods=["POST"])
-def kill():
-    data = request.get_json(force=True, silent=True) or {}
-    if WEBHOOK_SECRET and not hmac.compare_digest(
-        data.get("secret", ""), WEBHOOK_SECRET
-    ):
-        return jsonify({"error": "unauthorized"}), 401
-
-    flatten()
-    s = load_state()
-    s["circuit_breaker"] = True
-    _commit(s)
-    log.warning("/kill — circuit breaker on, day over")
-    post_to_discord("day-trade-signals", "🛑 Kill switch activated — no more trades today.")
-    return jsonify({"status": "killed"}), 200
-
-
-# ── /status ───────────────────────────────────────────────────────────────────
-@app.route("/oco-test")
-def oco_test():
-    """Validate the v11.7 OCO bracket payload against Tastytrade's dry-run
-    endpoint. NO ORDER IS PLACED. Proves the complex-order shape is accepted
-    before the first live trade uses it."""
-    ticker = (request.args.get("ticker") or "TSLA").upper()
-    occ, strike, ask = select_contract(ticker, "call")
-    if not occ:
-        return jsonify({"ok": False, "error": "no contract found"}), 200
-    fill = float(ask or 1.00)
-    target  = _tick(fill * 1.40)
-    trigger = _tick(fill * (1 - _stop_pct()))
-    payload = {
-        "type": "OCO",
-        "orders": [
-            {"time-in-force": "Day", "order-type": "Limit", "price": str(target),
-             "price-effect": "Credit",
-             "legs": [{"instrument-type": "Equity Option", "symbol": occ,
-                       "quantity": 1, "action": "Sell to Close"}]},
-            {"time-in-force": "Day", "order-type": "Stop", "stop-trigger": str(trigger),
-             "legs": [{"instrument-type": "Equity Option", "symbol": occ,
-                       "quantity": 1, "action": "Sell to Close"}]},
-        ],
-    }
-    try:
-        r = requests.post(f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders/dry-run",
-                          headers=_tt_headers(), json=payload, timeout=10)
-        return jsonify({"ok": r.status_code in (200, 201), "http": r.status_code,
-                        "contract": occ, "target": target, "stop": trigger,
-                        "detail": (r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text[:400])}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 200
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    s   = load_state()
-    now = datetime.now(ET)
-    pos = s.get("open_position")
-    hb = _read_heartbeat()
-    hb_age = round(time_module.time() - hb["ts"], 1) if hb and hb.get("ts") else None
-    # v11.9 WATCHDOG: if this process claims the scheduler but the thread is
-    # dead, revive it on the spot (any /status hit — e.g. an uptime monitor —
-    # doubles as the resurrection trigger).
-    global _scheduler_started
-    _thread_alive = any(t.name == "tpp-scheduler" and t.is_alive() for t in threading.enumerate())
-    if _sched_lock_fd is not None and not _thread_alive:
-        log.critical(f"[{_BOOT_ID}] WATCHDOG: scheduler thread DEAD — reviving now")
-        with _scheduler_lock:
-            _scheduler_started = False
-        _ensure_scheduler()
-        try:
-            send_emergency_dm(f"WATCHDOG revived a dead scheduler thread (boot {_BOOT_ID}). "
-                              "Investigate logs, but trading continuity was preserved.")
-        except Exception:
-            pass
-        _thread_alive = True
-    return jsonify({
-        "status":             "online",
-        "version":            "v11.9",
-        "boot_id":            _BOOT_ID,
-        "boot_time_et":       _BOOT_TIME_ET,
-        "serving_pid":        os.getpid(),
-        "scheduler_in_this_process": _sched_lock_fd is not None,
-        "scheduler_thread_alive":    _thread_alive,
-        "heartbeat_boot_id":  hb.get("boot_id") if hb else None,
-        "heartbeat_age_s":    hb_age,
-        "risk_mode":          RISK_MODE,
-        "alloc_pct":          _risk()["alloc"],
-        "stop_pct":           _stop_pct(),
-        "no_trade_today":     _no_trade_today(),
-        "time_et":            now.strftime("%Y-%m-%d %H:%M:%S ET"),
-        "trade_count":        s["trade_count"],
-        "circuit_breaker":    s["circuit_breaker"],
-        "consecutive_losses": s["consecutive_losses"],
-        "open_position":      pos is not None,
-        "open_symbol":        pos["occ_symbol"] if pos else None,
-        "last_reset_date":    s["last_reset_date"],
-        "in_window":          _in_window(),
-    }), 200
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return status()
-
-
-@app.route("/tt-test", methods=["GET"])
-def tt_test():
-    """Verify Tastytrade auth works without placing any order."""
-    try:
-        token = _tt_get_token()
-        if token:
-            return jsonify({"tastytrade_auth": "ok", "account": TT_ACCOUNT}), 200
-        return jsonify({"tastytrade_auth": "failed", "reason": "no token returned"}), 500
-    except Exception as e:
-        return jsonify({"tastytrade_auth": "failed", "reason": str(e)}), 500
-
-
-# ── / ─────────────────────────────────────────────────────────────────────────
-@app.route("/wl-test", methods=["GET"])
-def wl_test():
-    """Dry-run: generate the watchlist with LIVE data right now. Nothing posts to Discord."""
-    try:
-        rows = []
-        for _tk in ["NVDA", "TSLA"]:
-            lv  = get_key_levels(_tk)
-            pmh = lv.get("pmh")
-            pml = lv.get("pml")
-            pc  = lv.get("prev_close")
-            if pmh is None or pml is None:
-                continue
-            spot = _spot_price(_tk) or pc
-            gap  = round(((spot - pc) / pc) * 100, 2) if (spot and pc) else None
-            poc  = round((pmh + pml) / 2, 2)
-            rows.append({"ticker": _tk, "price": spot, "gap": gap, "pmh": pmh, "pml": pml, "poc": poc})
-        if not rows:
-            return jsonify({"ok": False, "reason": "no level data"}), 500
-        data_lines = [r["ticker"] + ": price=$" + str(r["price"]) + " gap=" + str(r["gap"]) + "% PMH=$" + str(r["pmh"]) + " PML=$" + str(r["pml"]) + " POC=$" + str(r["poc"]) for r in rows]
-        _pr = (
-            "You are Junior from The Portfolio Plug. Write the morning watchlist post for #daily-watchlist.\n"
-            "RULES: NVDA and TSLA ONLY. Junior voice - direct, confident, educational, zero fluff, no disclaimers. "
-            "For each ticker in its own block: bold ticker name, price, gap %, whether price sits near PMH (supply) or PML (demand), "
-            "the POC level, and ONE clear sentence on what you are watching for (bounce, break, rejection). "
-            "3-4 sentences per ticker max. End with exactly one line: Window opens 9:30 AM ET - alerts fire on confirmed setups only.\n"
-            "DATA:\n" + "\n".join(data_lines)
-        )
-        _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
-        _rp = _cl.messages.create(model=CLAUDE_MODEL, max_tokens=600, messages=[{"role": "user", "content": _pr}])
-        return jsonify({"ok": True, "rows": rows, "watchlist": _rp.content[0].text.strip()}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "reason": str(e)}), 500
-
-
-@app.route("/exec-test", methods=["GET"])
-def exec_test():
-    """Dry-run: dumps live chain diagnostics + runs select_contract. NO ORDER PLACED."""
-    try:
-        tk = str(request.args.get("ticker", "NVDA")).upper()
-        dr = str(request.args.get("direction", "call")).lower()
-        if tk not in TRADEABLE_TICKERS or dr not in ("call", "put"):
-            return jsonify({"ok": False, "reason": "invalid params"}), 400
-        spot   = _spot_price(tk)
-        expiry = _next_friday()
-        opt_type = "C" if dr == "call" else "P"
-        resp = requests.get(
-            f"{TT_BASE}/option-chains/{tk}/nested",
-            headers=_tt_headers(),
-            params={"expiration-date": expiry.strftime("%Y-%m-%d")},
-            timeout=10,
-        )
-        chain_status = resp.status_code
-        strikes = []
-        if chain_status == 200:
-            items0 = resp.json().get("data", {}).get("items", [])
-            for it0 in items0:
-                for ex0 in it0.get("expirations", []):
-                    if ex0.get("expiration-date") == expiry.strftime("%Y-%m-%d"):
-                        strikes = sorted(float(s["strike-price"]) for s in ex0.get("strikes", []) if s.get("strike-price"))
-        sample = []
-        if strikes and spot:
-            atm = min(strikes, key=lambda s: abs(s - spot))
-            ai  = strikes.index(atm)
-            walk = strikes[ai:ai+6] if dr == "call" else list(reversed(strikes[max(0,ai-5):ai+1]))
-            for st in walk:
-                occ = (tk + "      ")[:6] + expiry.strftime("%y%m%d") + opt_type + ("%08d" % int(round(st * 1000)))
-                q   = _live_option_quote(occ) or {}
-                entry = {"strike": st, "occ": occ,
-                         "bid": q.get("bid"), "ask": q.get("ask")}
-                if not sample and q:
-                    entry["raw"] = {k: q.get(k) for k in list(q.keys())[:20]}
-                sample.append(entry)
-        occ, strike, ask = select_contract(tk, dr)
-        return jsonify({
-            "ok": bool(occ), "ticker": tk, "direction": dr,
-            "spot": spot, "expiry": expiry.strftime("%Y-%m-%d"),
-            "chain_http": chain_status, "num_strikes": len(strikes),
-            "sample_quotes": sample,
-            "selected": ({"occ": occ, "strike": strike, "ask": ask,
-                          "cost_per_contract": round(ask*100,2) if ask else None} if occ else None),
-            "note": "DRY RUN - no order placed; zero bid/ask = market closed",
-        }), 200
-    except Exception as e:
-        import traceback
-        return jsonify({"ok": False, "reason": str(e), "trace": traceback.format_exc()[-400:]}), 500
-
-
-@app.route("/quote-test", methods=["GET"])
-def quote_test():
-    """Probe 4 quote request variants to find the one Tastytrade answers. Read-only."""
-    try:
-        occ_padded = "NVDA  260717C00210000"
-        compact = occ_padded.replace(" ", "")
-        from urllib.parse import quote as _uq
-        out = {}
-        def probe(name, url, params=None):
-            try:
-                r = requests.get(url, headers=_tt_headers(), params=params, timeout=5)
-                try:
-                    d = r.json().get("data", {})
-                    items = d.get("items", []) if isinstance(d, dict) else []
-                    if not items and isinstance(d, dict) and d.get("symbol"):
-                        items = [d]
-                except Exception:
-                    items = []
-                first = items[0] if items else None
-                out[name] = {"http": r.status_code, "n": len(items),
-                             "keys": (sorted(list(first.keys()))[:14] if isinstance(first, dict) else None),
-                             "bid": (first or {}).get("bid"), "ask": (first or {}).get("ask")}
-            except Exception as e:
-                out[name] = {"err": str(e)[:80]}
-        probe("bytype_padded", f"{TT_BASE}/market-data/by-type?equity-option=" + _uq(occ_padded, safe=""))
-        probe("bytype_compact", f"{TT_BASE}/market-data/by-type", {"equity-option": compact})
-        probe("path_padded", f"{TT_BASE}/market-data/" + _uq(occ_padded, safe=""))
-        probe("options_padded", f"{TT_BASE}/market-data/options", {"symbols[]": occ_padded})
-        return jsonify(out), 200
-    except Exception as e:
-        return jsonify({"err": str(e)}), 500
-
-@app.route("/order-test", methods=["GET"])
-def order_test():
-    """Validate the EXACT entry order payload against Tastytrade /orders/dry-run.
-    NO ORDER IS PLACED - dry-run only. Proves symbology + buying power + payload."""
-    try:
-        tk = str(request.args.get("ticker", "NVDA")).upper()
-        dr = str(request.args.get("direction", "call")).lower()
-        if tk not in TRADEABLE_TICKERS or dr not in ("call", "put"):
-            return jsonify({"ok": False, "reason": "invalid params"}), 400
-        occ, strike, ask = select_contract(tk, dr)
-        if not occ:
-            return jsonify({"ok": False, "reason": "no contract selected"}), 200
-        payload = {
-            "time-in-force": "Day",
-            "order-type":    "Market",
-            "legs": [{"instrument-type": "Equity Option", "symbol": occ,
-                      "quantity": 1, "action": "Buy to Open"}],
-        }
-        resp = requests.post(
-            f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders/dry-run",
-            headers=_tt_headers(),
-            json=payload,
-            timeout=10,
-        )
-        body = {}
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text[:300]}
-        d = body.get("data", {}) if isinstance(body, dict) else {}
-        bp = d.get("buying-power-effect", {})
-        return jsonify({
-            "ok": resp.status_code in (200, 201),
-            "http": resp.status_code,
-            "contract": {"occ": occ, "strike": strike, "ask": ask},
-            "order_status": (d.get("order", {}) or {}).get("status"),
-            "buying_power_change": bp.get("change-in-buying-power"),
-            "warnings": body.get("warnings") or d.get("warnings"),
-            "errors": body.get("error") or body.get("errors"),
-            "note": "DRY RUN via Tastytrade /orders/dry-run - nothing placed",
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "reason": str(e)}), 500
-
-@app.route("/structure-test", methods=["GET"])
-def structure_test():
-    """Live proof of session-structure tracking. Read-only, no orders."""
-    try:
-        tk = str(request.args.get("ticker", "NVDA")).upper()
-        lv = get_key_levels(tk)
-        c = get_latest_1min_candle(tk)
-        if c:
-            _update_structure(tk, c, lv.get("pmh"), lv.get("pml"))
-        return jsonify({"candle": c, "structure": _mkt_structure.get(tk),
-                        "context": _structure_context(tk, lv.get("pmh"), lv.get("pml"))}), 200
-    except Exception as e:
-        return jsonify({"err": str(e)}), 500
-
-@app.route("/fill-test", methods=["GET"])
-def fill_test():
-    """Runs the live fill reader against REAL past order IDs from this account.
-    Default IDs = the nine July 23 fills. Read-only; places nothing."""
-    default_ids = ("486657096,486664254,486671221,486671958,486701499,"
-                   "486710469,486726217,486731376,486770060")
-    ids = [i.strip() for i in request.args.get("ids", default_ids).split(",") if i.strip()]
-    rows, ok = [], 0
-    for oid in ids[:20]:
-        status, fill = _tt_order_status(oid)
-        good = (status == "filled" and fill is not None)
-        ok += 1 if good else 0
-        rows.append({"order_id": oid, "status": status,
-                     "fill_price": fill, "pass": good})
-    return jsonify({"tested": len(rows), "passed": ok,
-                    "verdict": "CERTIFIED" if ok == len(rows) else "FAILING",
-                    "rows": rows}), 200
-
-
-@app.route("/replay-test", methods=["GET"])
-def replay_test():
-    """Replay any past session through the EXACT live decision path.
-    /replay-test?ticker=TSLA&date=2026-07-20            -> structure/cross timeline only (free)
-    /replay-test?ticker=TSLA&date=2026-07-20&claude=1   -> + a real Claude decision per bar (~66 calls)
-    Never places orders. Never posts to Discord. Does not touch live session state."""
-    ticker = str(request.args.get("ticker", "TSLA")).upper()
-    day    = str(request.args.get("date", ""))
-    use_claude = str(request.args.get("claude", "0")) == "1"
-    # Chunking: Render's proxy caps requests near 100s, so a full-day Claude
-    # replay (60+ sequential calls) can never return in one request. Evaluate
-    # bars [claude_from, claude_to) per request (default 15-bar chunk).
-    try:
-        c_from = int(request.args.get("claude_from", "0"))
-        c_to   = int(request.args.get("claude_to", str(c_from + 15)))
-    except ValueError:
-        return jsonify({"error": "claude_from/claude_to must be integers"}), 400
-    if not day:
-        return jsonify({"error": "date=YYYY-MM-DD required"}), 400
-    # Never run replays inside the live scanning window: replay swaps live
-    # session state and would race the scanner thread.
-    _nw = datetime.now(ET)
-    if _nw.strftime("%Y-%m-%d") != day and (9, 20) <= (_nw.hour, _nw.minute) <= (10, 35) and _nw.weekday() < 5:
-        return jsonify({"error": "replay disabled during live window (9:20-10:35 ET)"}), 409
-
-    # prior-day PMH/PML for that date
-    p_start = (date.fromisoformat(day) - timedelta(days=7)).isoformat()
-    pmh = pml = None
-    for feed in ("iex", "sip", None):
-        try:
-            params = {"timeframe": "1Day", "limit": 10, "start": p_start, "end": day + "T00:00:00Z"}
-            if feed:
-                params["feed"] = feed
-            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
-                             headers=_alpaca_headers(), params=params, timeout=6)
-            if r.status_code == 200 and r.json().get("bars"):
-                b = r.json()["bars"][-1]
-                pmh, pml = b["h"], b["l"]
-                break
-        except Exception:
-            pass
-
-    bars = _fetch_1min_bars(ticker, day + "T13:24:00Z", day + "T14:31:00Z", limit=200)
-    if not bars:
-        return jsonify({"error": "no bars for that date/ticker"}), 404
-
-    saved = _mkt_structure.pop(ticker, None)   # protect live state
-    timeline, approvals = [], []
-    try:
-        for _bi, b in enumerate(bars):
-            c = {"open": b["o"], "high": b["h"], "low": b["l"],
-                 "close": b["c"], "volume": b["v"], "t": b.get("t")}
-            st = _update_structure(ticker, c, pmh, pml, day=day)
-            row = {"t": b.get("t"), "close": b["c"], "volume": b["v"]}
-            if use_claude and c_from <= _bi < c_to:
-                alert = {"ticker": ticker, "alert_type": "REPLAY_1MIN",
-                         "close": c["close"], "open": c["open"], "high": c["high"],
-                         "low": c["low"], "volume": c["volume"], "pmh": pmh, "pml": pml}
-                try:
-                    _bt_et = (datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00"))
-                              .astimezone(ET).strftime("%H:%M ET"))
-                except Exception:
-                    _bt_et = None
-                d = call_claude(alert, {"trade_count": 0, "consecutive_losses": 0,
-                                        "circuit_breaker": False, "open_position": None},
-                                replay=True, as_of=_bt_et)
-                if not d:
-                    row["decision"] = "ERROR"
-                    row["reason"] = "call_claude returned no decision (parse/API failure)"
-                if d:
-                    row["decision"] = d.get("decision")
-                    row["reason"] = d.get("reason", "")[:160]
-                    if d.get("decision") == "APPROVE":
-                        approvals.append({"t": b.get("t"), "direction": d.get("direction"),
-                                          "tier": d.get("tier"), "reason": d.get("reason", "")})
-            timeline.append(row)
-        final = _mkt_structure.get(ticker, {})
-        result = {"ticker": ticker, "date": day, "pmh": pmh, "pml": pml,
-                  "pm_high": final.get("pm_high"), "pm_low": final.get("pm_low"),
-                  "or_low": final.get("or_low"), "or_high": final.get("or_high"),
-                  "day_high": final.get("day_high"), "day_low": final.get("day_low"),
-                  "crosses": final.get("crosses", {}), "bars": len(bars),
-                  "claude_from": c_from if use_claude else None,
-                  "claude_to": min(c_to, len(bars)) if use_claude else None,
-                  "next_chunk": (day and use_claude and c_to < len(bars)) and (
-                      "/replay-test?ticker=" + ticker + "&date=" + day
-                      + "&claude=1&claude_from=" + str(c_to)
-                      + "&claude_to=" + str(min(c_to + 15, len(bars)))) or None,
-                  "approvals": approvals, "timeline": timeline}
-    finally:
-        if saved is not None:
-            _mkt_structure[ticker] = saved
-        else:
-            _mkt_structure.pop(ticker, None)
-    return jsonify(result), 200
-
-
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({"status": "TPP Trading Server v5.0 — live"}), 200
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  STARTUP
-# ══════════════════════════════════════════════════════════════════════════════
-_boot_done = False
-_boot_guard = threading.Lock()
-
-
-def _boot_in_worker():
-    """v11.2: ALL boot work happens here, in the process that serves HTTP —
-    never at module import. This makes the app immune to gunicorn preload /
-    fork topology: master imports nothing but definitions; the worker that
-    answers requests is the same process that runs the scheduler, owns the
-    structure, and holds the state. Called from gunicorn.conf.py
-    post_worker_init, from Flask's first request as a fallback, and from
-    __main__ for direct runs."""
-    global _boot_done, _BOOT_ID
-    with _boot_guard:
-        if _boot_done:
-            return
-        _boot_done = True
-    if os.getpid() != _IMPORT_PID:
-        # We are a forked child of a preloading master — mint our own identity
-        _BOOT_ID = _uuid.uuid4().hex[:6]
-    log.info(f"[{_BOOT_ID}] worker boot (pid {os.getpid()}, import pid {_IMPORT_PID}) — "
-             "state/structure/adoption/scheduler starting IN THIS PROCESS")
-    load_state()
-    _hydrate_structure()
-    _adopt_broker_positions()
-    _ensure_scheduler()
-
-
-@app.before_request
-def _boot_fallback():
-    if not _boot_done:
-        _boot_in_worker()
-
-
-if __name__ == "__main__":
-    _boot_in_worker()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+            "RULES: " + ", ".join(TICKERS) + " only. Junior voice - direct, educational, zero fluff, no disclaimers. "
+            "For each ticker, 1-2 sentences: where 
