@@ -1281,15 +1281,22 @@ def monitor_open_position():
         pos["peak_pnl"] = peak_pnl
         set_open_position(pos)
 
-    # v11.8 MULTI-TIER PROFIT PROTECTION (max 2 stop replacements per trade):
-    #   Stage 1: peak >= +10%  -> stop moves to BREAK-EVEN
-    #   Stage 2: peak >= +25%  -> stop moves to ENTRY +10% (gain locked)
-    # Deterministic ladder — eliminates green-to-red trades with minimal churn.
+    # v12.1 MULTI-TIER PROFIT PROTECTION (3 rungs, max 3 stop replacements):
+    #   Stage 1: peak >= +10%  -> stop to BREAK-EVEN
+    #   Stage 2: peak >= +20%  -> stop to ENTRY +10%   (was +25% — trades kept
+    #            peaking ~+20% and scratching out at breakeven)
+    #   Stage 3: peak >= +30%  -> stop to ENTRY +20%
+    _LADDER = [(0.10, 0.00, "break-even locked — this trade can no longer turn into a loss"),
+               (0.20, 0.10, "+10% profit locked — worst case from here is a winner"),
+               (0.30, 0.20, "+20% profit locked — most of this move is now yours")]
     _stage = int(pos.get("ratchet_stage") or 0)
-    _want  = 2 if peak_pnl >= 0.25 else (1 if peak_pnl >= 0.10 else 0)
+    _want  = 0
+    for _k, (_thr, _lock, _msg) in enumerate(_LADDER, start=1):
+        if peak_pnl >= _thr:
+            _want = _k
     if _want > _stage:
-        _desired = _tick(fill_price * (1.10 if _want == 2 else 1.00))
-        _label   = "+10% profit locked" if _want == 2 else "break-even locked"
+        _thr, _lock, _msg = _LADDER[_want - 1]
+        _desired = _tick(fill_price * (1 + _lock))
         _ok = False
         if pos.get("oco_id"):
             _cancel_complex_order(pos.get("oco_id"))
@@ -1312,11 +1319,14 @@ def monitor_open_position():
         if _ok:
             pos["ratchet_stage"] = _want
             pos["floor_trigger"] = _desired
+            _take = ("Green and comfortable? Take profits — don't wait for us."
+                     if _want >= 2 else
+                     "Feel free to add your own trail stop or start taking profits "
+                     "whenever you're comfortable — you don't have to wait for the +40% target.")
             post_to_discord(
                 "day-trade-signals",
-                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/2).**\n"
-                f"Stop moved to ${_desired:.2f} — {_label}. "
-                f"{'Worst case from here is a +10% winner.' if _want == 2 else 'This trade can no longer turn into a loss.'}",
+                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/3).**\n"
+                f"Stop moved to ${_desired:.2f} — {_msg}.\n{_take}",
             )
         set_open_position(pos)
 
@@ -1330,7 +1340,9 @@ def monitor_open_position():
             f"📊 **Open trade update — {_fmt_occ(occ)}**\n"
             f"Bid ${current_bid:.2f} | P&L {pnl_pct:+.1%} (entry ${fill_price:.2f}) | "
             f"peak {peak_pnl:+.1%} | protective floor ${float(pos.get('floor_trigger') or fill_price * (1 - _stop_pct())):.2f}\n"
-            f"Target ${round(fill_price * 1.40, 2):.2f} — managed automatically; exit call posts the moment anything fires.",
+            f"Target ${round(fill_price * 1.40, 2):.2f} — managed automatically; exit call posts the moment anything fires."
+            + ("\n💰 Green — taking profits early is always allowed. Our target is +40%, but your gains are yours."
+               if pnl_pct >= 0.10 else ""),
         )
 
     reason = None
@@ -1580,8 +1592,16 @@ APPROVE:
   "ticker": "NVDA",
   "direction": "call",
   "tier": "TIER-1",
-  "setup_description": "NVDA reclaimed PMH at 127.40 on the 1-min with HH/HL structure intact — calls are live."
+  "setup_description": "NVDA reclaimed PMH at 127.40 on the 1-min with HH/HL structure intact — calls are live.",
+  "chart_request": {"ticker": "NVDA", "timeframe": "1m", "indicators": "PMH,VOLUME", "highlight": "Reclaim of PMH 127.40 with rising volume"}
 }
+
+chart_request is REQUIRED on every APPROVE: it must reference the exact ticker,
+the timeframe your claim is based on (1m|5m|15m|1h|1d), the indicators/levels
+your setup_description cites (comma-separated), and a short note on what a
+chart should highlight to PROVE the claim. Every observational claim you make
+(a break, a reclaim, a volume spike, structure) must be verifiable from that
+chart request — never cite a phenomenon the chart could not show.
 
 NO_TRADE:
 {
@@ -2134,15 +2154,24 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
            f"either fills, the other cancels\n"
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
-        + "Protection tiers: +10% moves the stop to break-even, +25% locks +10% profit\n\n"
+        + "Protection tiers: +10% → break-even, +20% → +10% locked, +30% → +20% locked. "
+          "Take profits early whenever you're comfortable — the target is ours, the gains are yours\n\n"
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
+    _cr = (claude_decision.get("chart_request") or {}) if isinstance(claude_decision, dict) else {}
+    _cr_line = ""
+    if _cr:
+        _cr_line = ("\n[CHART_REQUEST: TICKER=" + str(_cr.get("ticker", ticker))
+                    + ", TIMEFRAME=" + str(_cr.get("timeframe", "1m"))
+                    + ", INDICATORS=" + str(_cr.get("indicators", ""))
+                    + ", HIGHLIGHT=\"" + str(_cr.get("highlight", ""))[:120] + "\"]")
     post_to_discord(
         "daily-watchlist",
         f"📚 **Setup breakdown — {ticker} {type_label}** [{tier}]\n"
         + (setup if setup else "Level-break setup confirmed.")
-        + f"\nEntry ${fill_price:.2f} x{qty} | Target ${target:.2f} (+40%) | Stop ${stop:.2f} ({stop_lbl})",
+        + f"\nEntry ${fill_price:.2f} x{qty} | Target ${target:.2f} (+40%) | Stop ${stop:.2f} ({stop_lbl})"
+        + _cr_line,
     )
 
     set_open_position({
@@ -2312,6 +2341,10 @@ def _post_scanning_update(label: str, closing: str):
         _pr = (
             "You are Junior from The Portfolio Plug posting a mid-window scanning update (" + label + ") in #daily-watchlist.\n"
             "RULES: " + ", ".join(TICKERS) + " only. Junior voice - direct, educational, zero fluff, no disclaimers. "
+            "CHART TAGS: whenever you cite a specific technical phenomenon (a level break, volume spike, "
+            "widening spreads, divergence), append on its own line at the END of that ticker's section: "
+            "[CHART_REQUEST: TICKER=<symbol>, TIMEFRAME=<1m|5m|15m|1h|1d>, INDICATORS=<comma-separated>, "
+            "HIGHLIGHT=\"<what the chart should prove>\"] — only for claims a chart can verify, max one per ticker. "
             "For each ticker, 1-2 sentences: where price trades versus PMH and PML right now, "
             "and exactly what has to happen for an entry (break and hold which level). "
             "This teaches the playbook - it is NOT a signal. At most one emoji total. "
@@ -2447,6 +2480,9 @@ def _scheduler_loop():
                                 "You are Junior from The Portfolio Plug. Write the morning "
                                 "watchlist post for #daily-watchlist.\n"
                                 "RULES: " + ", ".join(TICKERS) + " ONLY - never mention any other ticker. "
+            "CHART TAGS: if you cite a verifiable technical phenomenon, append at the end of that ticker's line: "
+            "[CHART_REQUEST: TICKER=<symbol>, TIMEFRAME=<1m|5m|15m|1h|1d>, INDICATORS=<comma-separated>, "
+            "HIGHLIGHT=\"<what to prove>\"]. Max one per ticker, only when a chart could verify the claim. "
                                 "Junior voice: direct, confident, educational, zero fluff, no disclaimers. "
                                 "For each ticker in its own block: bold ticker name, price, gap %, "
                                 "whether price sits near PMH (supply) or PML (demand), the POC level, "
@@ -2814,7 +2850,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.0",
+        "version":            "v12.1",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
