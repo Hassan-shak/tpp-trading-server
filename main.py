@@ -147,7 +147,7 @@ def _read_heartbeat() -> dict | None:
 # high_vol : 10% of net-liq per trade, 25% max stop  (~2.5% acct risk)
 # normal   : 20% of net-liq per trade, 20% max stop  (~4.0% acct risk)
 RISK_MODES = {
-    "high_vol": {"alloc": 0.10, "stop": 0.25},
+    "high_vol": {"alloc": 0.10, "stop": 0.20},   # v12.2: stop tightened 25→20% per Junior (alloc stays 10%)
     "normal":   {"alloc": 0.20, "stop": 0.20},
 }
 RISK_MODE      = os.environ.get("RISK_MODE", "high_vol").strip().lower()
@@ -2850,7 +2850,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.1",
+        "version":            "v12.2",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
