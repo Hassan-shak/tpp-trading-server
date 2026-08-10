@@ -80,12 +80,30 @@ CHANNEL_IDS = {
     "profits-and-recaps": os.environ.get("DISCORD_CHANNEL_RECAPS",     ""),
 }
 
-MARKET_HOLIDAYS_2026 = {
+MARKET_HOLIDAYS = {
+    # 2026
     date(2026,  1,  1), date(2026,  1, 19), date(2026,  2, 16),
     date(2026,  4,  3), date(2026,  5, 25), date(2026,  6, 19),
     date(2026,  7,  3), date(2026,  9,  7), date(2026, 11, 26),
     date(2026, 12, 25),
+    # 2027
+    date(2027,  1,  1), date(2027,  1, 18), date(2027,  2, 15),
+    date(2027,  3, 26), date(2027,  5, 31), date(2027,  6, 18),
+    date(2027,  7,  5), date(2027,  9,  6), date(2027, 11, 25),
+    date(2027, 12, 24),
 }
+MARKET_HOLIDAYS_2026 = MARKET_HOLIDAYS   # legacy alias
+
+# Early closes — market shuts 1:00 PM ET (system flattens 12:45, stands down after)
+EARLY_CLOSE_DATES = {
+    date(2026, 11, 27), date(2026, 12, 24),   # Black Friday, Christmas Eve
+    date(2027, 11, 26),                        # Black Friday 2027
+}
+
+
+def _flatten_time(d) -> tuple[int, int]:
+    """(hour, minute) of the forced flatten: 12:45 on early-close days, else 15:45."""
+    return (12, 45) if d in EARLY_CLOSE_DATES else (15, 45)
 
 FOMC_DECISION_DAYS_2026 = {
     date(2026,  1, 29), date(2026,  3, 19), date(2026,  5,  7),
@@ -344,6 +362,90 @@ _last_discord_hash: dict[str, str] = {}
 
 def _msg_hash(msg: str) -> str:
     return hashlib.md5(msg.encode()).hexdigest()
+
+
+def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
+    """Render the session 1-min chart for a ticker from OUR OWN structure data:
+    price line + volume bars + key levels (PMH/PML/OR) + highlight note.
+    Lazy-imports matplotlib so a broken install can never take down trading.
+    Returns PNG bytes, or None on any failure — callers always degrade to
+    text-only posts."""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib import dates as mdates
+
+        st = _mkt_structure.get(ticker) or {}
+        candles = st.get("candles") or []
+        if len(candles) < 3:
+            return None
+        ts, closes, vols = [], [], []
+        for c in candles:
+            try:
+                _t = datetime.fromisoformat(str(c.get("t")).replace("Z", "+00:00")).astimezone(ET)
+                ts.append(_t); closes.append(float(c["close"])); vols.append(float(c.get("volume") or 0))
+            except Exception:
+                continue
+        if len(closes) < 3:
+            return None
+
+        plt.style.use("dark_background")
+        fig, (ax, axv) = plt.subplots(2, 1, figsize=(8, 4.6), dpi=110,
+                                      gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
+        ax.plot(ts, closes, linewidth=1.6)
+        levels = [("PMH", st.get("pm_high")), ("PML", st.get("pm_low")),
+                  ("OR-H", st.get("or_high")), ("OR-L", st.get("or_low"))]
+        for name, lv in levels:
+            if lv:
+                ax.axhline(float(lv), linewidth=0.8, linestyle="--", alpha=0.7)
+                ax.annotate(f"{name} {float(lv):.2f}", xy=(ts[0], float(lv)),
+                            fontsize=7, alpha=0.9, va="bottom")
+        axv.bar(ts, vols, width=0.0006)
+        axv.set_ylabel("Vol", fontsize=7)
+        ax.set_title(f"{ticker} — 1-min session" + (f" | {highlight[:70]}" if highlight else ""),
+                     fontsize=9)
+        ax.tick_params(labelsize=7); axv.tick_params(labelsize=7)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ET))
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning(f"Chart render failed for {ticker}: {e}")
+        return None
+
+
+def post_chart_to_discord(channel: str, ticker: str, highlight: str = "",
+                          caption: str = "") -> bool:
+    """Attach a rendered session chart beneath a text post. Best-effort:
+    returns False (and posts nothing) if rendering or upload fails."""
+    png = _render_chart_png(ticker, highlight)
+    if not png:
+        return False
+    channel_id = CHANNEL_IDS.get(channel)
+    if not channel_id:
+        return False
+    try:
+        import json as _json
+        resp = requests.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            data={"payload_json": _json.dumps(
+                {"content": (caption or f"📈 {ticker} — chart for the setup above")
+                            + f"\n-# ⚙️ {_BOOT_ID}"})},
+            files={"files[0]": (f"{ticker.lower()}_session.png", png, "image/png")},
+            timeout=15,
+        )
+        ok = resp.status_code in (200, 201)
+        if not ok:
+            log.warning(f"Chart upload failed {resp.status_code}: {resp.text[:200]}")
+        return ok
+    except Exception as e:
+        log.warning(f"Chart upload error: {e}")
+        return False
 
 
 def post_to_discord(channel: str, message: str) -> bool:
@@ -1347,8 +1449,10 @@ def monitor_open_position():
 
     reason = None
 
-    # 0. Forced flatten 3:45 PM ET — nothing is ever held overnight
-    if now.time() >= dtime(15, 45):
+    # 0. Forced flatten — 3:45 PM ET normally, 12:45 on early-close days.
+    #    Nothing is ever held past the close.
+    _fh, _fm = _flatten_time(now.date())
+    if now.time() >= dtime(_fh, _fm):
         reason = "EOD FLATTEN 3:45 ET (no overnight holds)"
 
     # 1. HARD STOP — software enforcement of the max loss, independent of the
@@ -2160,6 +2264,12 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     )
     log.info("Signal posted to #day-trade-signals")
     _cr = (claude_decision.get("chart_request") or {}) if isinstance(claude_decision, dict) else {}
+    try:
+        post_chart_to_discord("day-trade-signals", ticker,
+                              highlight=str(_cr.get("highlight", "")) if _cr else "",
+                              caption=f"📈 **{ticker}** — the chart behind this setup")
+    except Exception:
+        pass
     _cr_line = ""
     if _cr:
         _cr_line = ("\n[CHART_REQUEST: TICKER=" + str(_cr.get("ticker", ticker))
@@ -2374,8 +2484,9 @@ def _scheduler_loop():
             # v11.3 INGEST-FIRST: keep session structure fresh before anything
             # else in this tick can slow down or fail. Nothing may starve the
             # scanner's memory again.
-            if (today.weekday() < 5 and today not in MARKET_HOLIDAYS_2026
-                    and (9, 25) <= (now.hour, now.minute) <= (15, 50)):
+            if (today.weekday() < 5 and today not in MARKET_HOLIDAYS
+                    and (9, 25) <= (now.hour, now.minute)
+                    <= ((12, 50) if today in EARLY_CLOSE_DATES else (15, 50))):
                 for _tk in TICKERS:
                     try:
                         _lv = get_key_levels(_tk)
@@ -2498,6 +2609,12 @@ def _scheduler_loop():
                                     messages=[{"role": "user", "content": wl_prompt}],
                                 )
                                 post_to_discord("daily-watchlist", _wl_resp.content[0].text.strip())
+                                for _wtk in TICKERS:
+                                    try:
+                                        post_chart_to_discord("daily-watchlist", _wtk,
+                                                              caption=f"📈 **{_wtk}** — levels on the chart")
+                                    except Exception:
+                                        pass
                             except Exception as we:
                                 log.error("Watchlist Claude call failed: " + str(we))
                                 for r_ in rows:
@@ -2594,7 +2711,8 @@ def _scheduler_loop():
                         log.error(f"Scanner error: {e}")
 
             # ── Daily wrap 10:31+ — members get an official end to the day ──
-            if (dtime(10, 31) <= t <= dtime(15, 59)
+            if (today.weekday() < 5 and today not in MARKET_HOLIDAYS
+                    and dtime(10, 31) <= t <= dtime(15, 59)
                     and load_state().get("last_wrap_date") != today_s
                     and not get_open_position()
                     and not _no_trade_today()):
@@ -2850,7 +2968,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.2",
+        "version":            "v12.3",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
