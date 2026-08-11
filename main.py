@@ -381,6 +381,25 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
         st = _mkt_structure.get(ticker) or {}
         candles = st.get("candles") or []
         if len(candles) < 3:
+            # Pre-market / fresh boot: structure is empty, but the chart can
+            # still be real — pull the morning's 1-min bars straight from
+            # Alpaca (pre-market action IS the right 9:15 watchlist chart).
+            try:
+                _day = datetime.now(ET).strftime("%Y-%m-%d")
+                for _feed in ("sip", "iex", None):
+                    _p = {"timeframe": "1Min", "start": _day + "T08:00:00Z", "limit": 1000}
+                    if _feed:
+                        _p["feed"] = _feed
+                    _r = requests.get(
+                        f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                        headers=_alpaca_headers(), params=_p, timeout=6)
+                    if _r.status_code == 200 and _r.json().get("bars"):
+                        candles = [{"t": b["t"], "close": b["c"], "volume": b["v"]}
+                                   for b in _r.json()["bars"]]
+                        break
+            except Exception as _fe:
+                log.warning(f"chart fallback bars {ticker}: {_fe}")
+        if len(candles) < 3:
             return None
         ts, closes, vols = [], [], []
         for c in candles:
@@ -396,7 +415,14 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
         fig, (ax, axv) = plt.subplots(2, 1, figsize=(8, 4.6), dpi=110,
                                       gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
         ax.plot(ts, closes, linewidth=1.6)
-        levels = [("PMH", st.get("pm_high")), ("PML", st.get("pm_low")),
+        _pmh, _pml = st.get("pm_high"), st.get("pm_low")
+        if not (_pmh or _pml):
+            try:
+                _kl = get_key_levels(ticker)
+                _pmh, _pml = _kl.get("pmh"), _kl.get("pml")
+            except Exception:
+                pass
+        levels = [("PMH", _pmh), ("PML", _pml),
                   ("OR-H", st.get("or_high")), ("OR-L", st.get("or_low"))]
         for name, lv in levels:
             if lv:
@@ -3008,7 +3034,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.4",
+        "version":            "v12.5",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
