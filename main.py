@@ -452,7 +452,10 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
         plt.close(fig)
         return buf.getvalue()
     except Exception as e:
-        _LAST_CHART_ERR = f"{type(e).__name__}: {e}"
+        import traceback as _tb
+        _tail = _tb.format_exc().splitlines()
+        _LAST_CHART_ERR = (f"{type(e).__name__}: {e} | trace: "
+                           + " || ".join(_tail[1:3] + ["..."] + _tail[-8:]))[:900]
         log.error(f"CHART RENDER FAILED for {ticker}: {_LAST_CHART_ERR}")
         return None
 
@@ -3046,7 +3049,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.6",
+        "version":            "v12.7",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
