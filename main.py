@@ -371,7 +371,8 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
     Returns PNG bytes, or None on any failure — callers always degrade to
     text-only posts."""
     try:
-        import io
+        import io, os as _os
+        _os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -414,7 +415,7 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
         plt.close(fig)
         return buf.getvalue()
     except Exception as e:
-        log.warning(f"Chart render failed for {ticker}: {e}")
+        log.error(f"CHART RENDER FAILED for {ticker}: {type(e).__name__}: {e}")
         return None
 
 
@@ -424,9 +425,11 @@ def post_chart_to_discord(channel: str, ticker: str, highlight: str = "",
     returns False (and posts nothing) if rendering or upload fails."""
     png = _render_chart_png(ticker, highlight)
     if not png:
+        log.error(f"CHART: no PNG produced for {ticker} — see render error above")
         return False
     channel_id = CHANNEL_IDS.get(channel)
     if not channel_id:
+        log.error(f"CHART: no channel id for '{channel}'")
         return False
     try:
         import json as _json
@@ -440,8 +443,11 @@ def post_chart_to_discord(channel: str, ticker: str, highlight: str = "",
             timeout=15,
         )
         ok = resp.status_code in (200, 201)
-        if not ok:
-            log.warning(f"Chart upload failed {resp.status_code}: {resp.text[:200]}")
+        if ok:
+            log.info(f"CHART posted: {ticker} → #{channel} ({len(png)} bytes)")
+        else:
+            log.error(f"CHART UPLOAD FAILED {resp.status_code} for {ticker} → #{channel}: {resp.text[:300]}"
+                      + (" — bot role likely missing ATTACH FILES permission" if resp.status_code == 403 else ""))
         return ok
     except Exception as e:
         log.warning(f"Chart upload error: {e}")
@@ -2909,6 +2915,40 @@ def kill():
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
+@app.route("/chart-test")
+def chart_test():
+    """Render + upload one chart on demand and report exactly what happened.
+    Safe to hit anytime; posts a test chart to daily-watchlist on success."""
+    ticker = (request.args.get("ticker") or "TSLA").upper()
+    out = {"ticker": ticker, "candles": len((_mkt_structure.get(ticker) or {}).get("candles") or [])}
+    png = _render_chart_png(ticker, "chart-test diagnostic")
+    out["render_ok"] = bool(png)
+    out["png_bytes"] = len(png or b"")
+    if not png:
+        out["hint"] = "render failed or <3 candles in structure — check logs for CHART RENDER FAILED"
+        return jsonify(out), 200
+    try:
+        import json as _json
+        channel_id = CHANNEL_IDS.get("daily-watchlist")
+        resp = requests.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            data={"payload_json": _json.dumps({"content": f"🧪 chart-test — {ticker}\n-# ⚙️ {_BOOT_ID}"})},
+            files={"files[0]": (f"{ticker.lower()}_test.png", png, "image/png")},
+            timeout=15,
+        )
+        out["upload_status"] = resp.status_code
+        out["upload_ok"] = resp.status_code in (200, 201)
+        if not out["upload_ok"]:
+            out["discord_error"] = resp.text[:300]
+            if resp.status_code == 403:
+                out["hint"] = "Bot role is missing the ATTACH FILES permission in this channel"
+    except Exception as e:
+        out["upload_ok"] = False
+        out["error"] = str(e)[:200]
+    return jsonify(out), 200
+
+
 @app.route("/oco-test")
 def oco_test():
     """Validate the v11.7 OCO bracket payload against Tastytrade's dry-run
@@ -2968,7 +3008,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.3",
+        "version":            "v12.4",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
