@@ -364,6 +364,9 @@ def _msg_hash(msg: str) -> str:
     return hashlib.md5(msg.encode()).hexdigest()
 
 
+_LAST_CHART_ERR = ""
+
+
 def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
     """Render the session 1-min chart for a ticker from OUR OWN structure data:
     price line + volume bars + key levels (PMH/PML/OR) + highlight note.
@@ -384,6 +387,8 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
             # Pre-market / fresh boot: structure is empty, but the chart can
             # still be real — pull the morning's 1-min bars straight from
             # Alpaca (pre-market action IS the right 9:15 watchlist chart).
+            global _LAST_CHART_ERR
+            _attempts = []
             try:
                 _day = datetime.now(ET).strftime("%Y-%m-%d")
                 for _feed in ("sip", "iex", None):
@@ -393,13 +398,19 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
                     _r = requests.get(
                         f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
                         headers=_alpaca_headers(), params=_p, timeout=6)
-                    if _r.status_code == 200 and _r.json().get("bars"):
+                    _n = len(_r.json().get("bars") or []) if _r.status_code == 200 else 0
+                    _attempts.append(f"{_feed or 'default'}:{_r.status_code}/{_n}bars"
+                                     + ("" if _r.status_code == 200 else f" {_r.text[:80]}"))
+                    if _r.status_code == 200 and _n:
                         candles = [{"t": b["t"], "close": b["c"], "volume": b["v"]}
                                    for b in _r.json()["bars"]]
                         break
             except Exception as _fe:
+                _attempts.append(f"exception: {type(_fe).__name__}: {_fe}")
                 log.warning(f"chart fallback bars {ticker}: {_fe}")
         if len(candles) < 3:
+            _LAST_CHART_ERR = f"no bars: structure=0, fallback=[{'; '.join(_attempts) if '_attempts' in dir() else 'n/a'}]"
+            log.error(f"CHART RENDER FAILED for {ticker}: {_LAST_CHART_ERR}")
             return None
         ts, closes, vols = [], [], []
         for c in candles:
@@ -441,7 +452,8 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
         plt.close(fig)
         return buf.getvalue()
     except Exception as e:
-        log.error(f"CHART RENDER FAILED for {ticker}: {type(e).__name__}: {e}")
+        _LAST_CHART_ERR = f"{type(e).__name__}: {e}"
+        log.error(f"CHART RENDER FAILED for {ticker}: {_LAST_CHART_ERR}")
         return None
 
 
@@ -2951,7 +2963,7 @@ def chart_test():
     out["render_ok"] = bool(png)
     out["png_bytes"] = len(png or b"")
     if not png:
-        out["hint"] = "render failed or <3 candles in structure — check logs for CHART RENDER FAILED"
+        out["last_chart_error"] = _LAST_CHART_ERR
         return jsonify(out), 200
     try:
         import json as _json
@@ -3034,7 +3046,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.5",
+        "version":            "v12.6",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
