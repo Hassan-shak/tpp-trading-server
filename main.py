@@ -446,7 +446,9 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
                      fontsize=9)
         ax.tick_params(labelsize=7); axv.tick_params(labelsize=7)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ET))
-        fig.tight_layout()
+        # tight_layout() deepcopy-recurses on Python 3.14 + older matplotlib —
+        # fixed margins avoid that code path entirely on any version
+        fig.subplots_adjust(left=0.09, right=0.98, top=0.90, bottom=0.12, hspace=0.18)
         buf = io.BytesIO()
         fig.savefig(buf, format="png")
         plt.close(fig)
@@ -3049,7 +3051,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.7",
+        "version":            "v12.8",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
