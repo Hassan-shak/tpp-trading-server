@@ -164,11 +164,8 @@ def _read_heartbeat() -> dict | None:
 # ── v11.1: POSITION SIZING + RISK MODES (was: quantity hardcoded to 1) ────────
 # high_vol : 10% of net-liq per trade, 25% max stop  (~2.5% acct risk)
 # normal   : 20% of net-liq per trade, 20% max stop  (~4.0% acct risk)
-RISK_MODES = {
-    "high_vol": {"alloc": 0.10, "stop": 0.20},   # v12.2: stop tightened 25→20% per Junior (alloc stays 10%)
-    "normal":   {"alloc": 0.20, "stop": 0.20},
-}
-RISK_MODE      = os.environ.get("RISK_MODE", "high_vol").strip().lower()
+# v13: fixed RISK_MODES retired — allocation now follows the ACCOUNT TIERS
+# (see SIZING_TIERS): <$10k -> 10%, $10k-<$20k -> 7.5%, >=$20k -> 5%, stop 20%.
 NO_TRADE_DATES = {d.strip() for d in
                   os.environ.get("NO_TRADE_DATES", "2026-07-29").split(",") if d.strip()}
 MAX_CONTRACTS  = int(os.environ.get("MAX_CONTRACTS", "10"))
@@ -176,7 +173,11 @@ MAX_OTM_PCT    = float(os.environ.get("MAX_OTM_PCT", "0.06"))
 
 
 def _risk() -> dict:
-    return RISK_MODES.get(RISK_MODE, RISK_MODES["high_vol"])
+    cash = _sizing_cash()
+    if not cash:
+        return {"alloc": 0.10, "stop": 0.20, "tier": "Tier 1 (balance unreadable)"}
+    alloc, name = _tier_for(cash)
+    return {"alloc": alloc, "stop": 0.20, "tier": name}
 
 
 def _stop_pct() -> float:
@@ -187,32 +188,74 @@ def _no_trade_today() -> bool:
     return datetime.now(ET).date().isoformat() in NO_TRADE_DATES
 
 
-def _account_net_liq() -> float | None:
+_bal_cache: dict = {"ts": 0.0, "cash": None, "nl": None}
+
+
+def _account_balances() -> tuple[float | None, float | None]:
+    """(cash_balance, net_liq) — 60s cache so per-tick calls don't hammer TT."""
+    global _bal_cache
+    if time_module.time() - _bal_cache["ts"] < 60 and (_bal_cache["cash"] or _bal_cache["nl"]):
+        return _bal_cache["cash"], _bal_cache["nl"]
     try:
         r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/balances",
                          headers=_tt_headers(), timeout=6)
-        if r.status_code != 200:
-            return None
-        nl = float(r.json().get("data", {}).get("net-liquidating-value") or 0)
-        return nl if nl > 0 else None
+        if r.status_code == 200:
+            d = r.json().get("data", {})
+            cash = float(d.get("cash-balance") or 0) or None
+            nl   = float(d.get("net-liquidating-value") or 0) or None
+            _bal_cache = {"ts": time_module.time(), "cash": cash, "nl": nl}
+            return cash, nl
     except Exception as e:
-        log.warning(f"net-liq fetch failed: {e}")
-        return None
+        log.warning(f"balance fetch failed: {e}")
+    return _bal_cache["cash"], _bal_cache["nl"]
+
+
+def _account_net_liq() -> float | None:
+    _, nl = _account_balances()
+    return nl
+
+
+def _sizing_cash() -> float | None:
+    """Account cash for tier + sizing math (spec: 'available account cash');
+    net-liq stands in when cash is unreadable."""
+    cash, nl = _account_balances()
+    return cash or nl
+
+
+# v13: ACCOUNT ALLOCATION TIERS (Junior's Intraday Sizing & Risk Specification)
+#   <$10k: 10% alloc | $10k–<$20k: 7.5% | >=$20k: 5% — stop fixed 20% at every
+#   tier, so max portfolio risk per trade = alloc x stop = 2% / 1.5% / 1% by
+#   construction.
+SIZING_TIERS = [
+    (10_000.0, 0.100, "Tier 1"),
+    (20_000.0, 0.075, "Tier 2"),
+    (float("inf"), 0.050, "Tier 3"),
+]
+
+
+def _tier_for(cash: float) -> tuple[float, str]:
+    for _ceil, _alloc, _name in SIZING_TIERS:
+        if cash < _ceil:
+            return _alloc, _name
+    return 0.050, "Tier 3"
 
 
 def _position_size(premium: float) -> int:
-    """Contracts = (net_liq * alloc%) / (premium * 100), min 1, capped.
-    If the balance can't be read, fail safe to 1 contract."""
+    """v13 SPEC: qty = Floor(cash * tier_alloc / (ask * 100)), capped at
+    MAX_CONTRACTS. Returns 0 = ABORT: the allocation rules are never
+    overridden to squeeze in 1 contract."""
     if premium <= 0:
-        return 1
-    nl = _account_net_liq()
-    if not nl:
-        log.warning("Sizing: net-liq unavailable — defaulting to 1 contract")
-        return 1
-    qty = int((nl * _risk()["alloc"]) // (premium * 100))
-    qty = max(1, min(qty, MAX_CONTRACTS))
-    log.info(f"Sizing [{RISK_MODE}]: net_liq=${nl:.0f} alloc={_risk()['alloc']:.0%} "
-             f"premium=${premium:.2f} -> {qty} contract(s)")
+        return 0
+    cash = _sizing_cash()
+    if not cash:
+        log.error("Sizing ABORT: account balance unreadable — refusing to size blind")
+        return 0
+    r = _risk()
+    qty = int((cash * r["alloc"]) // (premium * 100))
+    qty = min(qty, MAX_CONTRACTS)
+    log.info(f"Sizing [{r['tier']}]: cash=${cash:.0f} alloc={r['alloc']:.1%} "
+             f"premium=${premium:.2f} -> {qty} contract(s)"
+             + (" — ABORT (exceeds tier allocation)" if qty == 0 else ""))
     return qty
 _state: dict = {}
 
@@ -2212,6 +2255,19 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     _entry_q = _live_option_quote(occ)
     _entry_ask = float((_entry_q or {}).get("ask") or 0)
     qty = _position_size(_entry_ask)
+    if qty == 0:
+        _r = _risk()
+        _cash = _sizing_cash() or 0
+        log.info(f"ABORT: {occ} ask ${_entry_ask:.2f} exceeds {_r['tier']} allocation "
+                 f"({_r['alloc']:.1%} of ${_cash:.0f})")
+        post_to_discord(
+            "daily-watchlist",
+            f"📚 **Setup we passed on — {ticker} {direction.upper()}**\n"
+            f"Valid signal, but the contract (${_entry_ask:.2f} ≈ ${_entry_ask * 100:.0f}) "
+            f"exceeds our {_r['tier']} allocation cap ({_r['alloc']:.1%} of account cash). "
+            f"Sizing rules are never overridden — no trade.",
+        )
+        return False
     fill_price = enter_trade(occ, qty)
     if not fill_price and _last_order_id and not _last_order_error:
         # Order reached the broker but confirmation failed — never walk away.
@@ -2585,7 +2641,8 @@ def _scheduler_loop():
                         lines.append(f"❌ Position check failed: {e}"); bad = True
                     _s0 = load_state()
                     lines.append(f"{'🛑 FOMC/no-trade day — entries OFF' if _no_trade_today() else '✅ Trading day'}"
-                                 f" | mode {RISK_MODE} ({_risk()['alloc']:.0%}/trade, {_stop_pct():.0%} stop)")
+                                 f" | {_risk()['tier']} ({_risk()['alloc']:.1%}/trade, {_stop_pct():.0%} stop, "
+                                 f"max {_risk()['alloc'] * _stop_pct():.1%} account risk)")
                     lines.append(f"✅ v{'11.6'} boot {_BOOT_ID} | trades {_s0.get('trade_count', 0)}/2 | "
                                  f"circuit {'ON' if _s0.get('circuit_breaker') else 'off'}")
                     send_emergency_dm(
@@ -3052,7 +3109,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.9",
+        "version":            "v13.0",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
@@ -3060,7 +3117,7 @@ def status():
         "scheduler_thread_alive":    _thread_alive,
         "heartbeat_boot_id":  hb.get("boot_id") if hb else None,
         "heartbeat_age_s":    hb_age,
-        "risk_mode":          RISK_MODE,
+        "risk_mode":          _risk().get("tier", "?"),
         "alloc_pct":          _risk()["alloc"],
         "stop_pct":           _stop_pct(),
         "no_trade_today":     _no_trade_today(),
