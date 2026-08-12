@@ -1437,8 +1437,9 @@ def monitor_open_position():
     #   Stage 2: peak >= +20%  -> stop to ENTRY +10%   (was +25% — trades kept
     #            peaking ~+20% and scratching out at breakeven)
     #   Stage 3: peak >= +30%  -> stop to ENTRY +20%
-    _LADDER = [(0.10, 0.00, "break-even locked — this trade can no longer turn into a loss"),
-               (0.20, 0.10, "+10% profit locked — worst case from here is a winner"),
+    _LADDER = [(0.10, 0.02, "break-even cushion locked (+2%) — fees covered, this can't go red"),
+               (0.15, 0.05, "+5% locked — guaranteed net green"),
+               (0.20, 0.10, "+10% profit locked — worst case from here is a solid winner"),
                (0.30, 0.20, "+20% profit locked — most of this move is now yours")]
     _stage = int(pos.get("ratchet_stage") or 0)
     _want  = 0
@@ -1476,7 +1477,7 @@ def monitor_open_position():
                      "whenever you're comfortable — you don't have to wait for the +40% target.")
             post_to_discord(
                 "day-trade-signals",
-                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/3).**\n"
+                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/{len(_LADDER)}).**\n"
                 f"Stop moved to ${_desired:.2f} — {_msg}.\n{_take}",
             )
         set_open_position(pos)
@@ -2307,7 +2308,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
            f"either fills, the other cancels\n"
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
-        + "Protection tiers: +10% → break-even, +20% → +10% locked, +30% → +20% locked. "
+        + "Protection tiers: +10% → BE+2%, +15% → +5%, +20% → +10%, +30% → +20% locked. "
           "Take profits early whenever you're comfortable — the target is ours, the gains are yours\n\n"
         f"{setup}",
     )
@@ -3051,7 +3052,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v12.8",
+        "version":            "v12.9",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
