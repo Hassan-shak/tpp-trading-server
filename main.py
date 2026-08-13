@@ -227,10 +227,13 @@ def _sizing_cash() -> float | None:
 #   tier, so max portfolio risk per trade = alloc x stop = 2% / 1.5% / 1% by
 #   construction.
 SIZING_TIERS = [
-    (10_000.0, 0.100, "Tier 1"),
-    (20_000.0, 0.075, "Tier 2"),
+    (10_000.0, 0.200, "Tier 1"),   # v13.1 Community-First spec: 20% <$10k
+    (20_000.0, 0.100, "Tier 2"),   # 10% $10k-<$20k
     (float("inf"), 0.050, "Tier 3"),
 ]
+# Optional breathing room under each profit-lock rung (0.0 = lock exactly AT
+# the milestone per spec; e.g. 0.02 puts the +10% rung's stop at +8%)
+LOCK_BUFFER = float(os.environ.get("LOCK_BUFFER_PCT", "0.0"))
 
 
 def _tier_for(cash: float) -> tuple[float, str]:
@@ -1475,15 +1478,57 @@ def monitor_open_position():
         pos["peak_pnl"] = peak_pnl
         set_open_position(pos)
 
+    # v13.1 RECOVERY RULE: a trade that dipped <=-10% and clawed back above
+    # flat gets its stop raised to -10% — a comeback never re-tests -20%.
+    _trough = float(pos.get("trough_pnl") or 0.0)
+    if pnl_pct < _trough:
+        _trough = pnl_pct
+        pos["trough_pnl"] = _trough
+        set_open_position(pos)
+    if (_trough <= -0.10 and pnl_pct > 0.0
+            and int(pos.get("ratchet_stage") or 0) == 0
+            and not pos.get("recovery_locked")):
+        _rec_floor = _tick(fill_price * 0.90)
+        _cur_floor = float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
+        if _rec_floor > _cur_floor:
+            _ok_r = False
+            if pos.get("oco_id"):
+                _cancel_complex_order(pos.get("oco_id"))
+                _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_rec_floor)
+                if _new_oco:
+                    pos["oco_id"] = _new_oco
+                    _ok_r = True
+                else:
+                    _sid_r = place_stop_loss(occ, fill_price, _q, trigger_override=_rec_floor)
+                    pos["oco_id"] = None
+                    pos["stop_order_id"] = _sid_r
+                    _ok_r = bool(_sid_r)
+                    send_emergency_dm(f"RECOVERY: OCO re-place failed for {occ}; "
+                                      f"plain stop {'set' if _sid_r else 'ALSO FAILED'} at ${_rec_floor:.2f}")
+            elif pos.get("stop_order_id"):
+                cancel_resting_stop(pos.get("stop_order_id"))
+                _sid_r = place_stop_loss(occ, fill_price, _q, trigger_override=_rec_floor)
+                pos["stop_order_id"] = _sid_r
+                _ok_r = bool(_sid_r)
+            if _ok_r:
+                pos["recovery_locked"] = True
+                pos["floor_trigger"] = _rec_floor
+                post_to_discord(
+                    "day-trade-signals",
+                    f"🔄 **{_fmt_occ(occ)} — comeback protected.**\n"
+                    f"This trade dipped {_trough:+.1%} and fought back green — stop raised to "
+                    f"${_rec_floor:.2f} (-10%). A recovered trade never re-tests the full stop.",
+                )
+            set_open_position(pos)
+
     # v12.1 MULTI-TIER PROFIT PROTECTION (3 rungs, max 3 stop replacements):
     #   Stage 1: peak >= +10%  -> stop to BREAK-EVEN
     #   Stage 2: peak >= +20%  -> stop to ENTRY +10%   (was +25% — trades kept
     #            peaking ~+20% and scratching out at breakeven)
     #   Stage 3: peak >= +30%  -> stop to ENTRY +20%
-    _LADDER = [(0.10, 0.02, "break-even cushion locked (+2%) — fees covered, this can't go red"),
-               (0.15, 0.05, "+5% locked — guaranteed net green"),
-               (0.20, 0.10, "+10% profit locked — worst case from here is a solid winner"),
-               (0.30, 0.20, "+20% profit locked — most of this move is now yours")]
+    _LADDER = [(0.10, 0.10 - LOCK_BUFFER, "+10% locked — first green win guaranteed"),
+               (0.20, 0.20 - LOCK_BUFFER, "+20% locked — solid base gain banked"),
+               (0.30, 0.30 - LOCK_BUFFER, "+30% locked — the bulk of this move is protected")]
     _stage = int(pos.get("ratchet_stage") or 0)
     _want  = 0
     for _k, (_thr, _lock, _msg) in enumerate(_LADDER, start=1):
@@ -2364,7 +2409,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
            f"either fills, the other cancels\n"
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
-        + "Protection tiers: +10% → BE+2%, +15% → +5%, +20% → +10%, +30% → +20% locked. "
+        + "Protection: recovery rule (dip ≤-10% then back green → stop -10%) | locks AT +10% / +20% / +30% | target +40%. "
           "Take profits early whenever you're comfortable — the target is ours, the gains are yours\n\n"
         f"{setup}",
     )
@@ -2400,6 +2445,8 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "oco_id":        oco_id,
         "floor_trigger": round(fill_price * (1 - _stop_pct()), 2),
         "ratchet_stage": 0,
+        "trough_pnl":    0.0,
+        "recovery_locked": False,
         "last_update_ts": time_module.time(),
         "target_price":  round(fill_price * 1.40, 2),
         "peak_pnl":      0.0,
@@ -3109,7 +3156,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.0",
+        "version":            "v13.1",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
