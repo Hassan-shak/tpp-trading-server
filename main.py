@@ -3151,7 +3151,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.2",
+        "version":            "v13.3",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
@@ -3497,6 +3497,71 @@ _boot_done = False
 _boot_guard = threading.Lock()
 
 
+def _resync_day_state_from_discord():
+    """A fresh instance starts with blank /tmp state. Before the scheduler
+    runs, read today's OWN posts back from Discord so the day's facts survive
+    a redeploy: (1) a wrap already posted today -> stamp last_wrap_date so we
+    never post a second, contradictory wrap; (2) recap posts from today ->
+    rebuild today_results so a later wrap reports the real tally. Best-effort:
+    any failure leaves state blank, which is no worse than before."""
+    import re as _re
+    today_et = datetime.now(ET).date()
+
+    def _msgs(channel):
+        cid = CHANNEL_IDS.get(channel)
+        if not cid:
+            return []
+        try:
+            r = requests.get(f"{DISCORD_API}/channels/{cid}/messages",
+                             headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+                             params={"limit": 30}, timeout=10)
+            return r.json() if r.status_code == 200 else []
+        except Exception as e:
+            log.warning(f"day-state resync: fetch {channel} failed: {e}")
+            return []
+
+    def _is_today(m):
+        try:
+            ts = datetime.fromisoformat(str(m.get("timestamp")).replace("Z", "+00:00"))
+            return ts.astimezone(ET).date() == today_et
+        except Exception:
+            return False
+
+    try:
+        # (1) wrap dedup
+        if any(_is_today(m) and "Window closed" in (m.get("content") or "")
+               for m in _msgs("daily-watchlist")):
+            with _state_lock:
+                s = load_state()
+                s["last_wrap_date"] = today_et.isoformat()
+                _commit(s)
+            log.info("day-state resync: wrap already posted today — stamped")
+
+        # (2) rebuild today's results from our own recap posts
+        results = []
+        pat = _re.compile(
+            r"(✅|❌) \*\*(\S+) .*?CLOSED\*\*.*?P&L: ([+-][\d.]+)% \(([+-]?)\$([\d.]+) total",
+            _re.S)
+        for m in reversed(_msgs("profits-and-recaps")):   # oldest first
+            if not _is_today(m):
+                continue
+            g = pat.search(m.get("content") or "")
+            if g:
+                _sign = -1.0 if (g.group(1) == "❌" or g.group(4) == "-") else 1.0
+                results.append({"ticker": g.group(2), "win": g.group(1) == "✅",
+                                "pnl_pct": float(g.group(3)) / 100.0,
+                                "pnl_dollar": _sign * abs(float(g.group(5)))})
+        if results:
+            with _state_lock:
+                s = load_state()
+                if not s.get("today_results"):
+                    s["today_results"] = results
+                    _commit(s)
+            log.info(f"day-state resync: rebuilt {len(results)} trade result(s) from recaps")
+    except Exception as e:
+        log.warning(f"day-state resync failed (non-fatal): {e}")
+
+
 def _boot_in_worker():
     """v11.2: ALL boot work happens here, in the process that serves HTTP —
     never at module import. This makes the app immune to gunicorn preload /
@@ -3518,6 +3583,7 @@ def _boot_in_worker():
     load_state()
     _hydrate_structure()
     _adopt_broker_positions()
+    _resync_day_state_from_discord()
     _ensure_scheduler()
 
 
