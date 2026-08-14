@@ -68,8 +68,8 @@ TT_ACCOUNT         = os.environ["TASTYTRADE_ACCOUNT_NUMBER"]
 DISCORD_API        = "https://discord.com/api/v10"
 CLAUDE_MODEL       = "claude-sonnet-4-6"
 MAX_DAILY_CALLS    = 220
-MIN_PREMIUM        = 0.75   # per share → $75/contract
-MAX_PREMIUM        = 1.50   # per share → $150/contract
+MIN_PREMIUM        = float(os.environ.get("PREMIUM_MIN", "0.75"))   # $75/contract floor
+MAX_PREMIUM        = float(os.environ.get("PREMIUM_MAX", "1.50"))   # $150/contract cap — members can afford every trade
 MAX_SPREAD         = 0.05   # 5% bid-ask spread cap
 FILL_TIMEOUT       = 60     # seconds before cancel on entry
 CLOSE_TIMEOUT      = 45     # seconds before market escalation on exit
@@ -1017,12 +1017,11 @@ def select_contract(ticker: str, direction: str) -> tuple:
     ai      = strikes.index(atm)
     ordered = strikes[ai:] if direction == "call" else list(reversed(strikes[:ai + 1]))
 
-    # v11.4: risk-budget-first selection. Per-contract budget = this trade's
-    # dollar allocation; take the CLOSEST strike we can afford within
-    # MAX_OTM_PCT of spot. Higher delta, same dollars at risk. The old
-    # premium band remains as a fallback so a small account still trades.
-    _nl = _account_net_liq()
-    budget_ask = (_nl * _risk()["alloc"] / 100.0) if _nl else None
+    # v13.2 COMMUNITY-FIRST SELECTION: the premium band IS the rule.
+    # Only contracts asking $%.2f–$%.2f qualify (small-account friendly —
+    # members can mirror every trade). Closest-to-money strike inside the
+    # band wins; sizing then buys multiple contracts within the tier
+    # allocation. Nothing in band within MAX_OTM_PCT of spot = NO TRADE.
     quotes = []
     for strike in ordered:
         occ   = strike_map[strike]
@@ -1036,24 +1035,20 @@ def select_contract(ticker: str, direction: str) -> tuple:
         spread = (ask - bid) / ask if ask else 1
         quotes.append((strike, occ, ask, spread))
         if ask < MIN_PREMIUM:
-            break   # far enough OTM that premiums died — stop pulling quotes
+            break   # premiums below the band floor — no point walking further
 
-    if budget_ask:
-        for strike, occ, ask, spread in quotes:
-            if spread >= MAX_SPREAD or ask < MIN_PREMIUM:
-                continue
-            if ask <= budget_ask and abs(strike - spot) / spot <= MAX_OTM_PCT:
-                log.info(f"Contract {occ} ask {ask} (budget-first, "
-                         f"{abs(strike - spot) / spot:.1%} OTM, budget ${budget_ask:.2f})")
-                return occ, strike, ask
-
-    for strike, occ, ask, spread in quotes:   # legacy premium-band fallback
+    for strike, occ, ask, spread in quotes:   # ordered = closest-to-ATM first
         if spread >= MAX_SPREAD:
             continue
-        if MIN_PREMIUM <= ask <= MAX_PREMIUM:
-            log.info(f"Contract {occ} ask {ask} (premium-band fallback)")
-            return occ, strike, ask
-    log.warning(f"No contract in range for {ticker} {direction}")
+        if not (MIN_PREMIUM <= ask <= MAX_PREMIUM):
+            continue
+        if abs(strike - spot) / spot > MAX_OTM_PCT:
+            continue
+        log.info(f"Contract {occ} ask {ask} (in-band ${MIN_PREMIUM}-${MAX_PREMIUM}, "
+                 f"{abs(strike - spot) / spot:.1%} OTM)")
+        return occ, strike, ask
+    log.warning(f"No contract in the ${MIN_PREMIUM}-${MAX_PREMIUM} band for {ticker} "
+                f"{direction} within {MAX_OTM_PCT:.0%} OTM — trade will be passed")
     return None, None, None
 
 _last_order_error = None
@@ -3156,7 +3151,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.1",
+        "version":            "v13.2",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
