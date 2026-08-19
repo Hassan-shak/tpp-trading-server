@@ -166,8 +166,19 @@ def _read_heartbeat() -> dict | None:
 # normal   : 20% of net-liq per trade, 20% max stop  (~4.0% acct risk)
 # v13: fixed RISK_MODES retired — allocation now follows the ACCOUNT TIERS
 # (see SIZING_TIERS): <$10k -> 10%, $10k-<$20k -> 7.5%, >=$20k -> 5%, stop 20%.
-NO_TRADE_DATES = {d.strip() for d in
-                  os.environ.get("NO_TRADE_DATES", "2026-07-29").split(",") if d.strip()}
+# v13.4 FED-DAY FULL SHUTDOWNS (decisions + minutes releases, 2026–27) —
+# hardcoded per Junior's calendar; env NO_TRADE_DATES adds further dates.
+FED_SHUTDOWN_DAYS = {
+    "2026-07-29",
+    # FOMC rate decisions / press conferences
+    "2026-09-16", "2026-10-28", "2026-12-09",
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28",
+    # FOMC minutes releases (2:00 PM ET)
+    "2026-08-19", "2026-10-07", "2026-11-18", "2026-12-30",
+    "2027-02-17", "2027-04-07", "2027-05-19", "2027-06-30",
+}
+NO_TRADE_DATES = FED_SHUTDOWN_DAYS | {d.strip() for d in
+                  os.environ.get("NO_TRADE_DATES", "").split(",") if d.strip()}
 MAX_CONTRACTS  = int(os.environ.get("MAX_CONTRACTS", "10"))
 MAX_OTM_PCT    = float(os.environ.get("MAX_OTM_PCT", "0.06"))
 
@@ -2700,11 +2711,11 @@ def _scheduler_loop():
                     log.info("JOB: no-trade day notice (FOMC/high-risk)")
                     post_to_discord(
                         "daily-watchlist",
-                        "@everyone 🛑 **No trades today — FOMC day.**\n"
-                        "Fed rate decision at 2:00 PM ET with the press conference at 2:30 "
-                        "means whipsaw risk all session, and our edge is the opening-range "
-                        "playbook — not Fed roulette. Capital protection IS a position. "
-                        "Back at it tomorrow with the same rules.",
+                        "@everyone 🛑 **FED DAY / HIGH VOLATILITY EVENT**\n"
+                        "System is sitting 100% cash today. No day trades or swing trades "
+                        "will be taken. Fed events mean binary whipsaw risk all session — "
+                        "our edge is the playbook, not Fed roulette. Capital protection IS "
+                        "a position. Back at it next session with the same rules.",
                     )
                     last_watchlist_date = today_s
                     _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
@@ -3151,7 +3162,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.3",
+        "version":            "v13.4",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
