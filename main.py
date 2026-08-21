@@ -69,7 +69,10 @@ DISCORD_API        = "https://discord.com/api/v10"
 CLAUDE_MODEL       = "claude-sonnet-4-6"
 MAX_DAILY_CALLS    = 220
 MIN_PREMIUM        = float(os.environ.get("PREMIUM_MIN", "0.75"))   # $75/contract floor
-MAX_PREMIUM        = float(os.environ.get("PREMIUM_MAX", "1.50"))   # $150/contract cap — members can afford every trade
+MAX_PREMIUM        = float(os.environ.get("PREMIUM_MAX", "1.50"))   # primary band cap
+SECONDARY_MAX      = float(os.environ.get("PREMIUM_SECONDARY_MAX", "3.00"))  # fallback band cap
+MAX_SPREAD_MID     = float(os.environ.get("MAX_SPREAD_MID", "0.05"))  # spread <= 5% of mid (liquidity rule)
+_last_selection_tier = None
 MAX_SPREAD         = 0.05   # 5% bid-ask spread cap
 FILL_TIMEOUT       = 60     # seconds before cancel on entry
 CLOSE_TIMEOUT      = 45     # seconds before market escalation on exit
@@ -1028,12 +1031,13 @@ def select_contract(ticker: str, direction: str) -> tuple:
     ai      = strikes.index(atm)
     ordered = strikes[ai:] if direction == "call" else list(reversed(strikes[:ai + 1]))
 
-    # v13.2 COMMUNITY-FIRST SELECTION: the premium band IS the rule.
-    # Only contracts asking $%.2f–$%.2f qualify (small-account friendly —
-    # members can mirror every trade). Closest-to-money strike inside the
-    # band wins; sizing then buys multiple contracts within the tier
-    # allocation. Nothing in band within MAX_OTM_PCT of spot = NO TRADE.
-    quotes = []
+    # v13.5 TWO-TIER SELECTION (user spec): Primary band $0.75-$1.50 (sweet
+    # spot $1.00) -> fallback Secondary $1.51-$3.00 (sweet spot $2.00).
+    # Liquidity rule: spread <= 5% of MID. Moneyness cap (MAX_OTM_PCT)
+    # retained across both bands. Nothing qualifying = NO TRADE.
+    global _last_selection_tier
+    _last_selection_tier = None
+    candidates = []
     for strike in ordered:
         occ   = strike_map[strike]
         quote = _live_option_quote(occ)
@@ -1043,23 +1047,32 @@ def select_contract(ticker: str, direction: str) -> tuple:
         bid = float(quote.get("bid") or 0)
         if ask <= 0:
             continue
-        spread = (ask - bid) / ask if ask else 1
-        quotes.append((strike, occ, ask, spread))
-        if ask < MIN_PREMIUM:
-            break   # premiums below the band floor — no point walking further
-
-    for strike, occ, ask, spread in quotes:   # ordered = closest-to-ATM first
-        if spread >= MAX_SPREAD:
-            continue
-        if not (MIN_PREMIUM <= ask <= MAX_PREMIUM):
+        mid = (ask + bid) / 2.0
+        spread_mid = (ask - bid) / mid if mid > 0 else 1.0
+        if spread_mid > MAX_SPREAD_MID:
             continue
         if abs(strike - spot) / spot > MAX_OTM_PCT:
             continue
-        log.info(f"Contract {occ} ask {ask} (in-band ${MIN_PREMIUM}-${MAX_PREMIUM}, "
+        candidates.append((strike, occ, ask))
+        if ask < MIN_PREMIUM:
+            break   # premiums below the primary floor — chain walked far enough
+
+    primary   = [c for c in candidates if MIN_PREMIUM <= c[2] <= MAX_PREMIUM]
+    secondary = [c for c in candidates if MAX_PREMIUM < c[2] <= SECONDARY_MAX]
+    pick, sweet = None, None
+    if primary:
+        pick, sweet = min(primary, key=lambda c: abs(c[2] - 1.00)), 1.00
+        _last_selection_tier = f"Primary ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}"
+    elif secondary:
+        pick, sweet = min(secondary, key=lambda c: abs(c[2] - 2.00)), 2.00
+        _last_selection_tier = f"Secondary ${MAX_PREMIUM + 0.01:.2f}-${SECONDARY_MAX:.2f}"
+    if pick:
+        strike, occ, ask = pick
+        log.info(f"Contract {occ} ask {ask} ({_last_selection_tier}, sweet ${sweet:.2f}, "
                  f"{abs(strike - spot) / spot:.1%} OTM)")
         return occ, strike, ask
-    log.warning(f"No contract in the ${MIN_PREMIUM}-${MAX_PREMIUM} band for {ticker} "
-                f"{direction} within {MAX_OTM_PCT:.0%} OTM — trade will be passed")
+    log.warning(f"No liquidity-passing contract ${MIN_PREMIUM}-${SECONDARY_MAX} for "
+                f"{ticker} {direction} within {MAX_OTM_PCT:.0%} OTM — trade will be passed")
     return None, None, None
 
 _last_order_error = None
@@ -1590,6 +1603,11 @@ def monitor_open_position():
             + ("\n💰 Green — taking profits early is always allowed. Our target is +40%, but your gains are yours."
                if pnl_pct >= 0.10 else ""),
         )
+        try:
+            post_chart_to_discord("day-trade-signals", pos.get("ticker") or "",
+                                  caption=f"📈 **{pos.get('ticker')}** — live chart with the trade on")
+        except Exception:
+            pass
 
     reason = None
 
@@ -2413,6 +2431,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"**Target:** ${target:.2f} (+40%)\n"
         + (f"**Bracket resting at broker ✅** — target ${target:.2f} & stop ${stop:.2f} ({stop_lbl}) as one OCO: "
            f"either fills, the other cancels\n"
+           + (f"Contract band: {_last_selection_tier}\n" if _last_selection_tier else "")
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
         + "Protection: recovery rule (dip ≤-10% then back green → stop -10%) | locks AT +10% / +20% / +30% | target +40%. "
@@ -2786,31 +2805,46 @@ def _scheduler_loop():
                                         " - window opens 9:30 AM ET, alerts on confirmed setups only.")
                         else:
                             log.warning("Watchlist skipped - no level data for either ticker")
-                        try:
-                            _sb_lines = []
-                            for _t in TICKERS:
-                                _c_occ, _cs, _ca = select_contract(_t, "call")
-                                _p_occ, _ps, _pa = select_contract(_t, "put")
-                                if _c_occ or _p_occ:
-                                    _parts = []
-                                    if _c_occ:
-                                        _parts.append(f"📈 breakout → **{_fmt_occ(_c_occ)}** (~${_ca:.2f})")
-                                    if _p_occ:
-                                        _parts.append(f"📉 breakdown → **{_fmt_occ(_p_occ)}** (~${_pa:.2f})")
-                                    _sb_lines.append(f"**{_t}:** " + "  |  ".join(_parts))
-                            if _sb_lines:
-                                post_to_discord(
-                                    "daily-watchlist",
-                                    "🎯 **Contracts on standby — have these loaded, enter ONLY when the entry signal fires:**\n"
-                                    + "\n".join(_sb_lines)
-                                    + "\n_Premiums move by the open — the entry signal names the final contract and price._",
-                                )
-                        except Exception as _sb_e:
-                            log.warning(f"standby contracts post failed: {_sb_e}")
+                        post_to_discord(
+                            "daily-watchlist",
+                            "🎯 Standby contracts post at **9:31 AM with live market pricing** — "
+                            "pre-market premiums shift at the open, so we quote them when they're real.",
+                        )
                         last_watchlist_date = today_s
                         _sp = load_state(); _sp["last_watchlist_date"] = today_s; _commit(_sp)
                     except Exception as e:
                         log.error(f"Watchlist job error: {e}")
+
+                # ── 9:31 AM standby contracts — LIVE pricing (member fix:
+                #     pre-market quotes were stale by the open) ─────────────
+                if (dtime(9, 31) <= t <= dtime(9, 42)
+                        and load_state().get("last_standby_date") != today_s
+                        and not _no_trade_today()):
+                    with _state_lock:
+                        _ss = load_state(); _ss["last_standby_date"] = today_s; _commit(_ss)
+                    try:
+                        _sb_lines = []
+                        for _t in TICKERS:
+                            _c_occ, _cs, _ca = select_contract(_t, "call")
+                            _p_occ, _ps, _pa = select_contract(_t, "put")
+                            if _c_occ or _p_occ:
+                                _parts = []
+                                if _c_occ:
+                                    _parts.append(f"📈 breakout → **{_fmt_occ(_c_occ)}** (~${_ca:.2f})")
+                                if _p_occ:
+                                    _parts.append(f"📉 breakdown → **{_fmt_occ(_p_occ)}** (~${_pa:.2f})")
+                                _sb_lines.append(f"**{_t}:** " + "  |  ".join(_parts))
+                        if _sb_lines:
+                            post_to_discord(
+                                "daily-watchlist",
+                                "🎯 **Contracts on standby — LIVE 9:31 pricing. Have these loaded, "
+                                "enter ONLY when the entry signal fires:**\n"
+                                + "\n".join(_sb_lines)
+                                + "\n_The entry signal always names the final contract and fill price._",
+                            )
+                            log.info("JOB: 9:31 live standby contracts posted")
+                    except Exception as _sb_e:
+                        log.warning(f"9:31 standby post failed: {_sb_e}")
 
                 # ── 9:45 AM status update ─────────────────────────────────
                 if (dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s
@@ -2818,6 +2852,12 @@ def _scheduler_loop():
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
                         _post_scanning_update("9:45 AM", "No forced trades — entries hit #day-trade-signals only on confirmed setups.")
+                        for _ctk in TICKERS:
+                            try:
+                                post_chart_to_discord("daily-watchlist", _ctk,
+                                                      caption=f"📈 **{_ctk}** — live session so far")
+                            except Exception:
+                                pass
                         log.info("9:45 status update posted")
                     else:
                         log.info("9:45 status update skipped — trade already active")
@@ -2830,6 +2870,12 @@ def _scheduler_loop():
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
                         _post_scanning_update("10:15 AM — final stretch", "Window closes 10:30 — if nothing sets up we sit out. No forced trades.")
+                        for _ctk in TICKERS:
+                            try:
+                                post_chart_to_discord("daily-watchlist", _ctk,
+                                                      caption=f"📈 **{_ctk}** — live session so far")
+                            except Exception:
+                                pass
                         log.info("10:15 status update posted")
                     else:
                         log.info("10:15 status update skipped — trade already active")
@@ -3162,7 +3208,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.4",
+        "version":            "v13.5",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
