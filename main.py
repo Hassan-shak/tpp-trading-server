@@ -799,7 +799,8 @@ def _adopt_broker_positions():
             "occ_symbol":    occ,
             "qty":           int(qty),
             "fill_price":    basis,
-            "oco_id":        (place_oco_bracket(occ, basis, int(qty))[0]),
+            "oco_id":        (_tt_sweep_closing_orders(occ) is not None
+                              and place_oco_bracket(occ, basis, int(qty))[0]),
             "stop_order_id": None,
             "floor_trigger": round(basis * (1 - _stop_pct()), 2),
             "target_price":  round(basis * 1.40, 2),
@@ -809,6 +810,11 @@ def _adopt_broker_positions():
         })
         log.critical(f"[{_BOOT_ID}] ADOPTED broker position {occ} basis ${basis:.2f} "
                      "— monitor/trailing/3:45 flatten reattached")
+        if not (load_state().get("open_position") or {}).get("oco_id"):
+            send_emergency_dm(
+                f"ADOPTION: could not arm a fresh bracket for {occ} — software hard "
+                f"stop is the only floor. Check the broker NOW.",
+                prefix="🚨 **TPP PROTECTION ALERT** 🚨")
         post_to_discord("daily-watchlist",
                         f"♻️ Reattached to open position **{_fmt_occ(occ)}** after a "
                         f"restart — managing per playbook (target +40%, trailing stop, "
@@ -1162,6 +1168,41 @@ def _fmt_occ(occ: str) -> str:
         return occ
 
 
+def _tt_sweep_closing_orders(occ: str) -> int:
+    """v13.7: cancel every live order (simple + complex) that references this
+    option symbol. Used before (re)placing protection so the broker never
+    holds duplicate closing orders — the silent-rejection trap behind the
+    Aug 25 frozen-ratchet incident. Returns count canceled; best-effort."""
+    swept = 0
+    _sym = occ.replace(" ", "")
+    for _ep in ("orders", "complex-orders"):
+        try:
+            r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}",
+                             headers=_tt_headers(),
+                             params={"status[]": ["Live", "Received", "Routed"]},
+                             timeout=8)
+            if r.status_code != 200:
+                continue
+            items = (r.json().get("data") or {}).get("items") or []
+            for it in items:
+                _id = it.get("id")
+                _legs = it.get("legs") or []
+                for _o in (it.get("orders") or []):     # complex orders nest orders->legs
+                    _legs += _o.get("legs") or []
+                if _id and any(_sym == str(l.get("symbol", "")).replace(" ", "")
+                               for l in _legs):
+                    try:
+                        requests.delete(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}/{_id}",
+                                        headers=_tt_headers(), timeout=8)
+                        swept += 1
+                        log.info(f"SWEEP: canceled resting {_ep[:-1]} {_id} for {occ}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning(f"sweep {_ep} failed: {e}")
+    return swept
+
+
 def _tt_order_status(order_id: str) -> tuple[str, float | None]:
     """One robust status check. Handles both response shapes (order directly
     under data, or nested under data.order) and case-insensitive statuses.
@@ -1419,6 +1460,51 @@ def monitor_open_position():
     peak_pnl   = float(pos.get("peak_pnl", 0.0))
     _q         = int(pos.get("qty") or 1)
 
+    # v13.8 BROKER-TRUTH CHECK: if the broker shows NO position for this
+    # symbol, the trade is OVER regardless of what our state believes — a
+    # restart-adopted position can be closed out from under us (Aug 25: the
+    # system narrated a sold position for hours). Detect within one tick,
+    # announce honestly, reconcile, never ghost.
+    if (now - entry_time).total_seconds() > 90:
+        try:
+            _live_syms = {str(p.get("symbol", "")).replace(" ", "")
+                          for p in _tt_open_option_positions()}
+            if occ.replace(" ", "") not in _live_syms:
+                _bid_now = float((_live_option_quote(occ) or {}).get("bid") or 0)
+                _est_px  = _bid_now or float(pos.get("floor_trigger") or fill_price)
+                _pnl_p   = (_est_px - fill_price) / fill_price
+                _pnl_d   = (_est_px - fill_price) * 100 * _q
+                log.critical(f"BROKER-TRUTH: {occ} no longer held at broker — "
+                             f"reconciling (est exit ~${_est_px:.2f})")
+                _tt_sweep_closing_orders(occ)
+                post_to_discord(
+                    "day-trade-signals",
+                    f"⚖️ **{_fmt_occ(occ)} — position closed at the broker.**\n"
+                    f"Our records showed it open; the broker is ground truth and it's "
+                    f"closed. If you followed this trade, confirm your own exit. "
+                    f"Approx. exit ~${_est_px:.2f} ({_pnl_p:+.1%} est.) — exact fills "
+                    f"in your broker history. Recap follows.",
+                )
+                post_to_discord(
+                    "profits-and-recaps",
+                    f"{'✅' if _pnl_p >= 0 else '❌'} **{_fmt_occ(occ)} CLOSED** — "
+                    f"BROKER RECONCILE (fill detected at broker)\n"
+                    f"Entry: ${fill_price:.2f} → Exit: ~${_est_px:.2f} (est.)\n"
+                    f"P&L: {_pnl_p:+.1%} (${_pnl_d:+.0f} est. on {_q} contract(s))",
+                )
+                send_emergency_dm(
+                    f"BROKER-TRUTH reconcile: {occ} was closed at the broker while "
+                    f"state showed it open (est. {_pnl_p:+.1%}). State cleaned; "
+                    f"verify fills in TT history.",
+                    prefix="⚖️ **TPP RECONCILE**")
+                record_trade_result(_pnl_p >= 0, ticker=pos.get("ticker"),
+                                    pnl_pct=_pnl_p, pnl_dollar=_pnl_d,
+                                    direction=pos.get("direction"))
+                clear_open_position()
+                return
+        except Exception as _bt_e:
+            log.warning(f"broker-truth check failed (non-fatal): {_bt_e}")
+
     # v11.5: if the resting broker stop has FILLED, that IS the exit — tell
     # members immediately, reconcile state, record the loss. Never let a
     # stop fill pass silently.
@@ -1542,6 +1628,21 @@ def monitor_open_position():
                 _sid_r = place_stop_loss(occ, fill_price, _q, trigger_override=_rec_floor)
                 pos["stop_order_id"] = _sid_r
                 _ok_r = bool(_sid_r)
+            else:
+                _tt_sweep_closing_orders(occ)
+                _new_oco_r, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_rec_floor)
+                if _new_oco_r:
+                    pos["oco_id"] = _new_oco_r
+                    _ok_r = True
+                else:
+                    _sid_r = place_stop_loss(occ, fill_price, _q, trigger_override=_rec_floor)
+                    pos["stop_order_id"] = _sid_r
+                    _ok_r = bool(_sid_r)
+                if not _ok_r:
+                    send_emergency_dm(
+                        f"RECOVERY: could not arm ANY protection for {occ} "
+                        f"at ${_rec_floor:.2f} — software hard stop is the only floor.",
+                        prefix="🚨 **TPP PROTECTION ALERT** 🚨")
             if _ok_r:
                 pos["recovery_locked"] = True
                 pos["floor_trigger"] = _rec_floor
@@ -1588,6 +1689,24 @@ def monitor_open_position():
             _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
             pos["stop_order_id"] = _sid2
             _ok = bool(_sid2)
+        else:
+            # v13.7: adopted/orphaned position with no known order ids — sweep
+            # whatever rests at the broker and arm fresh protection at the new
+            # floor. Silence is never an option here.
+            _tt_sweep_closing_orders(occ)
+            _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
+            if _new_oco:
+                pos["oco_id"] = _new_oco
+                _ok = True
+            else:
+                _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
+                pos["stop_order_id"] = _sid2
+                _ok = bool(_sid2)
+            if not _ok:
+                send_emergency_dm(
+                    f"RATCHET stage {_want}: could not arm ANY protection for {occ} "
+                    f"at ${_desired:.2f} — software hard stop is the only floor.",
+                    prefix="🚨 **TPP PROTECTION ALERT** 🚨")
         if _ok:
             pos["ratchet_stage"] = _want
             pos["floor_trigger"] = _desired
@@ -3304,7 +3423,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.6",
+        "version":            "v13.8",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
@@ -3711,6 +3830,14 @@ def _resync_day_state_from_discord():
                     s["today_results"] = results
                     _commit(s)
             log.info(f"day-state resync: rebuilt {len(results)} trade result(s) from recaps")
+        # v13.7: the day's entry count = trades closed today + a position open now
+        with _state_lock:
+            s = load_state()
+            _implied = len(s.get("today_results") or []) + (1 if s.get("open_position") else 0)
+            if int(s.get("trade_count") or 0) < _implied:
+                s["trade_count"] = _implied
+                _commit(s)
+                log.info(f"day-state resync: trade_count restored to {_implied}")
     except Exception as e:
         log.warning(f"day-state resync failed (non-fatal): {e}")
 
