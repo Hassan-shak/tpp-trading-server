@@ -179,6 +179,8 @@ FED_SHUTDOWN_DAYS = {
     # FOMC minutes releases (2:00 PM ET)
     "2026-08-19", "2026-10-07", "2026-11-18", "2026-12-30",
     "2027-02-17", "2027-04-07", "2027-05-19", "2027-06-30",
+    # Ad-hoc high-volatility events (speeches etc. — Sunday scanner adds more)
+    "2026-08-28",   # Fed Chair Warsh @ Jackson Hole (all-day symposium, day 2)
 }
 NO_TRADE_DATES = FED_SHUTDOWN_DAYS | {d.strip() for d in
                   os.environ.get("NO_TRADE_DATES", "").split(",") if d.strip()}
@@ -199,7 +201,13 @@ def _stop_pct() -> float:
 
 
 def _no_trade_today() -> bool:
-    return datetime.now(ET).date().isoformat() in NO_TRADE_DATES
+    if datetime.now(ET).date().isoformat() in NO_TRADE_DATES:
+        return True
+    try:
+        return datetime.now(ET).date().isoformat() in set(
+            load_state().get("auto_no_trade_dates") or [])
+    except Exception:
+        return False
 
 
 _bal_cache: dict = {"ts": 0.0, "cash": None, "nl": None}
@@ -703,7 +711,7 @@ def _gate_cooldown(ticker: str, signal_type: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-EARNINGS_BLACKOUT = os.environ.get("EARNINGS_BLACKOUT", "")
+EARNINGS_BLACKOUT = os.environ.get("EARNINGS_BLACKOUT", "NVDA:2026-08-26")
 _earnings_set = {p.strip().upper() for p in EARNINGS_BLACKOUT.split(",") if p.strip()}
 
 
@@ -714,6 +722,11 @@ def _gate_earnings(ticker: str) -> tuple[bool, str]:
     key = f"{ticker.upper()}:{datetime.now(ET).strftime('%Y-%m-%d')}"
     if key in _earnings_set:
         return False, f"earnings blackout ({key})"
+    try:
+        if key in set(load_state().get("auto_earnings_blackout") or []):
+            return False, f"earnings blackout ({key}, week-ahead scan)"
+    except Exception:
+        pass
     return True, "ok"
 
 
@@ -2220,6 +2233,44 @@ def _extract_json_object(text: str) -> dict:
     raise json.JSONDecodeError("unbalanced JSON object", t[:50] or " ", 0)
 
 
+def _week_ahead_scan() -> dict | None:
+    """Sunday job: Claude + web search finds the coming week's high-volatility
+    calendar — Fed Chair speeches, FOMC events not on the hardcoded list,
+    CPI/PPI/PCE/GDP releases, and earnings dates for our tickers. Returns
+    parsed JSON or None. Best-effort; failures leave the week unchanged."""
+    try:
+        from datetime import timedelta
+        _mon = (datetime.now(ET).date() + timedelta(days=1))
+        prompt = (
+            f"Today is Sunday {datetime.now(ET).date().isoformat()}. Research the US market "
+            f"week starting Monday {_mon.isoformat()}. Find with web search:\n"
+            f"1. Any Federal Reserve Chair (currently Kevin Warsh) speaking engagements, "
+            f"testimony, or symposium appearances, with dates.\n"
+            f"2. Any FOMC meetings/minutes this week.\n"
+            f"3. High-impact US releases: CPI, PPI, Core PCE, GDP, NFP jobs report — dates.\n"
+            f"4. Earnings report dates THIS week for: {', '.join(TICKERS)}.\n"
+            f"Respond with ONLY a JSON object, no prose:\n"
+            f'{{"no_trade_dates": ["YYYY-MM-DD", ...],   // days with Fed-chair speeches or FOMC events\n'
+            f' "earnings": ["TICKER:YYYY-MM-DD", ...],   // our tickers only\n'
+            f' "week_summary": "2-3 sentences for the community on the week ahead"}}'
+        )
+        response = _claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1500,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _txt = " ".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+        parsed = _extract_json_object(_txt)
+        if not isinstance(parsed, dict):
+            log.warning("week-ahead scan: no JSON parsed")
+            return None
+        return parsed
+    except Exception as e:
+        log.warning(f"week-ahead scan failed (non-fatal): {e}")
+        return None
+
+
 def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: str | None = None) -> dict | None:
     global _claude_calls
     if not replay and not _claude_budget_ok():
@@ -2671,6 +2722,51 @@ def _scheduler_loop():
                         _ingest_new_bars(_tk, _lv.get("pmh"), _lv.get("pml"))
                     except Exception as _ie:
                         log.warning(f"ingest-first {_tk}: {_ie}")
+
+            # ── SUNDAY 6 PM: week-ahead calendar scan (web search) ────────
+            if (today.weekday() == 6 and dtime(18, 0) <= t <= dtime(20, 0)
+                    and load_state().get("last_week_scan_date") != today_s):
+                with _state_lock:
+                    _ws = load_state(); _ws["last_week_scan_date"] = today_s; _commit(_ws)
+                log.info("JOB: Sunday week-ahead scan starting")
+                _scan = _week_ahead_scan()
+                if _scan:
+                    _new_dates = [d for d in (_scan.get("no_trade_dates") or [])
+                                  if isinstance(d, str) and len(d) == 10]
+                    _new_earn  = [e.strip().upper() for e in (_scan.get("earnings") or [])
+                                  if isinstance(e, str) and ":" in e]
+                    with _state_lock:
+                        _ws = load_state()
+                        _ws["auto_no_trade_dates"] = sorted(set(
+                            [d for d in (_ws.get("auto_no_trade_dates") or [])
+                             if d >= today_s] + _new_dates))
+                        _ws["auto_earnings_blackout"] = sorted(set(
+                            [e for e in (_ws.get("auto_earnings_blackout") or [])
+                             if e.split(":")[-1] >= today_s] + _new_earn))
+                        _commit(_ws)
+                    _summary = str(_scan.get("week_summary") or "").strip()
+                    post_to_discord(
+                        "daily-watchlist",
+                        "📅 **Week Ahead — auto-scanned Sunday**\n"
+                        + (_summary + "\n" if _summary else "")
+                        + (("🛑 No-trade days this week: " + ", ".join(_new_dates) + "\n")
+                           if _new_dates else "✅ No Fed-chair events found this week.\n")
+                        + (("📊 Earnings blackouts: " + ", ".join(_new_earn))
+                           if _new_earn else "📊 No earnings for our tickers this week."),
+                    )
+                    send_emergency_dm(
+                        "📅 Week-ahead scan done. Auto no-trade: "
+                        + (", ".join(_new_dates) or "none")
+                        + " | Earnings blackouts: " + (", ".join(_new_earn) or "none")
+                        + "\nOverride anytime via NO_TRADE_DATES / EARNINGS_BLACKOUT env.",
+                        prefix="🗓️ **TPP WEEK-AHEAD SCAN**",
+                    )
+                else:
+                    send_emergency_dm(
+                        "Week-ahead scan could not fetch results — set this week's dates "
+                        "manually via NO_TRADE_DATES / EARNINGS_BLACKOUT env if needed.",
+                        prefix="⚠️ **TPP WEEK-AHEAD SCAN FAILED**",
+                    )
 
             # Skip everything on weekends and holidays
             is_trading_day = (
@@ -3208,7 +3304,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.5",
+        "version":            "v13.6",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
