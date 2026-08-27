@@ -30,6 +30,7 @@ import logging
 import time as time_module
 import threading
 from datetime import datetime, date, timedelta, timezone
+from datetime import time as dtime
 import pytz
 import re
 import requests
@@ -120,7 +121,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.1"
+APP_VERSION = "v14.2"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -3461,7 +3462,6 @@ def _scheduler_loop():
                     )
 
                 # ── Watchlist 9:15 AM ─────────────────────────────────────
-                from datetime import time as dtime
                 if (dtime(9, 15) <= t <= dtime(9, 44) and last_watchlist_date != today_s
                         and _no_trade_today()):
                     log.info("JOB: no-trade day notice (FOMC/high-risk)")
