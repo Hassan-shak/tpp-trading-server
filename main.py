@@ -80,6 +80,7 @@ CLOSE_TIMEOUT      = 45     # seconds before market escalation on exit
 CHANNEL_IDS = {
     "daily-watchlist":    os.environ.get("DISCORD_CHANNEL_WATCHLIST",  ""),
     "day-trade-signals":  os.environ.get("DISCORD_CHANNEL_DAY_SIGNALS") or os.environ.get("DISCORD_CHANNEL_SIGNALS",    ""),
+    "swing-trade-signals": os.environ.get("DISCORD_CHANNEL_SWING_SIGNALS") or os.environ.get("DISCORD_CHANNEL_SWING", ""),
     "profits-and-recaps": os.environ.get("DISCORD_CHANNEL_RECAPS",     ""),
 }
 
@@ -118,6 +119,8 @@ FOMC_DECISION_DAYS_2026 = {
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
+
+APP_VERSION = "v14.1"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -191,9 +194,19 @@ MAX_OTM_PCT    = float(os.environ.get("MAX_OTM_PCT", "0.06"))
 def _risk() -> dict:
     cash = _sizing_cash()
     if not cash:
-        return {"alloc": 0.10, "stop": 0.20, "tier": "Tier 1 (balance unreadable)"}
-    alloc, name = _tier_for(cash)
-    return {"alloc": alloc, "stop": 0.20, "tier": name}
+        base = {"alloc": 0.10, "stop": 0.20, "tier": "Tier 1 (balance unreadable)"}
+    else:
+        alloc, name = _tier_for(cash)
+        base = {"alloc": alloc, "stop": 0.20, "tier": name}
+    # v14.1: protective override — RISK_ALLOC_OVERRIDE env (e.g. "0.10") caps
+    # allocation across every tier until removed. Set after big-loss days.
+    try:
+        _ov = float(os.environ.get("RISK_ALLOC_OVERRIDE", "") or 0)
+        if 0 < _ov < base["alloc"]:
+            base = {**base, "alloc": _ov, "tier": base["tier"] + f" (capped {_ov:.0%})"}
+    except Exception:
+        pass
+    return base
 
 
 def _stop_pct() -> float:
@@ -715,18 +728,31 @@ EARNINGS_BLACKOUT = os.environ.get("EARNINGS_BLACKOUT", "NVDA:2026-08-26")
 _earnings_set = {p.strip().upper() for p in EARNINGS_BLACKOUT.split(",") if p.strip()}
 
 
+def _next_trading_day(d: date) -> date:
+    n = d + timedelta(days=1)
+    while n.weekday() >= 5 or n in MARKET_HOLIDAYS:
+        n += timedelta(days=1)
+    return n
+
+
 def _gate_earnings(ticker: str) -> tuple[bool, str]:
-    """Blocks a ticker on its earnings-day session. Env EARNINGS_BLACKOUT holds
-    comma-separated TICKER:YYYY-MM-DD entries maintained weekly from the
-    earnings calendar. Post-earnings gap days are allowed by design."""
-    key = f"{ticker.upper()}:{datetime.now(ET).strftime('%Y-%m-%d')}"
-    if key in _earnings_set:
-        return False, f"earnings blackout ({key})"
-    try:
-        if key in set(load_state().get("auto_earnings_blackout") or []):
-            return False, f"earnings blackout ({key}, week-ahead scan)"
-    except Exception:
-        pass
+    """v14.1: blocks a ticker on its earnings-report session AND the next
+    trading session (the post-earnings reaction day — Aug 27's -$236 lesson:
+    the gap day is the most violent tape of the quarter, not a normal day)."""
+    today = datetime.now(ET).date()
+    entries = _earnings_set | set(load_state().get("auto_earnings_blackout") or [])
+    for entry in entries:
+        try:
+            tk, ds = entry.split(":")
+            if tk.strip().upper() != ticker.upper():
+                continue
+            ed = datetime.strptime(ds.strip(), "%Y-%m-%d").date()
+            if today == ed:
+                return False, f"earnings blackout ({entry})"
+            if today == _next_trading_day(ed):
+                return False, f"earnings blackout ({entry} +1: post-earnings reaction day)"
+        except Exception:
+            continue
     return True, "ok"
 
 
@@ -938,6 +964,461 @@ def _tt_get_token() -> str:
 
 def _tt_headers() -> dict:
     return {"Authorization": "Bearer " + _tt_get_token(), "Content-Type": "application/json"}
+
+
+def _swing_pick_expiry(ticker: str) -> str | None:
+    """Nearest monthly expiration 90–365 days out, from the live chain."""
+    try:
+        resp = requests.get(f"{TT_BASE}/option-chains/{ticker}/nested",
+                            headers=_tt_headers(), timeout=10)
+        if resp.status_code != 200:
+            return None
+        today = datetime.now(ET).date()
+        cands = []
+        for it in resp.json().get("data", {}).get("items", []):
+            for exp in it.get("expirations", []):
+                ds = exp.get("expiration-date")
+                try:
+                    d = datetime.strptime(ds, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                dte = (d - today).days
+                if SWING_DTE_MIN <= dte <= SWING_DTE_MAX:
+                    cands.append((dte, ds))
+        if not cands:
+            return None
+        return sorted(cands)[0][1]      # nearest qualifying
+    except Exception as e:
+        log.warning(f"swing expiry pick failed {ticker}: {e}")
+        return None
+
+
+def swing_select_contract(ticker: str, direction: str) -> tuple:
+    """$1.50–$5.00 band on the 90–365 DTE monthly; spread ≤5% of mid;
+    within 8% of spot; closest-to-money wins. Returns (occ, strike, ask, exp)."""
+    exp_str = _swing_pick_expiry(ticker)
+    spot = _spot_price(ticker)
+    if not exp_str or not spot:
+        return None, None, None, None
+    try:
+        resp = requests.get(f"{TT_BASE}/option-chains/{ticker}/nested",
+                            headers=_tt_headers(),
+                            params={"expiration-date": exp_str}, timeout=10)
+        if resp.status_code != 200:
+            return None, None, None, None
+        strike_map = {}
+        for it in resp.json().get("data", {}).get("items", []):
+            for exp in it.get("expirations", []):
+                if exp.get("expiration-date") != exp_str:
+                    continue
+                for s in exp.get("strikes", []):
+                    try:
+                        k = float(s.get("strike-price"))
+                        occ = s.get("call") if direction == "call" else s.get("put")
+                        if occ:
+                            strike_map[k] = occ
+                    except Exception:
+                        continue
+        ordered = sorted(strike_map, key=lambda k: (abs(k - spot), k))
+        best = None
+        for strike in ordered[:24]:
+            occ = strike_map[strike]
+            q = _live_option_quote(occ)
+            if not q:
+                continue
+            ask = float(q.get("ask") or 0)
+            bid = float(q.get("bid") or 0)
+            if ask <= 0:
+                continue
+            mid = (ask + bid) / 2.0
+            if mid <= 0 or (ask - bid) / mid > MAX_SPREAD_MID:
+                continue
+            if not (SWING_PREMIUM_MIN <= ask <= SWING_PREMIUM_MAX):
+                continue
+            if abs(strike - spot) / spot > 0.08:
+                continue
+            best = (occ, strike, ask, exp_str)
+            break
+        if best:
+            log.info(f"SWING contract {best[0]} ask {best[2]} exp {exp_str}")
+            return best
+        log.info(f"SWING: no qualifying contract for {ticker} {direction} ({exp_str})")
+        return None, None, None, None
+    except Exception as e:
+        log.warning(f"swing_select_contract {ticker}: {e}")
+        return None, None, None, None
+
+
+# ═══════════════════ SWING SUBSYSTEM (v14) ═══════════════════
+# Community-First Swing Execution Spec — strictly isolated from the day
+# system: own channel, own counters, own P&L, own positions (list, up to 3).
+SWING_CHANNEL      = "swing-trade-signals"
+SWING_PREMIUM_MIN  = float(os.environ.get("SWING_PREMIUM_MIN", "1.50"))
+SWING_PREMIUM_MAX  = float(os.environ.get("SWING_PREMIUM_MAX", "5.00"))
+SWING_DTE_MIN      = int(os.environ.get("SWING_DTE_MIN", "90"))    # 3 months
+SWING_DTE_MAX      = int(os.environ.get("SWING_DTE_MAX", "365"))   # 12 months
+SWING_MAX_PER_WEEK = int(os.environ.get("SWING_MAX_PER_WEEK", "2"))
+SWING_MAX_ACTIVE   = int(os.environ.get("SWING_MAX_ACTIVE", "3"))
+SWING_STOP_PCT     = 0.30          # initial, 15-min candle-CLOSE rule
+SWING_TARGET_PCT   = 1.00          # +100% full exit
+SWING_TRIM_AT      = 0.30          # +30% -> auto-sell 50%
+# step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
+SWING_LADDER = [(0.10, 0.02), (0.15, 0.05), (0.20, 0.15), (0.30, 0.25),
+                (0.40, 0.35), (0.50, 0.50), (0.60, 0.60), (0.70, 0.70),
+                (0.80, 0.80), (0.90, 0.90)]
+SWING_MILESTONES = [0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 1.00]
+# CPI 8:30 AM ET releases (48h swing-entry blackout windows precede these)
+CPI_DATES = ["2026-09-11", "2026-10-14", "2026-11-10", "2026-12-10", "2027-01-13"]
+
+
+def _swing_channel() -> str:
+    return SWING_CHANNEL
+
+
+def _iso_week_key() -> str:
+    y, w, _ = datetime.now(ET).date().isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _swing_positions() -> list:
+    return list(load_state().get("swing_positions") or [])
+
+
+def _swing_save_positions(plist: list):
+    with _state_lock:
+        s = load_state()
+        s["swing_positions"] = plist
+        _commit(s)
+
+
+def _swing_week_count() -> int:
+    s = load_state()
+    wk = s.get("swing_week") or {}
+    return int(wk.get(_iso_week_key()) or 0)
+
+
+def _swing_bump_week_count():
+    with _state_lock:
+        s = load_state()
+        wk = {k: v for k, v in (s.get("swing_week") or {}).items()
+              if k == _iso_week_key()}          # keep only current week
+        wk[_iso_week_key()] = int(wk.get(_iso_week_key()) or 0) + 1
+        s["swing_week"] = wk
+        _commit(s)
+
+
+def _swing_entry_blackout_today() -> tuple[bool, str]:
+    """Friday, pre-holiday Thursday, Fed shutdown days, and 48h pre-CPI —
+    NO NEW swing entries. Managing existing positions stays allowed."""
+    today = datetime.now(ET).date()
+    if _no_trade_today():
+        return True, "Fed/high-volatility shutdown day"
+    if today.weekday() == 4:
+        return True, "Friday — no new swings into the weekend"
+    if today.weekday() == 3 and (today + timedelta(days=1)).isoformat() in {
+            d.isoformat() for d in MARKET_HOLIDAYS}:
+        return True, "pre-holiday Thursday"
+    now = datetime.now(ET)
+    for cd in CPI_DATES:
+        try:
+            cpi_dt = ET.localize(datetime.strptime(cd + " 08:30", "%Y-%m-%d %H:%M"))
+        except Exception:
+            continue
+        if timedelta(0) <= (cpi_dt - now) <= timedelta(hours=48):
+            return True, f"CPI release {cd} inside 48h"
+    return False, ""
+
+
+def _swing_earnings_within_48h(ticker: str) -> bool:
+    """Per-ticker: earnings inside 48h rejects the SWING (day trade allowed)."""
+    now = datetime.now(ET)
+    for entry in _earnings_set | set(load_state().get("auto_earnings_blackout") or []):
+        try:
+            tk, ds = entry.split(":")
+            if tk.strip().upper() != ticker.upper():
+                continue
+            edt = ET.localize(datetime.strptime(ds.strip() + " 16:00", "%Y-%m-%d %H:%M"))
+            if timedelta(hours=-8) <= (edt - now) <= timedelta(hours=48):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _daily_bars(ticker: str, days: int = 40) -> list:
+    try:
+        r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                         headers=_alpaca_headers(),
+                         params={"timeframe": "1Day", "limit": days, "feed": "iex"},
+                         timeout=8)
+        return (r.json().get("bars") or []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def _swing_replace_bracket(pos: dict, new_floor: float) -> bool:
+    """Cancel-replace the GTC bracket at a higher floor. Floor only rises."""
+    occ, fill, qty = pos["occ_symbol"], pos["fill_price"], int(pos["qty"])
+    if new_floor <= float(pos.get("floor") or 0):
+        return True
+    if pos.get("oco_id"):
+        _cancel_complex_order(pos["oco_id"])
+    else:
+        _tt_sweep_closing_orders(occ)
+    target = _tick(fill * (1 + SWING_TARGET_PCT))
+    oco_id, _ = place_oco_bracket(occ, fill, qty, trigger_override=_tick(new_floor),
+                                  target_override=target, tif="GTC")
+    if oco_id:
+        pos["oco_id"] = oco_id
+        pos["floor"] = _tick(new_floor)
+        return True
+    sid = place_stop_loss(occ, fill, qty, trigger_override=_tick(new_floor))
+    pos["oco_id"] = None
+    if sid:
+        pos["floor"] = _tick(new_floor)
+        return True
+    send_emergency_dm(f"SWING {occ}: could not arm protection at ${new_floor:.2f}",
+                      prefix="🚨 **TPP PROTECTION ALERT** 🚨")
+    return False
+
+
+def swing_monitor():
+    """Per-tick management of all swing positions. Posts play-by-play to
+    #profits-and-recaps; entries/exits/recaps to the swing channel."""
+    plist = _swing_positions()
+    if not plist:
+        return
+    now = datetime.now(ET)
+    keep = []
+    changed = False
+    live_syms = None
+    for pos in plist:
+        occ, fill, qty = pos["occ_symbol"], float(pos["fill_price"]), int(pos["qty"])
+        tkr = pos.get("ticker")
+        # broker truth (survives restarts / manual closes)
+        if time_module.time() - float(pos.get("entry_ts") or 0) > 120:
+            if live_syms is None:
+                try:
+                    live_syms = {str(p.get("symbol", "")).replace(" ", "")
+                                 for p in _tt_open_option_positions()}
+                except Exception:
+                    live_syms = None
+            if live_syms is not None and occ.replace(" ", "") not in live_syms:
+                real_px, _rq2 = _tt_actual_exit_fill(occ)
+                bid_now = float((_live_option_quote(occ) or {}).get("bid") or 0)
+                est = real_px or bid_now or float(pos.get("floor") or fill)
+                pnl_p = (est - fill) / fill
+                _tt_sweep_closing_orders(occ)
+                post_to_discord(
+                    SWING_CHANNEL,
+                    f"{'✅' if pnl_p >= 0 else '❌'} **SWING {_fmt_occ(occ)} CLOSED** — "
+                    f"broker fill detected\nEntry: ${fill:.2f} → Exit: ~${est:.2f} (est.)\n"
+                    f"P&L: {pnl_p:+.1%} (${(est - fill) * 100 * qty:+.0f} est. on {qty})")
+                changed = True
+                continue
+        q = _live_option_quote(occ)
+        bid = float((q or {}).get("bid") or 0)
+        if bid <= 0:
+            keep.append(pos)
+            continue
+        pnl = (bid - fill) / fill
+        pos["peak_pnl"] = max(float(pos.get("peak_pnl") or 0), pnl)
+        pos["trough_pnl"] = min(float(pos.get("trough_pnl") or 0), pnl)
+        peak = pos["peak_pnl"]
+
+        # 15-min candle-close stop (-30%): evaluate only at candle boundaries
+        cref = f"{now.hour}:{now.minute // 15}"
+        if pos.get("candle_ref") != cref:
+            pos["candle_ref"] = cref
+            changed = True
+            if pnl <= -SWING_STOP_PCT:
+                exit_px = close_position_tt(occ, "SWING CANDLE-CLOSE STOP", bid, qty) or bid
+                pnl_f = (exit_px - fill) / fill
+                _tt_sweep_closing_orders(occ)
+                post_to_discord(
+                    SWING_CHANNEL,
+                    f"🛑 **SWING {_fmt_occ(occ)} CLOSED** — 15-min candle closed below "
+                    f"-30%\nEntry: ${fill:.2f} → Exit: ${exit_px:.2f}\n"
+                    f"P&L: {pnl_f:+.1%} (${(exit_px - fill) * 100 * qty:+.0f} on {qty}) — "
+                    f"loss capped per the plan.")
+                continue
+
+        # recovery: dipped <=-15%, back to breakeven -> floor to -15%
+        if (not pos.get("recovery") and pos["trough_pnl"] <= -0.15 and pnl >= 0
+                and int(pos.get("stage") or 0) == 0):
+            if _swing_replace_bracket(pos, fill * 0.85):
+                pos["recovery"] = True
+                post_to_discord("profits-and-recaps",
+                                f"🔄 **SWING {_fmt_occ(occ)}** dipped {pos['trough_pnl']:+.1%} and "
+                                f"fought back — floor raised to -15%. A comeback never re-tests -30%.")
+            changed = True
+
+        # +30% trim: sell HALF, once (qty>=2)
+        if not pos.get("trimmed") and peak >= SWING_TRIM_AT and qty >= 2:
+            half = qty // 2
+            exit_px = close_position_tt(occ, "SWING +30% TRIM", bid, half) or bid
+            pos["qty"] = qty - half
+            pos["trimmed"] = True
+            changed = True
+            _tt_sweep_closing_orders(occ)
+            _swing_replace_bracket(pos, max(float(pos.get("floor") or 0), fill * 1.25))
+            post_to_discord(
+                SWING_CHANNEL,
+                f"✂️ **SWING TRIM — {_fmt_occ(occ)}**: +30% hit, **sold {half} of {qty} "
+                f"({exit_px:+.2f}) to lock gains** (+${(exit_px - fill) * 100 * half:.0f} banked). "
+                f"The remaining {pos['qty']} runs for +100% with the trail behind it.")
+            qty = pos["qty"]
+        elif not pos.get("trimmed") and peak >= SWING_TRIM_AT and qty == 1:
+            pos["trimmed"] = True
+            changed = True
+            post_to_discord("profits-and-recaps",
+                            f"✂️ SWING {_fmt_occ(occ)}: +30% trim skipped (1 contract can't be "
+                            f"halved) — trail continues on the full position.")
+
+        # step-trail ladder
+        want = 0
+        for k, (thr, lock) in enumerate(SWING_LADDER, start=1):
+            if peak >= thr:
+                want = k
+        if want > int(pos.get("stage") or 0):
+            thr, lock = SWING_LADDER[want - 1]
+            if _swing_replace_bracket(pos, fill * (1 + lock)):
+                pos["stage"] = want
+                post_to_discord("profits-and-recaps",
+                                f"🔔 **SWING {_fmt_occ(occ)}** peak {peak:+.1%} — floor stepped "
+                                f"to {lock:+.0%} (stage {want}/{len(SWING_LADDER)}).")
+            changed = True
+
+        # milestone alerts (once each)
+        hit = [m for m in SWING_MILESTONES if peak >= m and m not in (pos.get("milestones") or [])]
+        for m in hit:
+            pos.setdefault("milestones", []).append(m)
+            changed = True
+            post_to_discord("profits-and-recaps",
+                            f"📈 **SWING {_fmt_occ(occ)}** crossed {m:+.0%} (now {pnl:+.1%}, "
+                            f"floor ${float(pos.get('floor') or 0):.2f}). Taking profits early is "
+                            f"always allowed — your gains are yours.")
+
+        # 9:45 check-in / 3:45 pre-close
+        today_s = now.date().isoformat()
+        if now.hour == 9 and 45 <= now.minute <= 55 and pos.get("am_checkin") != today_s:
+            pos["am_checkin"] = today_s
+            changed = True
+            post_to_discord("profits-and-recaps",
+                            f"☀️ **SWING check-in — {_fmt_occ(occ)}**: {pnl:+.1%} "
+                            f"(bid ${bid:.2f}), floor ${float(pos.get('floor') or 0):.2f}, "
+                            f"{pos['qty']} contract(s){' (post-trim runner)' if pos.get('trimmed') else ''}.")
+        if now.hour == 15 and 45 <= now.minute <= 55 and pos.get("pm_checkin") != today_s:
+            pos["pm_checkin"] = today_s
+            changed = True
+            post_to_discord("profits-and-recaps",
+                            f"🌙 **SWING pre-close — {_fmt_occ(occ)}**: {pnl:+.1%} "
+                            f"(bid ${bid:.2f}), floor ${float(pos.get('floor') or 0):.2f} — "
+                            f"holding overnight per plan (exp {pos.get('expiry')}).")
+        keep.append(pos)
+    if changed or len(keep) != len(plist):
+        _swing_save_positions(keep)
+
+
+def swing_watchlist_job():
+    """Pre-9:15 swing watchlist: daily structure per ticker + specific
+    contracts ($1.50–$5.00, 90–365 DTE) + trigger levels for the 3 PM window."""
+    lines = []
+    for tk in TICKERS:
+        bars = _daily_bars(tk)
+        if len(bars) < 21:
+            continue
+        closes = [b["c"] for b in bars]
+        hi20, lo20 = max(b["h"] for b in bars[-20:]), min(b["l"] for b in bars[-20:])
+        spot = closes[-1]
+        c_occ, c_k, c_ask, c_exp = swing_select_contract(tk, "call")
+        p_occ, p_k, p_ask, p_exp = swing_select_contract(tk, "put")
+        seg = [f"**{tk}** — ${spot:.2f} | 20-day range ${lo20:.2f}–${hi20:.2f}",
+               f"  Long trigger: daily close pressure above ${hi20:.2f}"
+               + (f" → **{_fmt_occ(c_occ)}** (~${c_ask:.2f})" if c_occ else " → no contract in band"),
+               f"  Short trigger: breakdown below ${lo20:.2f}"
+               + (f" → **{_fmt_occ(p_occ)}** (~${p_ask:.2f})" if p_occ else " → no contract in band")]
+        lines.append("\n".join(seg))
+    if not lines:
+        return
+    bo, why = _swing_entry_blackout_today()
+    post_to_discord(
+        SWING_CHANNEL,
+        "@everyone 🧭 **Swing Watchlist** — contracts to load for the "
+        "3:00–3:50 PM entry window\n"
+        + ("\n".join(lines))
+        + "\nRules: max 2 new swings/week, 3 active | entries 3:00–3:50 PM only | "
+          f"this week: {_swing_week_count()}/{SWING_MAX_PER_WEEK} used"
+        + (f"\n🛑 **No new swings today** — {why}." if bo else ""),
+    )
+    log.info("JOB: swing watchlist posted")
+
+
+def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
+    """Full swing entry: caps + blackouts re-checked, sized by tier, GTC
+    bracket (disaster stop -40%, target +100%) rests at broker; -30%
+    candle-close stop + trail + trim are software-managed."""
+    bo, why = _swing_entry_blackout_today()
+    if bo:
+        log.info(f"SWING blocked: {why}")
+        return False
+    if _swing_week_count() >= SWING_MAX_PER_WEEK:
+        return False
+    plist = _swing_positions()
+    if len(plist) >= SWING_MAX_ACTIVE or any(p.get("ticker") == ticker for p in plist):
+        return False
+    if _swing_earnings_within_48h(ticker):
+        post_to_discord(SWING_CHANNEL,
+                        f"📚 **Swing passed — {ticker} {direction.upper()}**: earnings "
+                        f"inside 48h. Day trades stay eligible; swings don't hold into "
+                        f"binary events.")
+        return False
+    occ, strike, ask, exp = swing_select_contract(ticker, direction)
+    if not occ:
+        return False
+    qty = _position_size(ask)
+    if qty == 0:
+        post_to_discord(SWING_CHANNEL,
+                        f"📚 **Swing passed — {ticker} {direction.upper()}**: contract "
+                        f"${ask:.2f} exceeds the tier allocation. Rules are never bent.")
+        return False
+    _tt_sweep_closing_orders(occ)
+    fill = enter_trade(occ, qty)
+    if not fill:
+        return False
+    disaster = _tick(fill * (1 - 0.40))
+    target   = _tick(fill * (1 + SWING_TARGET_PCT))
+    oco_id, _ = place_oco_bracket(occ, fill, qty, trigger_override=disaster,
+                                  target_override=target, tif="GTC")
+    if not oco_id:
+        send_emergency_dm(f"SWING {occ}: GTC bracket failed — software stops only!",
+                          prefix="🚨 **TPP PROTECTION ALERT** 🚨")
+    pos = {"occ_symbol": occ, "ticker": ticker, "direction": direction,
+           "qty": qty, "fill_price": fill, "expiry": exp,
+           "entry_ts": time_module.time(), "oco_id": oco_id,
+           "peak_pnl": 0.0, "trough_pnl": 0.0, "stage": 0, "floor": disaster,
+           "trimmed": False, "milestones": [], "recovery": False,
+           "candle_ref": None, "entry_date": datetime.now(ET).date().isoformat()}
+    plist.append(pos)
+    _swing_save_positions(plist)
+    _swing_bump_week_count()
+    post_to_discord(
+        SWING_CHANNEL,
+        f"@everyone\n\n🟢 **SWING — {ticker} {direction.upper()}**\n\n"
+        f"**Contract:** {_fmt_occ(occ)} (exp {exp})\n"
+        f"✅ **Fill:** ${fill:.2f} × {qty} (${fill * 100 * qty:.0f} total)\n"
+        f"**Target:** ${target:.2f} (+100%) — GTC bracket resting at broker\n"
+        f"**Risk plan:** -30% stop on 15-min candle CLOSES (noise-filtered) | "
+        f"recovery rule -15% | step-trail locks from +10% | "
+        f"**at +30% we auto-sell HALF** and let the rest run\n"
+        f"Updates: 9:45 AM check-in + 3:45 PM pre-close + milestone alerts\n\n{reason}",
+    )
+    try:
+        post_chart_to_discord(SWING_CHANNEL, ticker,
+                              caption=f"📈 **{ticker}** — the daily setup behind this swing")
+    except Exception:
+        pass
+    return True
 
 
 def _next_friday() -> date:
@@ -1168,6 +1649,37 @@ def _fmt_occ(occ: str) -> str:
         return occ
 
 
+def _tt_actual_exit_fill(occ: str) -> tuple[float | None, int]:
+    """v14.1: today's real Sell-to-Close fills for a symbol from the TT
+    transactions API — (avg_price, qty) or (None, 0). Replaces bid-guess
+    P&L in broker-truth reconciles (Aug 27: estimates overstated -$371 vs
+    true -$236)."""
+    try:
+        r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/transactions",
+                         headers=_tt_headers(),
+                         params={"per-page": 40,
+                                 "start-date": datetime.now(ET).strftime("%Y-%m-%d")},
+                         timeout=8)
+        if r.status_code != 200:
+            return None, 0
+        tot_q, tot_val = 0, 0.0
+        _sym = occ.replace(" ", "")
+        for it in (r.json().get("data") or {}).get("items") or []:
+            if str(it.get("symbol", "")).replace(" ", "") != _sym:
+                continue
+            if "Sell" not in str(it.get("action") or it.get("transaction-sub-type") or ""):
+                continue
+            q = abs(int(float(it.get("quantity") or 0)))
+            px = abs(float(it.get("price") or 0))
+            if q and px:
+                tot_q += q
+                tot_val += px * q
+        return (tot_val / tot_q, tot_q) if tot_q else (None, 0)
+    except Exception as e:
+        log.warning(f"actual-fill lookup failed {occ}: {e}")
+        return None, 0
+
+
 def _tt_sweep_closing_orders(occ: str) -> int:
     """v13.7: cancel every live order (simple + complex) that references this
     option symbol. Used before (re)placing protection so the broker never
@@ -1293,19 +1805,21 @@ def _tick(px: float, side: str = "nearest") -> float:
 
 
 def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
-                      trigger_override: float | None = None) -> tuple[str | None, str | None]:
+                      trigger_override: float | None = None,
+                      target_override: float | None = None,
+                      tif: str = "Day") -> tuple[str | None, str | None]:
     """v11.7: rest BOTH exits at the broker as one OCO complex order —
     a limit sell at the +40% target and a stop-market underneath. Either leg
     filling cancels the other atomically at the broker. Returns
     (complex_order_id, None) on success, (None, None) on failure (caller
     falls back to plain stop + software target — the pre-v11.7 behavior)."""
-    target  = _tick(fill_price * 1.40)
+    target  = _tick(target_override) if target_override else _tick(fill_price * 1.40)
     trigger = _tick(trigger_override) if trigger_override else _tick(fill_price * (1 - _stop_pct()))
     payload = {
         "type": "OCO",
         "orders": [
             {
-                "time-in-force": "Day",
+                "time-in-force": tif,
                 "order-type":    "Limit",
                 "price":         str(target),
                 "price-effect":  "Credit",
@@ -1313,7 +1827,7 @@ def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
                           "quantity": qty, "action": "Sell to Close"}],
             },
             {
-                "time-in-force": "Day",
+                "time-in-force": tif,
                 "order-type":    "Stop",
                 "stop-trigger":  str(trigger),
                 "legs": [{"instrument-type": "Equity Option", "symbol": occ_symbol,
@@ -1470,8 +1984,10 @@ def monitor_open_position():
             _live_syms = {str(p.get("symbol", "")).replace(" ", "")
                           for p in _tt_open_option_positions()}
             if occ.replace(" ", "") not in _live_syms:
+                _real_px, _rq = _tt_actual_exit_fill(occ)
                 _bid_now = float((_live_option_quote(occ) or {}).get("bid") or 0)
-                _est_px  = _bid_now or float(pos.get("floor_trigger") or fill_price)
+                _est_px  = _real_px or _bid_now or float(pos.get("floor_trigger") or fill_price)
+                _est_tag = "actual fill" if _real_px else "est."
                 _pnl_p   = (_est_px - fill_price) / fill_price
                 _pnl_d   = (_est_px - fill_price) * 100 * _q
                 log.critical(f"BROKER-TRUTH: {occ} no longer held at broker — "
@@ -1482,15 +1998,14 @@ def monitor_open_position():
                     f"⚖️ **{_fmt_occ(occ)} — position closed at the broker.**\n"
                     f"Our records showed it open; the broker is ground truth and it's "
                     f"closed. If you followed this trade, confirm your own exit. "
-                    f"Approx. exit ~${_est_px:.2f} ({_pnl_p:+.1%} est.) — exact fills "
-                    f"in your broker history. Recap follows.",
+                    f"Exit ${_est_px:.2f} ({_pnl_p:+.1%}, {_est_tag}). Recap follows.",
                 )
                 post_to_discord(
                     "day-trade-signals",
                     f"{'✅' if _pnl_p >= 0 else '❌'} **{_fmt_occ(occ)} CLOSED** — "
                     f"BROKER RECONCILE (fill detected at broker)\n"
-                    f"Entry: ${fill_price:.2f} → Exit: ~${_est_px:.2f} (est.)\n"
-                    f"P&L: {_pnl_p:+.1%} (${_pnl_d:+.0f} est. on {_q} contract(s))",
+                    f"Entry: ${fill_price:.2f} → Exit: ${_est_px:.2f} ({_est_tag})\n"
+                    f"P&L: {_pnl_p:+.1%} (${_pnl_d:+.0f} on {_q} contract(s))",
                 )
                 send_emergency_dm(
                     f"BROKER-TRUTH reconcile: {occ} was closed at the broker while "
@@ -2895,6 +3410,13 @@ def _scheduler_loop():
 
             if is_trading_day:
 
+                # swing positions are managed all session, every tick
+                if dtime(9, 30) <= t <= dtime(16, 0):
+                    try:
+                        swing_monitor()
+                    except Exception as _sme:
+                        log.error(f"swing monitor failed: {_sme}")
+
                 # ── 9:00 AM self pre-flight — DM the vitals before the day ──
                 if ((8, 55) <= (now.hour, now.minute) <= (9, 14)
                         and load_state().get("last_preflight_date") != today_s):
@@ -2930,7 +3452,7 @@ def _scheduler_loop():
                     lines.append(f"{'🛑 FOMC/no-trade day — entries OFF' if _no_trade_today() else '✅ Trading day'}"
                                  f" | {_risk()['tier']} ({_risk()['alloc']:.1%}/trade, {_stop_pct():.0%} stop, "
                                  f"max {_risk()['alloc'] * _stop_pct():.1%} account risk)")
-                    lines.append(f"✅ v{'11.6'} boot {_BOOT_ID} | trades {_s0.get('trade_count', 0)}/2 | "
+                    lines.append(f"✅ {APP_VERSION} boot {_BOOT_ID} | trades {_s0.get('trade_count', 0)}/2 | "
                                  f"circuit {'ON' if _s0.get('circuit_breaker') else 'off'}")
                     send_emergency_dm(
                         "\n".join(lines) + "\nWindow 9:30–10:30 ET. Watchlist posts 9:15.",
@@ -3061,6 +3583,52 @@ def _scheduler_loop():
                     except Exception as _sb_e:
                         log.warning(f"9:31 standby post failed: {_sb_e}")
 
+                # ── SWING: 8:50 watchlist ─────────────────────────────────
+                if (dtime(8, 50) <= t <= dtime(9, 12)
+                        and load_state().get("last_swing_wl_date") != today_s):
+                    with _state_lock:
+                        _sw = load_state(); _sw["last_swing_wl_date"] = today_s; _commit(_sw)
+                    try:
+                        swing_watchlist_job()
+                    except Exception as _swe:
+                        log.error(f"swing watchlist failed: {_swe}")
+
+                # ── SWING: 3:00–3:50 PM entry window ──────────────────────
+                if dtime(15, 0) <= t <= dtime(15, 50):
+                    _sw_last = float(load_state().get("swing_scan_ts") or 0)
+                    if time_module.time() - _sw_last >= 300:      # every 5 min
+                        with _state_lock:
+                            _sw = load_state(); _sw["swing_scan_ts"] = time_module.time(); _commit(_sw)
+                        try:
+                            _bo, _why = _swing_entry_blackout_today()
+                            if (not _bo and _swing_week_count() < SWING_MAX_PER_WEEK
+                                    and len(_swing_positions()) < SWING_MAX_ACTIVE):
+                                for _tk in TICKERS:
+                                    if any(p.get("ticker") == _tk for p in _swing_positions()):
+                                        continue
+                                    _bars = _daily_bars(_tk)
+                                    if len(_bars) < 21:
+                                        continue
+                                    _hi20 = max(b["h"] for b in _bars[-21:-1])
+                                    _lo20 = min(b["l"] for b in _bars[-21:-1])
+                                    _px = _spot_price(_tk)
+                                    if not _px:
+                                        continue
+                                    if _px > _hi20 * 1.001:
+                                        if swing_execute_entry(
+                                                _tk, "call",
+                                                f"{_tk} is closing the day above its 20-day high "
+                                                f"(${_hi20:.2f}) — breakout swing per playbook."):
+                                            break
+                                    elif _px < _lo20 * 0.999:
+                                        if swing_execute_entry(
+                                                _tk, "put",
+                                                f"{_tk} is closing the day below its 20-day low "
+                                                f"(${_lo20:.2f}) — breakdown swing per playbook."):
+                                            break
+                        except Exception as _swe:
+                            log.error(f"swing entry scan failed: {_swe}")
+
                 # ── 9:45 AM status update ─────────────────────────────────
                 if (dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s
                         and not _no_trade_today()):
@@ -3144,7 +3712,7 @@ def _scheduler_loop():
                     if not _res:
                         _wrap = ("🏁 **Window closed — no trades today.**\n"
                                  "Nothing met the playbook's confirmation rules, so we sat on our "
-                                 "hands. Not trading IS a position. Watchlist back tomorrow at 9:15.")
+                                 "hands. Not trading IS a position. Watchlist returns next trading day at 9:15.")
                     else:
                         _wins = sum(1 for r in _res if r.get("win"))
                         _tot  = sum(float(r.get("pnl_dollar") or 0) for r in _res)
@@ -3162,7 +3730,7 @@ def _scheduler_loop():
                                  + (f"\n🚫 {', '.join(_locked)} benched after a loss — one loss per "
                                     f"ticker per day, that's the rule." if _locked else "")
                                  + "\nEvery entry, exit, and stop was posted live above. "
-                                   "Watchlist back tomorrow at 9:15.")
+                                   "Watchlist returns next trading day at 9:15.")
                     post_to_discord("daily-watchlist", _wrap)
                     log.info("JOB: daily wrap posted")
                 except Exception as e:
@@ -3330,6 +3898,42 @@ def kill():
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
+@app.route("/swing-test")
+def swing_test():
+    """Dry-run the whole swing pipeline: expiry pick, contract selection,
+    sizing, GTC bracket dry-run at the broker, channel access. No orders."""
+    out = {"week_used": _swing_week_count(), "active": len(_swing_positions()),
+           "blackout": dict(zip(("active", "reason"), _swing_entry_blackout_today()))}
+    tk = (request.args.get("ticker") or "TSLA").upper()
+    occ, strike, ask, exp = swing_select_contract(tk, request.args.get("dir", "call"))
+    out["selection"] = {"ticker": tk, "occ": occ, "strike": strike, "ask": ask,
+                        "expiry": exp}
+    if occ and ask:
+        out["sizing"] = {"qty": _position_size(ask), "tier": _risk().get("tier")}
+        try:
+            import json as _json
+            _fill = ask
+            _legs = [{"instrument-type": "Equity Option", "symbol": occ,
+                      "quantity": max(_position_size(ask), 1), "action": "Sell to Close"}]
+            r = requests.post(
+                f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders/dry-run",
+                headers=_tt_headers(),
+                json={"type": "OCO", "time-in-force": "GTC", "orders": [
+                    {"order-type": "Limit", "time-in-force": "GTC",
+                     "price": f"{_tick(_fill * 2):.2f}", "price-effect": "Credit",
+                     "legs": _legs},
+                    {"order-type": "Stop", "time-in-force": "GTC",
+                     "stop-trigger": f"{_tick(_fill * 0.6):.2f}", "legs": _legs},
+                ]}, timeout=10)
+            out["gtc_bracket_dry_run"] = {"status": r.status_code,
+                                          "ok": r.status_code in (200, 201),
+                                          "detail": (r.text[:250] if r.status_code >= 300 else "accepted")}
+        except Exception as e:
+            out["gtc_bracket_dry_run"] = {"ok": False, "error": str(e)[:200]}
+    out["swing_channel_configured"] = bool(CHANNEL_IDS.get(SWING_CHANNEL))
+    return jsonify(out), 200
+
+
 @app.route("/chart-test")
 def chart_test():
     """Render + upload one chart on demand and report exactly what happened.
@@ -3423,7 +4027,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.9",
+        "version":            APP_VERSION,
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
@@ -3432,6 +4036,8 @@ def status():
         "heartbeat_boot_id":  hb.get("boot_id") if hb else None,
         "heartbeat_age_s":    hb_age,
         "risk_mode":          _risk().get("tier", "?"),
+        "swing_active":       len(_swing_positions()),
+        "swing_week_used":    _swing_week_count(),
         "alloc_pct":          _risk()["alloc"],
         "stop_pct":           _stop_pct(),
         "no_trade_today":     _no_trade_today(),
