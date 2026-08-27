@@ -121,7 +121,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.3"
+APP_VERSION = "v14.4"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -3921,25 +3921,29 @@ def swing_test():
     if occ and ask:
         out["sizing"] = {"qty": _position_size(ask), "tier": _risk().get("tier")}
         try:
-            import json as _json
-            _fill = ask
-            _legs = [{"instrument-type": "Equity Option", "symbol": occ,
-                      "quantity": max(_position_size(ask), 1), "action": "Sell to Close"}]
+            # v14.4: while FLAT, a closing-OCO dry-run trips TT's uncovered-short
+            # check (you can't pre-validate selling options you don't hold).
+            # Dry-run a Buy-to-Open GTC limit instead — true validation of GTC
+            # acceptance + account routing. The closing OCO uses the same
+            # complex-order path the day system fills live daily; its GTC form
+            # is confirmed on the first real fill (DM + software stops if not).
             r = requests.post(
-                f"{TT_BASE}/accounts/{TT_ACCOUNT}/complex-orders/dry-run",
+                f"{TT_BASE}/accounts/{TT_ACCOUNT}/orders/dry-run",
                 headers=_tt_headers(),
-                json={"type": "OCO", "time-in-force": "GTC", "orders": [
-                    {"order-type": "Limit", "time-in-force": "GTC",
-                     "price": f"{_tick(_fill * 2):.2f}", "price-effect": "Credit",
-                     "legs": _legs},
-                    {"order-type": "Stop", "time-in-force": "GTC",
-                     "stop-trigger": f"{_tick(_fill * 0.6):.2f}", "legs": _legs},
-                ]}, timeout=10)
-            out["gtc_bracket_dry_run"] = {"status": r.status_code,
-                                          "ok": r.status_code in (200, 201),
-                                          "detail": (r.text[:250] if r.status_code >= 300 else "accepted")}
+                json={"order-type": "Limit", "time-in-force": "GTC",
+                      "price": f"{_tick(max(ask * 0.5, 0.05)):.2f}",
+                      "price-effect": "Debit",
+                      "legs": [{"instrument-type": "Equity Option", "symbol": occ,
+                                "quantity": max(_position_size(ask), 1),
+                                "action": "Buy to Open"}]}, timeout=10)
+            out["gtc_dry_run"] = {"mode": "buy-to-open GTC limit (flat-account safe)",
+                                  "status": r.status_code,
+                                  "ok": r.status_code in (200, 201),
+                                  "detail": ("accepted" if r.status_code < 300 else r.text[:250]),
+                                  "closing_oco_note": "validated on first fill; "
+                                  "bracket-failure -> DM + software stops"}
         except Exception as e:
-            out["gtc_bracket_dry_run"] = {"ok": False, "error": str(e)[:200]}
+            out["gtc_dry_run"] = {"ok": False, "error": str(e)[:200]}
     out["swing_channel_configured"] = bool(CHANNEL_IDS.get(SWING_CHANNEL))
     return jsonify(out), 200
 
