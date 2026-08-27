@@ -121,7 +121,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.2"
+APP_VERSION = "v14.3"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -1020,9 +1020,18 @@ def swing_select_contract(ticker: str, direction: str) -> tuple:
                             strike_map[k] = occ
                     except Exception:
                         continue
-        ordered = sorted(strike_map, key=lambda k: (abs(k - spot), k))
+        # v14.3: side-aware full walk of the allowed moneyness range. The old
+        # 24-nearest-strike window never reached the $1.50-$5.00 zone on
+        # LEAP-priced chains (SPY: 24 strikes = 2% of spot where calls cost
+        # $10-20). Walk near->far across the whole cap, stop early once
+        # premiums fall below the band floor.
+        _cap = SWING_MAX_OTM
+        if direction == "call":
+            side = [k for k in strike_map if spot * 0.99 <= k <= spot * (1 + _cap)]
+        else:
+            side = [k for k in strike_map if spot * (1 - _cap) <= k <= spot * 1.01]
         best = None
-        for strike in ordered[:24]:
+        for strike in sorted(side, key=lambda k: abs(k - spot)):
             occ = strike_map[strike]
             q = _live_option_quote(occ)
             if not q:
@@ -1031,12 +1040,12 @@ def swing_select_contract(ticker: str, direction: str) -> tuple:
             bid = float(q.get("bid") or 0)
             if ask <= 0:
                 continue
+            if ask < SWING_PREMIUM_MIN:
+                break        # beyond the band — further OTM only gets cheaper
             mid = (ask + bid) / 2.0
             if mid <= 0 or (ask - bid) / mid > MAX_SPREAD_MID:
                 continue
             if not (SWING_PREMIUM_MIN <= ask <= SWING_PREMIUM_MAX):
-                continue
-            if abs(strike - spot) / spot > 0.08:
                 continue
             best = (occ, strike, ask, exp_str)
             break
@@ -1063,6 +1072,7 @@ SWING_MAX_ACTIVE   = int(os.environ.get("SWING_MAX_ACTIVE", "3"))
 SWING_STOP_PCT     = 0.30          # initial, 15-min candle-CLOSE rule
 SWING_TARGET_PCT   = 1.00          # +100% full exit
 SWING_TRIM_AT      = 0.30          # +30% -> auto-sell 50%
+SWING_MAX_OTM      = float(os.environ.get("SWING_MAX_OTM_PCT", "0.08"))
 # step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
 SWING_LADDER = [(0.10, 0.02), (0.15, 0.05), (0.20, 0.15), (0.30, 0.25),
                 (0.40, 0.35), (0.50, 0.50), (0.60, 0.60), (0.70, 0.70),
