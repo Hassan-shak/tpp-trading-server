@@ -1486,7 +1486,7 @@ def monitor_open_position():
                     f"in your broker history. Recap follows.",
                 )
                 post_to_discord(
-                    "profits-and-recaps",
+                    "day-trade-signals",
                     f"{'✅' if _pnl_p >= 0 else '❌'} **{_fmt_occ(occ)} CLOSED** — "
                     f"BROKER RECONCILE (fill detected at broker)\n"
                     f"Entry: ${fill_price:.2f} → Exit: ~${_est_px:.2f} (est.)\n"
@@ -1534,7 +1534,7 @@ def monitor_open_position():
                         f"plan — that's the stop doing its job.")
             post_to_discord("day-trade-signals", f"{head}\n{body}")
             post_to_discord(
-                "profits-and-recaps",
+                "day-trade-signals",
                 f"{'✅' if exit_px > fill_price else '❌'} **{_fmt_occ(occ)} CLOSED** — "
                 f"{'TARGET' if _kind == 'target' else ('TRAILING FLOOR' if exit_px > fill_price else 'STOP LOSS')} (broker OCO)\n"
                 f"Entry: ${fill_price:.2f} → Exit: ${exit_px:.2f} "
@@ -1567,7 +1567,7 @@ def monitor_open_position():
                 f"that's the stop doing its job.",
             )
             post_to_discord(
-                "profits-and-recaps",
+                "day-trade-signals",
                 f"❌ **{_fmt_occ(occ)} CLOSED** — STOP LOSS (broker)\n"
                 f"Entry: ${fill_price:.2f} → Exit: ${exit_px:.2f} "
                 f"({datetime.now(ET).strftime('%H:%M ET')})\n"
@@ -1647,7 +1647,7 @@ def monitor_open_position():
                 pos["recovery_locked"] = True
                 pos["floor_trigger"] = _rec_floor
                 post_to_discord(
-                    "day-trade-signals",
+                    "profits-and-recaps",
                     f"🔄 **{_fmt_occ(occ)} — comeback protected.**\n"
                     f"This trade dipped {_trough:+.1%} and fought back green — stop raised to "
                     f"${_rec_floor:.2f} (-10%). A recovered trade never re-tests the full stop.",
@@ -1715,7 +1715,7 @@ def monitor_open_position():
                      "Feel free to add your own trail stop or start taking profits "
                      "whenever you're comfortable — you don't have to wait for the +40% target.")
             post_to_discord(
-                "day-trade-signals",
+                "profits-and-recaps",
                 f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/{len(_LADDER)}).**\n"
                 f"Stop moved to ${_desired:.2f} — {_msg}.\n{_take}",
             )
@@ -1727,7 +1727,7 @@ def monitor_open_position():
         pos["last_update_ts"] = time_module.time()
         set_open_position(pos)
         post_to_discord(
-            "day-trade-signals",
+            "profits-and-recaps",
             f"📊 **Open trade update — {_fmt_occ(occ)}**\n"
             f"Bid ${current_bid:.2f} | P&L {pnl_pct:+.1%} (entry ${fill_price:.2f}) | "
             f"peak {peak_pnl:+.1%} | protective floor ${float(pos.get('floor_trigger') or fill_price * (1 - _stop_pct())):.2f}\n"
@@ -1736,7 +1736,7 @@ def monitor_open_position():
                if pnl_pct >= 0.10 else ""),
         )
         try:
-            post_chart_to_discord("day-trade-signals", pos.get("ticker") or "",
+            post_chart_to_discord("profits-and-recaps", pos.get("ticker") or "",
                                   caption=f"📈 **{pos.get('ticker')}** — live chart with the trade on")
         except Exception:
             pass
@@ -1795,7 +1795,7 @@ def monitor_open_position():
         emoji         = "✅" if exit_price > fill_price else "❌"
         close_time    = datetime.now(ET).strftime("%H:%M ET")
         post_to_discord(
-            "profits-and-recaps",
+            "day-trade-signals",
             f"{emoji} **{_fmt_occ(occ)} CLOSED** — {reason}\n"
             f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
             f"P&L: {pnl_pct_final:+.1%} "
@@ -3298,7 +3298,7 @@ def flatten():
     close_time = datetime.now(ET).strftime("%H:%M ET")
 
     post_to_discord(
-        "profits-and-recaps",
+        "day-trade-signals",
         f"{emoji} **{occ} CLOSED** — MANUAL FLATTEN\n"
         f"Entry: ${fill_price:.2f} → Exit: ${exit_price:.2f} ({close_time})\n"
         f"P&L: {pnl_pct:+.1%} ({'+' if pnl_dollar >= 0 else ''}${abs(pnl_dollar):.0f}/contract)",
@@ -3423,7 +3423,7 @@ def status():
         _thread_alive = True
     return jsonify({
         "status":             "online",
-        "version":            "v13.8",
+        "version":            "v13.9",
         "boot_id":            _BOOT_ID,
         "boot_time_et":       _BOOT_TIME_ET,
         "serving_pid":        os.getpid(),
@@ -3814,7 +3814,7 @@ def _resync_day_state_from_discord():
         pat = _re.compile(
             r"(✅|❌) \*\*(\S+) .*?CLOSED\*\*.*?P&L: ([+-][\d.]+)% \(([+-]?)\$([\d.]+) total",
             _re.S)
-        for m in reversed(_msgs("profits-and-recaps")):   # oldest first
+        for m in reversed(_msgs("day-trade-signals")):   # recaps live here (v13.9 flip)
             if not _is_today(m):
                 continue
             g = pat.search(m.get("content") or "")
