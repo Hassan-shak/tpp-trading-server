@@ -121,7 +121,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.4"
+APP_VERSION = "v14.6"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -402,9 +402,22 @@ def clear_open_position():
         s["open_position"] = None
         _commit(s)
 
+def _post_trade_close_pointer(ticker: str | None, pnl_pct: float | None):
+    """v14.6: the play-by-play channel always hears how the story ended —
+    one line, recap lives in #day-trade-signals."""
+    try:
+        post_to_discord(
+            "profits-and-recaps",
+            f"🏁 **{ticker or 'Trade'} closed** {'' if pnl_pct is None else f'({pnl_pct:+.1%}) '}"
+            f"— full recap in #day-trade-signals.")
+    except Exception:
+        pass
+
+
 def record_trade_result(win: bool, ticker: str | None = None,
                         pnl_pct: float | None = None, pnl_dollar: float | None = None,
                         direction: str | None = None):
+  _post_trade_close_pointer(ticker, pnl_pct)
   with _state_lock:
     s = load_state()
     s.setdefault("today_results", []).append(
@@ -785,16 +798,86 @@ def _tt_open_option_positions() -> list:
         return cached
 
 
+def _occ_expiry_dte(occ: str) -> tuple[str | None, int | None, str | None]:
+    """Parse an OCC symbol -> (YYYY-MM-DD expiry, days-to-expiry, 'call'/'put')."""
+    try:
+        m = re.match(r"([A-Z]+)(\d{6})([CP])\d{8}$", occ.replace(" ", "").upper())
+        if not m:
+            return None, None, None
+        ds, cp = m.group(2), m.group(3)
+        exp = datetime.strptime("20" + ds, "%Y%m%d").date()
+        return exp.isoformat(), (exp - datetime.now(ET).date()).days, ("call" if cp == "C" else "put")
+    except Exception:
+        return None, None, None
+
+
+SWING_ADOPT_MIN_DTE = int(os.environ.get("SWING_ADOPT_MIN_DTE", "14"))
+
+
+def _adopt_as_swing(item: dict) -> bool:
+    """v14.5: a long-dated broker position after a restart is a SWING — rebuild
+    its swing record and re-arm the GTC bracket. Without this, day-adoption
+    would 3:45-flatten a 90-day hold."""
+    occ = str(item.get("symbol", "")).strip()
+    qty = int(float(item.get("quantity") or 0))
+    basis = float(item.get("average-open-price") or 0)
+    exp_iso, dte, direction = _occ_expiry_dte(occ)
+    if not exp_iso or qty <= 0 or basis <= 0:
+        return False
+    und = re.match(r"[A-Z]+", occ.replace(" ", ""))
+    plist = _swing_positions()
+    if any(p.get("occ_symbol") == occ for p in plist):
+        return True
+    _tt_sweep_closing_orders(occ)
+    oco_id, _ = place_oco_bracket(occ, basis, qty,
+                                  trigger_override=_tick(basis * 0.60),
+                                  target_override=_tick(basis * 2.0), tif="GTC")
+    if not oco_id:
+        send_emergency_dm(f"SWING ADOPTION {occ}: GTC bracket re-arm FAILED — "
+                          f"software stops only. Check the broker.",
+                          prefix="🚨 **TPP PROTECTION ALERT** 🚨")
+    plist.append({"occ_symbol": occ, "ticker": und.group(0) if und else "?",
+                  "direction": direction, "qty": qty, "fill_price": basis,
+                  "expiry": exp_iso, "entry_ts": time_module.time() - 86400,
+                  "oco_id": oco_id, "peak_pnl": 0.0, "trough_pnl": 0.0,
+                  "stage": 0, "floor": _tick(basis * 0.60), "trimmed": False,
+                  "milestones": [], "recovery": False, "candle_ref": None,
+                  "entry_date": datetime.now(ET).date().isoformat()})
+    _swing_save_positions(plist)
+    log.critical(f"[{_BOOT_ID}] SWING-ADOPTED {occ} (DTE {dte}) basis ${basis:.2f} "
+                 f"— swing management + GTC bracket reattached")
+    post_to_discord(SWING_CHANNEL,
+                    f"♻️ **Swing reattached after restart** — {_fmt_occ(occ)} "
+                    f"(basis ${basis:.2f} × {qty}). GTC bracket re-armed; candle-close "
+                    f"stop, trail, and trim all active. Nothing was left unmanaged.")
+    return True
+
+
 def _adopt_broker_positions():
     """v11 boot step: the broker is ground truth. If the account holds an open
     option position that this process's state doesn't know about (orphaned by a
     restart/redeploy), adopt it so the monitor, trailing stop, and 3:45 flatten
-    reattach. Never again does a restart leave a live position unmanaged."""
+    reattach. Never again does a restart leave a live position unmanaged.
+    v14.5: positions are CLASSIFIED first — long-dated (DTE >= SWING_ADOPT_MIN_DTE)
+    go to the swing store; only short-dated ones become day positions."""
     try:
         s = load_state()
+        live = _tt_open_option_positions()
+        if not live:
+            return
+        # v14.5: peel off swing-class positions first (any number, up to cap)
+        remaining = []
+        for item in live:
+            occ_i = str(item.get("symbol", "")).strip()
+            _, dte_i, _ = _occ_expiry_dte(occ_i)
+            if dte_i is not None and dte_i >= SWING_ADOPT_MIN_DTE:
+                if not _adopt_as_swing(item):
+                    remaining.append(item)
+            else:
+                remaining.append(item)
+        live = remaining
         if s.get("open_position"):
             return
-        live = _tt_open_option_positions()
         if not live:
             return
         if len(live) > 1:
@@ -2247,9 +2330,11 @@ def monitor_open_position():
             )
         set_open_position(pos)
 
-    # v11.7: in-trade update every 30 minutes so members are never in the dark
+    # v14.6: members are never in the dark — first update 3 minutes after the
+    # fill, then every 5 (Aug 27 lesson: both trades died inside the old 10-min
+    # first interval, so the play-by-play channel stayed silent all trade).
     _lu = float(pos.get("last_update_ts") or 0)
-    if time_module.time() - _lu >= int(os.environ.get("UPDATE_INTERVAL_MIN", "10")) * 60:
+    if time_module.time() - _lu >= int(os.environ.get("UPDATE_INTERVAL_MIN", "5")) * 60:
         pos["last_update_ts"] = time_module.time()
         set_open_position(pos)
         post_to_discord(
@@ -3168,7 +3253,8 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "ratchet_stage": 0,
         "trough_pnl":    0.0,
         "recovery_locked": False,
-        "last_update_ts": time_module.time(),
+        "last_update_ts": time_module.time()
+                          - int(os.environ.get("UPDATE_INTERVAL_MIN", "5")) * 60 + 180,
         "target_price":  round(fill_price * 1.40, 2),
         "peak_pnl":      0.0,
         "entry_time":    datetime.now(ET).isoformat(),
@@ -4450,6 +4536,33 @@ def _resync_day_state_from_discord():
                     s["today_results"] = results
                     _commit(s)
             log.info(f"day-state resync: rebuilt {len(results)} trade result(s) from recaps")
+        # v14.5: swing week counter rebuilt from the swing channel (🟢 SWING
+        # entry posts this ISO week) so a restart can't reopen used slots
+        try:
+            _wk = _iso_week_key()
+            _cnt = 0
+            for m in _msgs("swing-trade-signals"):
+                if "🟢 **SWING" not in (m.get("content") or ""):
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(m.get("timestamp")).replace("Z", "+00:00"))
+                    y, w, _d = ts.astimezone(ET).date().isocalendar()
+                    if f"{y}-W{w:02d}" == _wk:
+                        _cnt += 1
+                except Exception:
+                    continue
+            if _cnt:
+                with _state_lock:
+                    s = load_state()
+                    wk = s.get("swing_week") or {}
+                    if int(wk.get(_wk) or 0) < _cnt:
+                        wk = {_wk: _cnt}
+                        s["swing_week"] = wk
+                        _commit(s)
+                        log.info(f"day-state resync: swing week count restored to {_cnt}")
+        except Exception as _swe:
+            log.warning(f"swing week resync failed (non-fatal): {_swe}")
+
         # v13.7: the day's entry count = trades closed today + a position open now
         with _state_lock:
             s = load_state()
