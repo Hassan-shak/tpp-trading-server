@@ -121,7 +121,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.6"
+APP_VERSION = "v14.7"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -279,10 +279,12 @@ def _tier_for(cash: float) -> tuple[float, str]:
     return 0.050, "Tier 3"
 
 
-def _position_size(premium: float) -> int:
-    """v13 SPEC: qty = Floor(cash * tier_alloc / (ask * 100)), capped at
-    MAX_CONTRACTS. Returns 0 = ABORT: the allocation rules are never
-    overridden to squeeze in 1 contract."""
+def _position_size(premium: float, scale: float = 1.0) -> int:
+    """v13 SPEC + v14.7 SCALING MATRIX: qty = Floor(cash * tier_alloc * scale
+    / (ask * 100)), capped at MAX_CONTRACTS. scale=0.5 for ALL swing positions
+    and for 1DTE day contracts (tail-risk / gamma safeguard — the Aug 27
+    -43% class); 1.0 for standard multi-DTE day trades. Returns 0 = ABORT:
+    allocation rules are never overridden to squeeze in 1 contract."""
     if premium <= 0:
         return 0
     cash = _sizing_cash()
@@ -290,7 +292,7 @@ def _position_size(premium: float) -> int:
         log.error("Sizing ABORT: account balance unreadable — refusing to size blind")
         return 0
     r = _risk()
-    qty = int((cash * r["alloc"]) // (premium * 100))
+    qty = int((cash * r["alloc"] * scale) // (premium * 100))
     qty = min(qty, MAX_CONTRACTS)
     log.info(f"Sizing [{r['tier']}]: cash=${cash:.0f} alloc={r['alloc']:.1%} "
              f"premium=${premium:.2f} -> {qty} contract(s)"
@@ -1130,6 +1132,10 @@ def swing_select_contract(ticker: str, direction: str) -> tuple:
                 continue
             if not (SWING_PREMIUM_MIN <= ask <= SWING_PREMIUM_MAX):
                 continue
+            # v14.7: swings run half-size — skip contracts the scaled
+            # allocation can't afford instead of aborting later
+            if _position_size(ask, scale=0.5) == 0:
+                continue
             best = (occ, strike, ask, exp_str)
             break
         if best:
@@ -1470,7 +1476,7 @@ def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
     occ, strike, ask, exp = swing_select_contract(ticker, direction)
     if not occ:
         return False
-    qty = _position_size(ask)
+    qty = _position_size(ask, scale=0.5)   # v14.7: swings are ALWAYS half-size
     if qty == 0:
         post_to_discord(SWING_CHANNEL,
                         f"📚 **Swing passed — {ticker} {direction.upper()}**: contract "
@@ -1498,7 +1504,7 @@ def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
     _swing_bump_week_count()
     post_to_discord(
         SWING_CHANNEL,
-        f"@everyone\n\n🟢 **SWING — {ticker} {direction.upper()}**\n\n"
+        f"@everyone\n\n🟢 **SWING — {ticker} {direction.upper()}** _(half-size allocation — overnight-risk safeguard)_\n\n"
         f"**Contract:** {_fmt_occ(occ)} (exp {exp})\n"
         f"✅ **Fill:** ${fill:.2f} × {qty} (${fill * 100 * qty:.0f} total)\n"
         f"**Target:** ${target:.2f} (+100%) — GTC bracket resting at broker\n"
@@ -3104,7 +3110,10 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     _entry_q = _live_option_quote(occ)
     _entry_ask = float((_entry_q or {}).get("ask") or 0)
-    qty = _position_size(_entry_ask)
+    _, _dte_e, _ = _occ_expiry_dte(occ)
+    _scale = 0.5 if (_dte_e is not None and _dte_e <= 1) else 1.0
+    _scale_label = " · HALF-SIZE (1DTE safeguard)" if _scale == 0.5 else ""
+    qty = _position_size(_entry_ask, scale=_scale)
     if qty == 0:
         _r = _risk()
         _cash = _sizing_cash() or 0
@@ -3206,7 +3215,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     post_to_discord(
         "day-trade-signals",
         f"@everyone\n\n"
-        f"{arrow} **{ticker} {type_label}** [{tier}]\n\n"
+        f"{arrow} **{ticker} {type_label}** [{tier}]{_scale_label}\n\n"
         f"**Contract:** {_fmt_occ(occ)}\n"
         f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
         f"**Target:** ${target:.2f} (+40%)\n"
@@ -4005,7 +4014,8 @@ def swing_test():
     out["selection"] = {"ticker": tk, "occ": occ, "strike": strike, "ask": ask,
                         "expiry": exp}
     if occ and ask:
-        out["sizing"] = {"qty": _position_size(ask), "tier": _risk().get("tier")}
+        out["sizing"] = {"qty": _position_size(ask, scale=0.5),
+                         "tier": _risk().get("tier"), "scale": "0.5 (swing half-size)"}
         try:
             # v14.4: while FLAT, a closing-OCO dry-run trips TT's uncovered-short
             # check (you can't pre-validate selling options you don't hold).
@@ -4020,7 +4030,7 @@ def swing_test():
                       "price": f"{_tick(max(ask * 0.5, 0.05)):.2f}",
                       "price-effect": "Debit",
                       "legs": [{"instrument-type": "Equity Option", "symbol": occ,
-                                "quantity": max(_position_size(ask), 1),
+                                "quantity": max(_position_size(ask, scale=0.5), 1),
                                 "action": "Buy to Open"}]}, timeout=10)
             out["gtc_dry_run"] = {"mode": "buy-to-open GTC limit (flat-account safe)",
                                   "status": r.status_code,
