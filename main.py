@@ -121,7 +121,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.7"
+APP_VERSION = "v14.8"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -3719,6 +3719,14 @@ def _scheduler_loop():
                                     _px = _spot_price(_tk)
                                     if not _px:
                                         continue
+                                    _snap = load_state().get("swing_scan_snapshot") or {}
+                                    _snap[_tk] = {"px": _px, "hi20": _hi20, "lo20": _lo20,
+                                                  "t": datetime.now(ET).strftime("%H:%M")}
+                                    with _state_lock:
+                                        _ss2 = load_state(); _ss2["swing_scan_snapshot"] = _snap; _commit(_ss2)
+                                    log.info(f"SWING scan {_tk}: ${_px:.2f} vs 20d "
+                                             f"[{_lo20:.2f}–{_hi20:.2f}] "
+                                             f"(long needs >{_hi20 * 1.001:.2f}, short <{_lo20 * 0.999:.2f})")
                                     if _px > _hi20 * 1.001:
                                         if swing_execute_entry(
                                                 _tk, "call",
@@ -3733,6 +3741,44 @@ def _scheduler_loop():
                                             break
                         except Exception as _swe:
                             log.error(f"swing entry scan failed: {_swe}")
+
+                # ── SWING: 3:50 window recap — the hunt is never invisible ──
+                if (dtime(15, 51) <= t <= dtime(15, 59)
+                        and load_state().get("last_swing_recap_date") != today_s
+                        and not _no_trade_today()):
+                    with _state_lock:
+                        _sr = load_state(); _sr["last_swing_recap_date"] = today_s; _commit(_sr)
+                    try:
+                        _snap = load_state().get("swing_scan_snapshot") or {}
+                        _opened = [p for p in _swing_positions()
+                                   if p.get("entry_date") == today_s]
+                        if _opened:
+                            pass   # entry posts already told the story
+                        elif _snap:
+                            _lines = []
+                            for _tk2, d in _snap.items():
+                                _need_up = d["hi20"] * 1.001
+                                _need_dn = d["lo20"] * 0.999
+                                _dist_up = (_need_up - d["px"]) / d["px"]
+                                _dist_dn = (d["px"] - _need_dn) / d["px"]
+                                _lines.append(
+                                    f"**{_tk2}** ${d['px']:.2f} — long trigger >{_need_up:.2f} "
+                                    f"({_dist_up:+.1%} away) | short trigger <{_need_dn:.2f} "
+                                    f"({_dist_dn:+.1%} away)")
+                            post_to_discord(
+                                SWING_CHANNEL,
+                                "🧭 **Swing window closed — no entries today.**\n"
+                                "Every scan came back inside the 20-day range; we don't force "
+                                "swings, we wait for breaks.\n" + "\n".join(_lines)
+                                + f"\nWeek: {_swing_week_count()}/{SWING_MAX_PER_WEEK} slots used "
+                                  f"| {len(_swing_positions())}/{SWING_MAX_ACTIVE} positions active. "
+                                  "Hunt resumes next session 3:00 PM.",
+                            )
+                            log.info("JOB: swing window recap posted")
+                        with _state_lock:
+                            _sr = load_state(); _sr["swing_scan_snapshot"] = {}; _commit(_sr)
+                    except Exception as _sre:
+                        log.warning(f"swing window recap failed: {_sre}")
 
                 # ── 9:45 AM status update ─────────────────────────────────
                 if (dtime(9, 45) <= t <= dtime(9, 59) and last_945_date != today_s
