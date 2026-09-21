@@ -127,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.10"
+APP_VERSION = "v14.11"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -1427,10 +1427,15 @@ def swing_monitor():
 
 
 def swing_watchlist_job():
-    """Pre-9:15 swing watchlist: daily structure per ticker + specific
-    contracts (90–365 DTE) + trigger levels for the 3 PM window.
-    v14.10: scans SWING_TICKERS (wider universe) instead of day-trade TICKERS."""
-    lines = []
+    """3:00 PM swing watchlist: only tickers with qualifying contracts posted.
+    v14.10: scans SWING_TICKERS (wider universe) instead of day-trade TICKERS.
+    v14.11: moved to 3:00 PM (right before entry window); silent on tickers
+    with no qualifying contract — members only see real setups, no noise."""
+    # v14.11: rank all qualifying tickers by proximity to trigger, pick top 3.
+    # "Proximity" = how close spot is to either the 20-day high (long trigger)
+    # or 20-day low (short trigger). Closest to a trigger = highest conviction
+    # setup = shows up first. Members see max 3 clean setups, never a spam list.
+    candidates = []
     for tk in SWING_TICKERS:
         bars = _daily_bars(tk)
         if len(bars) < 21:
@@ -1440,21 +1445,38 @@ def swing_watchlist_job():
         spot = closes[-1]
         c_occ, c_k, c_ask, c_exp = swing_select_contract(tk, "call")
         p_occ, p_k, p_ask, p_exp = swing_select_contract(tk, "put")
+        if not c_occ and not p_occ:
+            log.info(f"SWING watchlist: {tk} skipped — no qualifying contract in band")
+            continue
+        # proximity score: % distance from spot to nearest trigger (lower = closer)
+        long_dist  = (hi20 - spot) / spot if spot < hi20 else 999
+        short_dist = (spot - lo20) / spot if spot > lo20 else 999
+        proximity  = min(long_dist, short_dist)
+        candidates.append((proximity, tk, spot, hi20, lo20, c_occ, c_ask, p_occ, p_ask))
+        log.info(f"SWING watchlist candidate: {tk} proximity {proximity:.2%}")
+
+    # sort by proximity ascending (closest trigger first), keep top 3
+    candidates.sort(key=lambda x: x[0])
+    top3 = candidates[:3]
+
+    lines = []
+    for _, tk, spot, hi20, lo20, c_occ, c_ask, p_occ, p_ask in top3:
         seg = [f"**{tk}** — ${spot:.2f} | 20-day range ${lo20:.2f}–${hi20:.2f}",
-               f"  Long trigger: daily close pressure above ${hi20:.2f}"
-               + (f" → **{_fmt_occ(c_occ)}** (~${c_ask:.2f})" if c_occ else " → no contract in band"),
+               f"  Long trigger: close above ${hi20:.2f}"
+               + (f" → **{_fmt_occ(c_occ)}** (~${c_ask:.2f})" if c_occ else ""),
                f"  Short trigger: breakdown below ${lo20:.2f}"
-               + (f" → **{_fmt_occ(p_occ)}** (~${p_ask:.2f})" if p_occ else " → no contract in band")]
+               + (f" → **{_fmt_occ(p_occ)}** (~${p_ask:.2f})" if p_occ else "")]
         lines.append("\n".join(seg))
+
     if not lines:
+        log.info("SWING watchlist: no qualifying contracts found across all tickers — skipping post")
         return
     bo, why = _swing_entry_blackout_today()
     post_to_discord(
         SWING_CHANNEL,
-        "@everyone 🧭 **Swing Watchlist** — contracts to load for the "
-        "3:00–3:50 PM entry window\n"
+        "@everyone 🧭 **Swing Watchlist** — entry window opens NOW (3:00–3:50 PM ET)\n"
         + ("\n".join(lines))
-        + "\nRules: max 2 new swings/week, 3 active | entries 3:00–3:50 PM only | "
+        + "\nRules: max 2 new swings/week, 3 active | "
           f"this week: {_swing_week_count()}/{SWING_MAX_PER_WEEK} used"
         + (f"\n🛑 **No new swings today** — {why}." if bo else ""),
     )
@@ -3719,18 +3741,17 @@ def _scheduler_loop():
                     except Exception as _sb_e:
                         log.warning(f"9:31 standby post failed: {_sb_e}")
 
-                # ── SWING: 8:50 watchlist ─────────────────────────────────
-                if (dtime(8, 50) <= t <= dtime(9, 12)
-                        and load_state().get("last_swing_wl_date") != today_s):
-                    with _state_lock:
-                        _sw = load_state(); _sw["last_swing_wl_date"] = today_s; _commit(_sw)
-                    try:
-                        swing_watchlist_job()
-                    except Exception as _swe:
-                        log.error(f"swing watchlist failed: {_swe}")
-
                 # ── SWING: 3:00–3:50 PM entry window ──────────────────────
                 if dtime(15, 0) <= t <= dtime(15, 50):
+                    # v14.11: swing watchlist posts at 3:00 PM sharp (entry window open)
+                    if (dtime(15, 0) <= t <= dtime(15, 5)
+                            and load_state().get("last_swing_wl_date") != today_s):
+                        with _state_lock:
+                            _sw = load_state(); _sw["last_swing_wl_date"] = today_s; _commit(_sw)
+                        try:
+                            swing_watchlist_job()
+                        except Exception as _swe:
+                            log.error(f"swing watchlist failed: {_swe}")
                     _sw_last = float(load_state().get("swing_scan_ts") or 0)
                     if time_module.time() - _sw_last >= 300:      # every 5 min
                         with _state_lock:
