@@ -56,6 +56,12 @@ ET = pytz.timezone("America/New_York")
 TICKERS            = [t.strip().upper() for t in
                       os.environ.get("TRADEABLE_TICKERS", "NVDA,TSLA,SPY").split(",") if t.strip()]
 TRADEABLE_TICKERS  = set(TICKERS)
+# v14.10: swing trades scan a wider universe than day trades — any liquid
+# optionable stock. Configurable via SWING_TICKERS env var; defaults to a
+# curated list of high-volume, affordable-options names.
+_SWING_TICKERS_DEFAULT = "NVDA,TSLA,SPY,QQQ,IWM,AMD,SOFI,PLTR,BAC,AMZN,MSFT,META,JPM,WMT,AAPL,NFLX,GOOGL,BA,XOM"
+SWING_TICKERS      = [t.strip().upper() for t in
+                      os.environ.get("SWING_TICKERS", _SWING_TICKERS_DEFAULT).split(",") if t.strip()]
 WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "")
 DISCORD_BOT_TOKEN  = os.environ["DISCORD_BOT_TOKEN"]
 # Comma-separated list of Discord user IDs — every ID gets every alert/pre-flight DM
@@ -121,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.9"
+APP_VERSION = "v14.10"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -1152,7 +1158,7 @@ def swing_select_contract(ticker: str, direction: str) -> tuple:
 # Community-First Swing Execution Spec — strictly isolated from the day
 # system: own channel, own counters, own P&L, own positions (list, up to 3).
 SWING_CHANNEL      = "swing-trade-signals"
-SWING_PREMIUM_MIN  = float(os.environ.get("SWING_PREMIUM_MIN", "1.50"))
+SWING_PREMIUM_MIN  = float(os.environ.get("SWING_PREMIUM_MIN", "0.75"))
 SWING_PREMIUM_MAX  = float(os.environ.get("SWING_PREMIUM_MAX", "5.00"))
 SWING_DTE_MIN      = int(os.environ.get("SWING_DTE_MIN", "90"))    # 3 months
 SWING_DTE_MAX      = int(os.environ.get("SWING_DTE_MAX", "365"))   # 12 months
@@ -1161,7 +1167,7 @@ SWING_MAX_ACTIVE   = int(os.environ.get("SWING_MAX_ACTIVE", "3"))
 SWING_STOP_PCT     = 0.30          # initial, 15-min candle-CLOSE rule
 SWING_TARGET_PCT   = 1.00          # +100% full exit
 SWING_TRIM_AT      = 0.30          # +30% -> auto-sell 50%
-SWING_MAX_OTM      = float(os.environ.get("SWING_MAX_OTM_PCT", "0.08"))
+SWING_MAX_OTM      = float(os.environ.get("SWING_MAX_OTM_PCT", "0.15"))
 # step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
 SWING_LADDER = [(0.10, 0.02), (0.15, 0.05), (0.20, 0.15), (0.30, 0.25),
                 (0.40, 0.35), (0.50, 0.50), (0.60, 0.60), (0.70, 0.70),
@@ -1422,9 +1428,10 @@ def swing_monitor():
 
 def swing_watchlist_job():
     """Pre-9:15 swing watchlist: daily structure per ticker + specific
-    contracts ($1.50–$5.00, 90–365 DTE) + trigger levels for the 3 PM window."""
+    contracts (90–365 DTE) + trigger levels for the 3 PM window.
+    v14.10: scans SWING_TICKERS (wider universe) instead of day-trade TICKERS."""
     lines = []
-    for tk in TICKERS:
+    for tk in SWING_TICKERS:
         bars = _daily_bars(tk)
         if len(bars) < 21:
             continue
@@ -2508,8 +2515,32 @@ standard as Conditions A/B:
 A recorded break DOWN through any of these anchors with price holding
 below it = PUTS. A recorded reclaim/break UP with price holding above
 it = CALLS. Recorded crosses in SESSION STRUCTURE are authoritative.
-Confirmation = current candle holding beyond the anchor; volume is
-supportive but not a hard gate. Tag [TIER-2].
+
+THREE REQUIRED FILTERS before any Condition C entry (v14.10):
+
+  FILTER 1 — LEVEL SEPARATION: If the pre-market level (PMH/PML) and
+  the opening-range level (OR-H/OR-L) are within 0.3% of each other
+  in price, they count as ONE level, not two. A break of both at nearly
+  the same price is not double confirmation — it is a single cluster.
+  When levels are clustered, you MUST require EMA structure (8 above 21
+  for calls, below for puts) OR volume >= 1.2x average to approve.
+  Without that additional confirmation, return NO_TRADE for this setup.
+
+  FILTER 2 — ONE CANDLE HOLD: Do not enter on the same candle as the
+  break. The break candle identifies the setup. Wait for the NEXT
+  1-min candle to also close beyond the level (still holding above for
+  calls, still holding below for puts). That second candle IS the entry
+  trigger. A single candle poke through a level is noise; two candles
+  holding is conviction.
+
+  FILTER 3 — TSLA TIME GATE: For TSLA specifically, Condition C entries
+  are blocked before 9:45 AM ET. TSLA anchor breaks in the first 15
+  minutes (9:30–9:44) have shown a consistent pattern of fake-outs and
+  reversals. If a TSLA Condition C setup fires before 9:45 AM, return
+  NO_TRADE and note the time gate. After 9:45 AM, all three filters
+  still apply normally.
+
+All three filters pass → Tag [TIER-2].
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CONDITION D — OVERSOLD REVERSAL AT SUPPORT (and overbought mirror)
@@ -3708,7 +3739,7 @@ def _scheduler_loop():
                             _bo, _why = _swing_entry_blackout_today()
                             if (not _bo and _swing_week_count() < SWING_MAX_PER_WEEK
                                     and len(_swing_positions()) < SWING_MAX_ACTIVE):
-                                for _tk in TICKERS:
+                                for _tk in SWING_TICKERS:  # v14.10: wider universe
                                     if any(p.get("ticker") == _tk for p in _swing_positions()):
                                         continue
                                     _bars = _daily_bars(_tk)
