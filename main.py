@@ -127,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.11"
+APP_VERSION = "v14.13"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -201,10 +201,10 @@ MAX_OTM_PCT    = float(os.environ.get("MAX_OTM_PCT", "0.06"))
 def _risk() -> dict:
     cash = _sizing_cash()
     if not cash:
-        base = {"alloc": 0.10, "stop": 0.20, "tier": "Tier 1 (balance unreadable)"}
+        base = {"alloc": 0.10, "stop": DAY_STOP_PCT, "tier": "Tier 1 (balance unreadable)"}
     else:
         alloc, name = _tier_for(cash)
-        base = {"alloc": alloc, "stop": 0.20, "tier": name}
+        base = {"alloc": alloc, "stop": DAY_STOP_PCT, "tier": name}
     # v14.1: protective override — RISK_ALLOC_OVERRIDE env (e.g. "0.10") caps
     # allocation across every tier until removed. Set after big-loss days.
     try:
@@ -276,6 +276,125 @@ SIZING_TIERS = [
 # Optional breathing room under each profit-lock rung (0.0 = lock exactly AT
 # the milestone per spec; e.g. 0.02 puts the +10% rung's stop at +8%)
 LOCK_BUFFER = float(os.environ.get("LOCK_BUFFER_PCT", "0.0"))
+
+# ── v14.12 WIN-RATE OVERHAUL (Oct 5) ─────────────────────────────────────────
+# Diagnosis: (1) ~$1 weekly contracts + a -20% stop = stopped by a ~$2 TSLA
+# wiggle (Oct 5: 376.50 -> 374.50 retest -> 379.25); (2) profit locked AT +10%
+# on the first downtick while losses ran the full stop -> needed ~2/3 winners
+# just to break even; (3) the prompt FORBADE passing on chop; (4) no VWAP.
+# Every knob below is an env var so it can be tuned without a code push.
+DAY_STOP_PCT = float(os.environ.get("DAY_STOP_PCT", "0.20"))
+# Risk-normalised sizing: wider stop -> proportionally fewer contracts so the
+# DOLLAR risk per trade stays what it was at -20% (alloc x 0.20/stop).
+DAY_RISK_NORMALIZE = os.environ.get("DAY_RISK_NORMALIZE", "1") == "1"
+RECOVERY_DIP = float(os.environ.get("RECOVERY_DIP_PCT", str(round(DAY_STOP_PCT / 2, 4))))
+
+
+def _parse_ladder(raw: str) -> list:
+    out = []
+    for part in (raw or "").split(","):
+        try:
+            a, b = part.split(":")
+            out.append((float(a), float(b)))
+        except Exception:
+            continue
+    out.sort()
+    return out or [(0.15, 0.0), (0.25, 0.10), (0.35, 0.20)]
+
+
+# ── v14.13 BACKTEST-DRIVEN DAY ENGINE (57 real sessions, Sep 8 - Oct 5) ──────
+# Cheap ~$1 contracts lost on EVERY setup (spread + decay eat the move); near-
+# the-money contracts track the stock. VWAP pullback was the only setup with a
+# positive result; opening-range breakouts lost in every version tested.
+DAY_ENGINE = os.environ.get("DAY_ENGINE", "rules").lower()            # rules | ai
+DAY_CONTRACT_MODE = os.environ.get("DAY_CONTRACT_MODE", "itm").lower() # itm | cheap
+DAY_ITM_BUDGET_PCT = float(os.environ.get("DAY_ITM_BUDGET_PCT", "0.22"))
+DAY_ITM_MAX_DEPTH = int(os.environ.get("DAY_ITM_MAX_DEPTH", "2"))
+DAY_TARGET_PCT = float(os.environ.get("DAY_TARGET_PCT", "0.20" if DAY_CONTRACT_MODE == "itm" else "0.40"))
+DAY_TRIM_AT = float(os.environ.get("DAY_TRIM_AT", "0.10"))   # sell half here (needs 2+ contracts)
+WINDOW_END_ET = os.environ.get("WINDOW_END_ET", "11:30")
+CHOP_CIRCUIT = os.environ.get("CHOP_CIRCUIT", "0") == "1"     # 10-min stagnant exit (untested -> off)
+PULLBACK_TREND_BARS = int(os.environ.get("PULLBACK_TREND_BARS", "10"))   # of last 12 on one VWAP side
+
+
+def _win_end() -> tuple:
+    try:
+        h, m = (int(x) for x in WINDOW_END_ET.split(":"))
+        return h, m
+    except Exception:
+        return 11, 30
+
+
+def _win_end_label() -> str:
+    h, m = _win_end()
+    return f"{h}:{m:02d}"
+
+
+# Ladder: stop to break-even at +10% (+5% at +15%); the +20% target rests at broker.
+DAY_LADDER = _parse_ladder(os.environ.get(
+    "DAY_LADDER", "0.10:0.00,0.15:0.05" if DAY_CONTRACT_MODE == "itm" else "0.15:0.00,0.25:0.10,0.35:0.20"))
+QUALITY_GATES = os.environ.get("QUALITY_GATES", "1") == "1"
+ENTRY_START_ET = os.environ.get("ENTRY_START_ET", "09:40")
+CHOP_MAX_VWAP_FLIPS = int(os.environ.get("CHOP_MAX_VWAP_FLIPS", "3"))    # in last 20 bars
+CHOP_MAX_EMA_CROSSES = int(os.environ.get("CHOP_MAX_EMA_CROSSES", "2"))  # in last 15 bars
+
+
+DROUGHT_DAYS = int(os.environ.get("DROUGHT_DAYS", "2"))
+DROUGHT_SIZE_SCALE = float(os.environ.get("DROUGHT_SIZE_SCALE", "0.5"))
+
+
+def _drought_sessions() -> int:
+    """Completed trading sessions since the last day-trade entry (bench days
+    and holidays don't count). Unknown -> start the count today."""
+    try:
+        _s = load_state()
+        _last = _s.get("last_day_entry_date")
+        _today = datetime.now(ET).date()
+        if not _last:
+            with _state_lock:
+                _s2 = load_state()
+                _s2.setdefault("last_day_entry_date", _today.isoformat())
+                _commit(_s2)
+            return 0
+        _benched = NO_TRADE_DATES | set(_s.get("auto_no_trade_dates") or [])
+        d = date.fromisoformat(_last) + timedelta(days=1)
+        n = 0
+        while d < _today:
+            if d.weekday() < 5 and d not in MARKET_HOLIDAYS and d.isoformat() not in _benched:
+                n += 1
+            d += timedelta(days=1)
+        return n
+    except Exception:
+        return 0
+
+
+DAY_MAX_LOSSES = int(os.environ.get("DAY_MAX_LOSSES", "1"))
+
+
+def _day_loss_limit_hit() -> bool:
+    """v14.13: after DAY_MAX_LOSSES losing day trades, no new day entries today."""
+    if DAY_MAX_LOSSES <= 0:
+        return False
+    try:
+        res = load_state().get("today_results") or []
+        return sum(1 for r in res if not r.get("win")) >= DAY_MAX_LOSSES
+    except Exception:
+        return False
+
+
+def _drought_mode() -> bool:
+    return QUALITY_GATES and DROUGHT_DAYS > 0 and _drought_sessions() >= DROUGHT_DAYS
+
+
+def _day_risk_norm() -> float:
+    if not DAY_RISK_NORMALIZE or DAY_STOP_PCT <= 0.20:
+        return 1.0
+    return round(0.20 / DAY_STOP_PCT, 4)
+
+
+def _ladder_lock_label(lock: float) -> str:
+    return "stop moved to break-even — downside protected" if abs(lock) < 1e-9 \
+        else f"{lock:+.0%} locked — gain banked"
 
 
 def _tier_for(cash: float) -> tuple[float, str]:
@@ -425,6 +544,23 @@ def _post_trade_close_pointer(ticker: str | None, pnl_pct: float | None):
 def record_trade_result(win: bool, ticker: str | None = None,
                         pnl_pct: float | None = None, pnl_dollar: float | None = None,
                         direction: str | None = None):
+  # v14.13: fold any half-trim already banked on this trade into the result
+  try:
+    _bk = load_state().get("day_trim_bank")
+    if _bk:
+        _oq, _hq = int(_bk.get("orig_qty") or 0), int(_bk.get("qty") or 0)
+        _bf = float(_bk.get("fill") or 0)
+        if pnl_dollar is not None:
+            pnl_dollar = round(float(pnl_dollar) + float(_bk.get("usd") or 0), 2)
+        if pnl_pct is not None and _oq and _bf:
+            _bp = float(_bk.get("usd") or 0) / (_bf * 100 * _hq) if _hq else 0
+            pnl_pct = (pnl_pct * (_oq - _hq) + _bp * _hq) / _oq
+        if pnl_dollar is not None:
+            win = pnl_dollar > 0
+        with _state_lock:
+            _sx = load_state(); _sx.pop("day_trim_bank", None); _commit(_sx)
+  except Exception:
+    pass
   _post_trade_close_pointer(ticker, pnl_pct)
   with _state_lock:
     s = load_state()
@@ -692,10 +828,11 @@ def _gate_window() -> tuple[bool, str]:
     """Gates NEW entries only. Does not affect position monitoring."""
     now    = datetime.now(ET)
     open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_ = now.replace(hour=10, minute=30, second=0, microsecond=0)
+    _eh, _em = _win_end()
+    close_ = now.replace(hour=_eh, minute=_em, second=0, microsecond=0)
     if open_ <= now <= close_:
         return True, "ok"
-    return False, f"outside 9:30–10:30 AM window ({now.strftime('%H:%M ET')})"
+    return False, f"outside 9:30–{_win_end_label()} AM window ({now.strftime('%H:%M ET')})"
 
 
 def _gate_ticker(ticker: str) -> tuple[bool, str]:
@@ -921,7 +1058,7 @@ def _adopt_broker_positions():
                               and place_oco_bracket(occ, basis, int(qty))[0]),
             "stop_order_id": None,
             "floor_trigger": round(basis * (1 - _stop_pct()), 2),
-            "target_price":  round(basis * 1.40, 2),
+            "target_price":  round(basis * (1 + DAY_TARGET_PCT), 2),
             "peak_pnl":      0.0,
             "entry_time":    datetime.now(ET).isoformat(),
             "adopted":       True,
@@ -1017,7 +1154,8 @@ def all_gates_pass(ticker: str, signal_type: str = "entry", direction: str | Non
 
 def _in_window() -> bool:
     now = datetime.now(ET)
-    return (now.hour == 9 and now.minute >= 30) or (now.hour == 10 and now.minute < 30)
+    _eh, _em = _win_end()
+    return (9, 30) <= (now.hour, now.minute) < (_eh, _em)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1244,22 +1382,127 @@ def _swing_earnings_within_48h(ticker: str) -> bool:
             if tk.strip().upper() != ticker.upper():
                 continue
             edt = ET.localize(datetime.strptime(ds.strip() + " 16:00", "%Y-%m-%d %H:%M"))
-            if timedelta(hours=-8) <= (edt - now) <= timedelta(hours=48):
+            if timedelta(hours=-8) <= (edt - now) <= timedelta(days=SWING_EARNINGS_DAYS):
                 return True
         except Exception:
             continue
     return False
 
 
+_DAILY_CACHE: dict = {}
+
+
 def _daily_bars(ticker: str, days: int = 40) -> list:
-    try:
-        r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
-                         headers=_alpaca_headers(),
-                         params={"timeframe": "1Day", "limit": days, "feed": "iex"},
-                         timeout=8)
-        return (r.json().get("bars") or []) if r.status_code == 200 else []
-    except Exception:
-        return []
+    """v14.12 FIX: Alpaca defaults `start` to the beginning of TODAY when it is
+    omitted — the old call (limit only) returned <=1 daily bar, every ticker
+    failed the 21-bar check and was skipped SILENTLY: no swing watchlist, no
+    scans, no recap since launch. Now sends an explicit start date and caches
+    for 4 minutes (completed daily bars don't change intraday)."""
+    _today = datetime.now(ET).date()
+    _key = (ticker, _today.isoformat(), days)
+    _hit = _DAILY_CACHE.get(_key)
+    if _hit and time_module.time() - _hit[0] < 240:
+        return _hit[1]
+    _start = (_today - timedelta(days=int(days * 1.6) + 10)).isoformat()
+    bars = []
+    for _feed in ("iex", "sip"):
+        try:
+            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                             headers=_alpaca_headers(),
+                             params={"timeframe": "1Day", "start": _start, "limit": 1000,
+                                     "adjustment": "split", "feed": _feed},
+                             timeout=8)
+            bars = (r.json().get("bars") or []) if r.status_code == 200 else []
+        except Exception:
+            bars = []
+        if len(bars) >= 21:
+            break
+    bars = bars[-days:]
+    if bars:
+        _DAILY_CACHE[_key] = (time_module.time(), bars)
+    return bars
+
+
+SWING_EARNINGS_DAYS = int(os.environ.get("SWING_EARNINGS_DAYS", "7"))
+
+
+def _swing_levels(ticker: str) -> dict | None:
+    """v14.12 swing setup engine (daily chart). Two setups, both TREND-FILTERED:
+      BREAKOUT  — uptrend + price above the 20-day high (calls) / mirror (puts)
+      PULLBACK  — uptrend + dipped to the 20 EMA in the last 2 sessions + now
+                  back above yesterday's high (calls) / mirror for puts.
+    Uptrend = price > 50 SMA, 20 SMA > 50 SMA, 20 SMA rising over 5 sessions."""
+    bars = _daily_bars(ticker, 80)
+    today = datetime.now(ET).date().isoformat()
+    done = [b for b in bars if str(b.get("t", ""))[:10] < today]
+    if len(done) < 50:
+        return None
+    px = _spot_price(ticker) or float(bars[-1]["c"])
+    closes = [float(b["c"]) for b in done]
+    sma20 = sum(closes[-20:]) / 20.0
+    sma20_prev = sum(closes[-25:-5]) / 20.0
+    sma50 = sum(closes[-50:]) / 50.0
+    k = 2.0 / 21
+    ema20 = sum(closes[:20]) / 20.0
+    for c in closes[20:]:
+        ema20 = c * k + ema20 * (1 - k)
+    hi20 = max(float(b["h"]) for b in done[-20:])
+    lo20 = min(float(b["l"]) for b in done[-20:])
+    prev_h, prev_l = float(done[-1]["h"]), float(done[-1]["l"])
+    low2 = min(float(done[-1]["l"]), float(done[-2]["l"]))
+    high2 = max(float(done[-1]["h"]), float(done[-2]["h"]))
+    up = px > sma50 and sma20 > sma50 and sma20 > sma20_prev
+    dn = px < sma50 and sma20 < sma50 and sma20 < sma20_prev
+    out = {"ticker": ticker, "px": round(px, 2), "trend": "up" if up else ("down" if dn else "none"),
+           "hi20": round(hi20, 2), "lo20": round(lo20, 2), "ema20": round(ema20, 2),
+           "sma50": round(sma50, 2), "strength": abs(sma20 - sma20_prev) / sma20_prev,
+           "trigger": None, "setup": None, "direction": None, "proximity": None, "plan": ""}
+    if up:
+        out["direction"] = "call"
+        bo_lvl = hi20 * 1.001
+        pulled = low2 <= ema20 * 1.01
+        if px > bo_lvl:
+            out.update(trigger=True, setup="BREAKOUT", proximity=0.0,
+                       plan=f"broke above 20-day high ${hi20:.2f} in an uptrend")
+        elif pulled and px > ema20 and px > prev_h:
+            out.update(trigger=True, setup="PULLBACK", proximity=0.0,
+                       plan=f"pulled back to the 20 EMA (${ema20:.2f}) and reclaimed yesterday's high ${prev_h:.2f}")
+        else:
+            d_bo = (bo_lvl - px) / px
+            d_pb = ((prev_h - px) / px) if pulled else 9.9
+            if d_pb <= d_bo:
+                out.update(setup="PULLBACK", proximity=max(d_pb, 0.0),
+                           plan=f"CALLS if it closes above ${prev_h:.2f} (pullback held the 20 EMA ${ema20:.2f})")
+            else:
+                out.update(setup="BREAKOUT", proximity=d_bo,
+                           plan=f"CALLS on a break above ${bo_lvl:.2f} (20-day high)")
+    elif dn:
+        out["direction"] = "put"
+        bd_lvl = lo20 * 0.999
+        bounced = high2 >= ema20 * 0.99
+        if px < bd_lvl:
+            out.update(trigger=True, setup="BREAKDOWN", proximity=0.0,
+                       plan=f"broke below 20-day low ${lo20:.2f} in a downtrend")
+        elif bounced and px < ema20 and px < prev_l:
+            out.update(trigger=True, setup="PULLBACK", proximity=0.0,
+                       plan=f"bounced into the 20 EMA (${ema20:.2f}) and lost yesterday's low ${prev_l:.2f}")
+        else:
+            d_bd = (px - bd_lvl) / px
+            d_pb = ((px - prev_l) / px) if bounced else 9.9
+            if d_pb <= d_bd:
+                out.update(setup="PULLBACK", proximity=max(d_pb, 0.0),
+                           plan=f"PUTS if it closes below ${prev_l:.2f} (bounce rejected at the 20 EMA ${ema20:.2f})")
+            else:
+                out.update(setup="BREAKDOWN", proximity=d_bd,
+                           plan=f"PUTS on a break below ${bd_lvl:.2f} (20-day low)")
+    return out
+
+
+def _swing_regime_ok(direction: str, spy: dict | None) -> bool:
+    """Market filter: calls only when SPY is above its 50 SMA, puts only below."""
+    if not spy:
+        return True
+    return (spy["px"] > spy["sma50"]) if direction == "call" else (spy["px"] < spy["sma50"])
 
 
 def _swing_replace_bracket(pos: dict, new_floor: float) -> bool:
@@ -1427,59 +1670,69 @@ def swing_monitor():
 
 
 def swing_watchlist_job():
-    """3:00 PM swing watchlist: only tickers with qualifying contracts posted.
-    v14.10: scans SWING_TICKERS (wider universe) instead of day-trade TICKERS.
-    v14.11: moved to 3:00 PM (right before entry window); silent on tickers
-    with no qualifying contract — members only see real setups, no noise."""
-    # v14.11: rank all qualifying tickers by proximity to trigger, pick top 3.
-    # "Proximity" = how close spot is to either the 20-day high (long trigger)
-    # or 20-day low (short trigger). Closest to a trigger = highest conviction
-    # setup = shows up first. Members see max 3 clean setups, never a spam list.
-    candidates = []
+    """v14.12: 3:00 PM swing watchlist — ALWAYS posts (members must see the
+    hunt). Ranks trend-qualified tickers by distance to a trigger using cheap
+    daily-bar math, then prices contracts for the top 3 only."""
+    levels, fails = [], 0
+    spy = None
     for tk in SWING_TICKERS:
-        bars = _daily_bars(tk)
-        if len(bars) < 21:
+        try:
+            lv = _swing_levels(tk)
+        except Exception as _e:
+            log.warning(f"SWING levels {tk} failed: {_e}")
+            lv = None
+        if lv is None:
+            fails += 1
             continue
-        closes = [b["c"] for b in bars]
-        hi20, lo20 = max(b["h"] for b in bars[-20:]), min(b["l"] for b in bars[-20:])
-        spot = closes[-1]
-        c_occ, c_k, c_ask, c_exp = swing_select_contract(tk, "call")
-        p_occ, p_k, p_ask, p_exp = swing_select_contract(tk, "put")
-        if not c_occ and not p_occ:
-            log.info(f"SWING watchlist: {tk} skipped — no qualifying contract in band")
-            continue
-        # proximity score: % distance from spot to nearest trigger (lower = closer)
-        long_dist  = (hi20 - spot) / spot if spot < hi20 else 999
-        short_dist = (spot - lo20) / spot if spot > lo20 else 999
-        proximity  = min(long_dist, short_dist)
-        candidates.append((proximity, tk, spot, hi20, lo20, c_occ, c_ask, p_occ, p_ask))
-        log.info(f"SWING watchlist candidate: {tk} proximity {proximity:.2%}")
-
-    # sort by proximity ascending (closest trigger first), keep top 3
-    candidates.sort(key=lambda x: x[0])
-    top3 = candidates[:3]
-
-    lines = []
-    for _, tk, spot, hi20, lo20, c_occ, c_ask, p_occ, p_ask in top3:
-        seg = [f"**{tk}** — ${spot:.2f} | 20-day range ${lo20:.2f}–${hi20:.2f}",
-               f"  Long trigger: close above ${hi20:.2f}"
-               + (f" → **{_fmt_occ(c_occ)}** (~${c_ask:.2f})" if c_occ else ""),
-               f"  Short trigger: breakdown below ${lo20:.2f}"
-               + (f" → **{_fmt_occ(p_occ)}** (~${p_ask:.2f})" if p_occ else "")]
-        lines.append("\n".join(seg))
-
-    if not lines:
-        log.info("SWING watchlist: no qualifying contracts found across all tickers — skipping post")
-        return
+        if tk == "SPY":
+            spy = lv
+        levels.append(lv)
+    if spy is None:
+        try:
+            spy = _swing_levels("SPY")
+        except Exception:
+            spy = None
     bo, why = _swing_entry_blackout_today()
+    hdr = ("@everyone 🧭 **Swing Watchlist** — entry window 3:00–3:50 PM ET\n"
+           + (f"🛑 **No new swings today** — {why}. Watch these for the next window.\n" if bo else ""))
+    if not levels:
+        send_emergency_dm(f"SWING DATA FAILURE: daily bars unavailable for all {len(SWING_TICKERS)} "
+                          f"swing tickers — the swing engine is blind today. Check Alpaca.",
+                          prefix="🚨 **TPP SWING ALERT** 🚨")
+        post_to_discord(SWING_CHANNEL, hdr + "Market data is delayed on our end today — "
+                        "the swing scan is paused and the team has been alerted.")
+        return
+    cands = [lv for lv in levels if lv["trend"] != "none" and lv["proximity"] is not None
+             and _swing_regime_ok(lv["direction"], spy)]
+    cands.sort(key=lambda lv: (lv["proximity"], -lv["strength"]))
+    lines = []
+    for lv in cands[:3]:
+        occ = ask = None
+        try:
+            occ, _k, ask, _e = swing_select_contract(lv["ticker"], lv["direction"])
+        except Exception:
+            pass
+        tag = "🔥 TRIGGERED" if lv["trigger"] else f"{lv['proximity']:.1%} from trigger"
+        lines.append(f"**{lv['ticker']}** ${lv['px']:.2f} — {lv['trend'].upper()}TREND · "
+                     f"{lv['setup']} ({tag})\n  {lv['plan']}"
+                     + (f" → **{_fmt_occ(occ)}** (~${ask:.2f})" if occ else
+                        " → contract chosen at entry"))
+    if not lines:
+        trend_n = sum(1 for lv in levels if lv["trend"] != "none")
+        body = (f"No clean swing setups today — {trend_n}/{len(levels)} tickers trending, none "
+                f"lined up with the market direction (SPY "
+                + (("above" if spy and spy["px"] > spy["sma50"] else "below") if spy else "n/a")
+                + " its 50-day). We only swing with the trend.")
+    else:
+        body = "\n".join(lines)
     post_to_discord(
         SWING_CHANNEL,
-        "@everyone 🧭 **Swing Watchlist** — entry window opens NOW (3:00–3:50 PM ET)\n"
-        + ("\n".join(lines))
-        + "\nRules: max 2 new swings/week, 3 active | "
-          f"this week: {_swing_week_count()}/{SWING_MAX_PER_WEEK} used"
-        + (f"\n🛑 **No new swings today** — {why}." if bo else ""),
+        hdr + body
+        + f"\nRules: max {SWING_MAX_PER_WEEK} new swings/week, {SWING_MAX_ACTIVE} active | "
+          f"this week: {_swing_week_count()}/{SWING_MAX_PER_WEEK} used",
     )
+    if fails:
+        log.warning(f"SWING watchlist: {fails} ticker(s) had no daily data")
     log.info("JOB: swing watchlist posted")
 
 
@@ -1499,11 +1752,14 @@ def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
     if _swing_earnings_within_48h(ticker):
         post_to_discord(SWING_CHANNEL,
                         f"📚 **Swing passed — {ticker} {direction.upper()}**: earnings "
-                        f"inside 48h. Day trades stay eligible; swings don't hold into "
+                        f"inside {SWING_EARNINGS_DAYS} days. Swings don't hold into "
                         f"binary events.")
         return False
     occ, strike, ask, exp = swing_select_contract(ticker, direction)
     if not occ:
+        post_to_discord(SWING_CHANNEL,
+                        f"📚 **Swing passed — {ticker} {direction.upper()}**: setup triggered but "
+                        f"no contract fit the budget/liquidity rules. Checking the next setup.")
         return False
     qty = _position_size(ask, scale=0.5)   # v14.7: swings are ALWAYS half-size
     if qty == 0:
@@ -1620,6 +1876,48 @@ def _build_occ(ticker: str, expiry: date, strike: float, opt_type: str) -> str:
     return f"{ticker}{expiry.strftime('%y%m%d')}{opt_type}{int(strike * 1000):08d}"
 
 
+_last_itm_reason = ""
+
+
+def _select_itm(ticker: str, direction: str, strikes: list, strike_map: dict, spot: float) -> tuple:
+    """v14.13: near-the-money selection. Tries the deepest in-the-money strike
+    (up to DAY_ITM_MAX_DEPTH) that fits the per-trade budget, then shallower,
+    then at-the-money. Liquidity rule (spread <= MAX_SPREAD_MID) kept. Nothing
+    affordable -> pass with an honest reason (TSLA at small balances)."""
+    global _last_selection_tier, _last_itm_reason
+    _last_selection_tier = None
+    _last_itm_reason = ""
+    budget = (_sizing_cash() or 0) * DAY_ITM_BUDGET_PCT
+    if direction == "call":
+        near = sorted([k for k in strikes if k <= spot * 1.003], reverse=True)[:DAY_ITM_MAX_DEPTH + 1]
+    else:
+        near = sorted([k for k in strikes if k >= spot * 0.997])[:DAY_ITM_MAX_DEPTH + 1]
+    cheapest = None
+    for k in reversed(near):          # deepest in-the-money first
+        occ = strike_map[k]
+        q = _live_option_quote(occ)
+        if not q:
+            continue
+        ask = float(q.get("ask") or 0)
+        bid = float(q.get("bid") or 0)
+        if ask <= 0:
+            continue
+        mid = (ask + bid) / 2.0
+        if mid <= 0 or (ask - bid) / mid > MAX_SPREAD_MID:
+            continue
+        cheapest = ask if cheapest is None else min(cheapest, ask)
+        if ask * 100 <= budget:
+            itm = (spot - k) if direction == "call" else (k - spot)
+            _last_selection_tier = (f"In-the-money ${itm:.2f}" if itm > 0.01 else "At-the-money")
+            log.info(f"ITM pick {occ} ask {ask} ({_last_selection_tier}, budget ${budget:.0f})")
+            return occ, k, ask
+    _last_itm_reason = (f"cheapest near-the-money {ticker} contract (${(cheapest or 0) * 100:.0f}) is "
+                        f"above the per-trade budget (${budget:.0f})" if cheapest else
+                        f"no liquid near-the-money {ticker} contract")
+    log.info("ITM selection: " + _last_itm_reason)
+    return None, None, None
+
+
 def select_contract(ticker: str, direction: str) -> tuple:
     """ATM->OTM walk. Parses nested chain data.items[].expirations[].strikes[], uses strike own OCC."""
     expiry   = _next_friday()
@@ -1659,6 +1957,8 @@ def select_contract(ticker: str, direction: str) -> tuple:
     atm     = min(strikes, key=lambda s: abs(s - spot))
     ai      = strikes.index(atm)
     ordered = strikes[ai:] if direction == "call" else list(reversed(strikes[:ai + 1]))
+    if DAY_CONTRACT_MODE == "itm":
+        return _select_itm(ticker, direction, strikes, strike_map, spot)
 
     # v13.5 TWO-TIER SELECTION (user spec): Primary band $0.75-$1.50 (sweet
     # spot $1.00) -> fallback Secondary $1.51-$3.00 (sweet spot $2.00).
@@ -1942,7 +2242,7 @@ def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
     filling cancels the other atomically at the broker. Returns
     (complex_order_id, None) on success, (None, None) on failure (caller
     falls back to plain stop + software target — the pre-v11.7 behavior)."""
-    target  = _tick(target_override) if target_override else _tick(fill_price * 1.40)
+    target  = _tick(target_override) if target_override else _tick(fill_price * (1 + DAY_TARGET_PCT))
     trigger = _tick(trigger_override) if trigger_override else _tick(fill_price * (1 - _stop_pct()))
     payload = {
         "type": "OCO",
@@ -2156,13 +2456,13 @@ def monitor_open_position():
     if _oco:
         _kind, _px = _complex_order_fill(_oco)
         if _kind:
-            exit_px = float(_px or (fill_price * 1.40 if _kind == "target"
+            exit_px = float(_px or (fill_price * (1 + DAY_TARGET_PCT) if _kind == "target"
                                     else float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))))
             pnl_d = (exit_px - fill_price) * 100 * _q
             pnl_p = (exit_px - fill_price) / fill_price
             if _kind == "target":
                 head = f"🎯 **TARGET HIT — {_fmt_occ(occ)}**"
-                body = (f"The +40% profit target filled at the broker — position CLOSED "
+                body = (f"The +{DAY_TARGET_PCT:.0%} profit target filled at the broker — position CLOSED "
                         f"@ ${exit_px:.2f} ({pnl_p:+.1%}). If you followed this trade, "
                         f"take your profit NOW if you haven't already. 📈")
             elif exit_px > fill_price:
@@ -2247,10 +2547,10 @@ def monitor_open_position():
         _trough = pnl_pct
         pos["trough_pnl"] = _trough
         set_open_position(pos)
-    if (_trough <= -0.10 and pnl_pct > 0.0
+    if (_trough <= -RECOVERY_DIP and pnl_pct > 0.0
             and int(pos.get("ratchet_stage") or 0) == 0
             and not pos.get("recovery_locked")):
-        _rec_floor = _tick(fill_price * 0.90)
+        _rec_floor = _tick(fill_price * (1 - RECOVERY_DIP))
         _cur_floor = float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
         if _rec_floor > _cur_floor:
             _ok_r = False
@@ -2294,18 +2594,55 @@ def monitor_open_position():
                     "profits-and-recaps",
                     f"🔄 **{_fmt_occ(occ)} — comeback protected.**\n"
                     f"This trade dipped {_trough:+.1%} and fought back green — stop raised to "
-                    f"${_rec_floor:.2f} (-10%). A recovered trade never re-tests the full stop.",
+                    f"${_rec_floor:.2f} (-{RECOVERY_DIP:.0%}). A recovered trade never re-tests the full stop.",
                 )
             set_open_position(pos)
+
+    # v14.13 TRIM: 2+ contracts -> sell half at +DAY_TRIM_AT, remainder's stop to
+    # break-even. 1 contract -> the ladder's first rung (break-even) does the job.
+    if (DAY_CONTRACT_MODE == "itm" and not pos.get("trimmed") and _q >= 2
+            and pnl_pct >= DAY_TRIM_AT):
+        _half = _q // 2
+        pos["trimmed"] = True
+        set_open_position(pos)
+        _tt_sweep_closing_orders(occ)
+        _tx = close_position_tt(occ, f"TRIM +{DAY_TRIM_AT:.0%} (half)", current_bid, _half)
+        _rem = _q - (_half if _tx else 0)
+        if _tx:
+            with _state_lock:
+                _sb = load_state()
+                _sb["day_trim_bank"] = {"occ": occ, "usd": round((_tx - fill_price) * 100 * _half, 2),
+                                        "qty": _half, "orig_qty": _q, "fill": fill_price}
+                _commit(_sb)
+            pos["qty"] = _rem
+        _floor_t = _tick(fill_price) if _tx else float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
+        _new_t, _ = place_oco_bracket(occ, fill_price, _rem, trigger_override=_floor_t)
+        if _new_t:
+            pos["oco_id"] = _new_t
+        else:
+            pos["oco_id"] = None
+            pos["stop_order_id"] = place_stop_loss(occ, fill_price, _rem, trigger_override=_floor_t)
+            send_emergency_dm(f"TRIM: bracket re-arm failed for {occ}; plain stop "
+                              f"{'set' if pos.get('stop_order_id') else 'ALSO FAILED'} at ${_floor_t:.2f}")
+        if _tx:
+            pos["floor_trigger"] = _floor_t
+            pos["ratchet_stage"] = max(int(pos.get("ratchet_stage") or 0), 1)
+            post_to_discord(
+                "profits-and-recaps",
+                f"✂️ **{_fmt_occ(occ)} — +{DAY_TRIM_AT:.0%} hit: sold {_half} of {_q} @ ${_tx:.2f}** "
+                f"(+${(_tx - fill_price) * 100 * _half:.0f} banked). Stop on the remaining {_rem} moved to "
+                f"break-even ${_floor_t:.2f} — this trade can't turn into a big loss now.")
+        _q = pos["qty"] = _rem
+        set_open_position(pos)
 
     # v12.1 MULTI-TIER PROFIT PROTECTION (3 rungs, max 3 stop replacements):
     #   Stage 1: peak >= +10%  -> stop to BREAK-EVEN
     #   Stage 2: peak >= +20%  -> stop to ENTRY +10%   (was +25% — trades kept
     #            peaking ~+20% and scratching out at breakeven)
     #   Stage 3: peak >= +30%  -> stop to ENTRY +20%
-    _LADDER = [(0.10, 0.10 - LOCK_BUFFER, "+10% locked — first green win guaranteed"),
-               (0.20, 0.20 - LOCK_BUFFER, "+20% locked — solid base gain banked"),
-               (0.30, 0.30 - LOCK_BUFFER, "+30% locked — the bulk of this move is protected")]
+    # v14.12: lock ONE STEP BEHIND the peak (DAY_LADDER env) so a normal
+    # pullback doesn't bank +10% on a trade that's still working.
+    _LADDER = [(_t, _l - LOCK_BUFFER, _ladder_lock_label(_l - LOCK_BUFFER)) for _t, _l in DAY_LADDER]
     _stage = int(pos.get("ratchet_stage") or 0)
     _want  = 0
     for _k, (_thr, _lock, _msg) in enumerate(_LADDER, start=1):
@@ -2357,7 +2694,12 @@ def monitor_open_position():
             _take = ("Green and comfortable? Take profits — don't wait for us."
                      if _want >= 2 else
                      "Feel free to add your own trail stop or start taking profits "
-                     "whenever you're comfortable — you don't have to wait for the +40% target.")
+                     "whenever you're comfortable — you don't have to wait for the target.")
+            if _want == 1 and DAY_CONTRACT_MODE == "itm":
+                # v14.13: the tested win-rate lever — members bank half at +10%
+                _take = ("**🔔 TAKE HALF OFF NOW.** Sell half your contracts here and let the rest "
+                         f"ride to the +{DAY_TARGET_PCT:.0%} target with your stop at break-even. "
+                         "Only 1 contract? Move your stop to your entry price.")
             post_to_discord(
                 "profits-and-recaps",
                 f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/{len(_LADDER)}).**\n"
@@ -2377,7 +2719,7 @@ def monitor_open_position():
             f"📊 **Open trade update — {_fmt_occ(occ)}**\n"
             f"Bid ${current_bid:.2f} | P&L {pnl_pct:+.1%} (entry ${fill_price:.2f}) | "
             f"peak {peak_pnl:+.1%} | protective floor ${float(pos.get('floor_trigger') or fill_price * (1 - _stop_pct())):.2f}\n"
-            f"Target ${round(fill_price * 1.40, 2):.2f} — managed automatically; exit call posts the moment anything fires."
+            f"Target ${round(fill_price * (1 + DAY_TARGET_PCT), 2):.2f} — managed automatically; exit call posts the moment anything fires."
             + ("\n💰 Green — taking profits early is always allowed. Our target is +40%, but your gains are yours."
                if pnl_pct >= 0.10 else ""),
         )
@@ -2400,18 +2742,18 @@ def monitor_open_position():
     elif pnl_pct <= -_stop_pct():
         reason = f"HARD STOP {-_stop_pct():+.0%} (software)"
 
-    # 2. Profit target +40%
-    elif pnl_pct >= 0.40:
-        reason = "PROFIT TARGET +40%"
+    # 2. Profit target (v14.13: DAY_TARGET_PCT)
+    elif pnl_pct >= DAY_TARGET_PCT:
+        reason = f"PROFIT TARGET +{DAY_TARGET_PCT:.0%}"
 
     # 2. Trailing stop — arms at +10%, trails 15% below peak
-    elif peak_pnl >= 0.10 and pnl_pct <= (peak_pnl - 0.15):
+    elif peak_pnl >= max(DAY_LADDER[0][0], 0.15) and pnl_pct <= (peak_pnl - 0.15):
         reason = f"TRAILING STOP (peak {peak_pnl:+.1%})"
 
     # 3. 10-min chop circuit
     else:
         mins_in = (now - entry_time).total_seconds() / 60
-        if mins_in >= 10 and (abs(pnl_pct) < 0.05 or pnl_pct <= -0.15):
+        if CHOP_CIRCUIT and mins_in >= 10 and (abs(pnl_pct) < 0.05 or pnl_pct <= -0.15):
             reason = "CHOP CIRCUIT (stagnant or -15%)"
 
     if reason:
@@ -2502,28 +2844,25 @@ All three must be present on the 1-min chart:
 All three present → APPROVE, tag [TIER-1].
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CONDITION B — CHOP / LOW VOLUME TREND (still tradeable)
+CONDITION B — RETIRED (v14.12)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Markets trend on low volume — this is normal and valid.
+Chop / compression entries are no longer traded. They were the main
+source of losses. A tape compressing between the EMAs is NO_TRADE.
 
-  SETUP 1 — CALLS (chop / uptrend):
-    - PMH break confirmed by TradingView alert
-    - Price making HH/HL sequence on 1-min
-    - Price compressing between the 8 and 21 EMA
-    - No 1-min candle has closed below the 21 EMA
-    - Entry trigger: 1-min candle closes back above the 8 EMA
-    → APPROVE, tag [TIER-2]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VWAP + TREND ALIGNMENT — REQUIRED ON EVERY ENTRY (v14.12)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CALLS only when price is ABOVE session VWAP and 8 EMA > 21 EMA.
+  PUTS only when price is BELOW session VWAP and 8 EMA < 21 EMA.
+  If the structure line says CHOP, return NO_TRADE.
+  (The execution engine enforces this in code and will veto you.)
 
-  SETUP 2 — PUTS (chop / downtrend):
-    - PML break confirmed by TradingView alert
-    - Price making LH/LL sequence on 1-min
-    - Price compressing between the 8 and 21 EMA
-    - No 1-min candle has closed above the 21 EMA
-    - Entry trigger: 1-min candle closes back below the 8 EMA
-    → APPROVE, tag [TIER-2]
-
-Volume is a confirming factor in Condition B, not a hard gate.
-Consistent directional closes on low volume = valid setup.
+PREFERRED ENTRY — BREAK, RETEST, HOLD:
+  The best entry is NOT the first candle through a level. It is the
+  pullback that retests the broken level and HOLDS (a candle that
+  touches/near the level and closes back in the trade direction).
+  First-candle breakouts get shaken out; retest-holds have a natural
+  stop just beyond the level. Prefer waiting for the retest.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CONDITION C — GAP-DAY ANCHORS (pre-market levels + opening range)
@@ -2565,16 +2904,10 @@ THREE REQUIRED FILTERS before any Condition C entry (v14.10):
 All three filters pass → Tag [TIER-2].
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CONDITION D — OVERSOLD REVERSAL AT SUPPORT (and overbought mirror)
+CONDITION D — RETIRED (v14.12)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-After an extended flush well below the day open / opening-range low:
-  - A clear reversal candle prints AT a support reference
-    (pre-market low, session-low retest, prior-day low, round number)
-  - The reversal candle closes in its upper third
-  - The next candle holds the reclaim (does not close back below the
-    reversal candle midpoint)
-  → CALLS on that confirmation, tag [TIER-2].
-Mirror logic for an extended rip rejecting at resistance → PUTS.
+Counter-trend reversal entries are no longer traded. Catching
+reversals is how the bot got trapped in chop. NO_TRADE.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SETUP LIBRARY — RESTORED FROM THE FULL PLAYBOOK (evaluate alongside A-D)
@@ -2599,14 +2932,14 @@ SETUP 2 — EMA BOUNCE / STRUCTURAL RETEST
 
 SETUP 3 — BULL FLAG / ASCENDING TRIANGLE (CALLS)
   Strong initial leg up, then downward-sloping consolidation.
-  Early entry: flag bottom tests 8/21 EMA AND RSI14 dips below ~50.
-  Breakout entry: 1-min candle breaks the flag upper trendline or
+  (Early "buy the flag bottom" entries are RETIRED in v14.12.)
+  Breakout entry ONLY: 1-min candle breaks the flag upper trendline or
   flat-top resistance with expanding volume. → APPROVE [TIER-2]
 
 SETUP 4 — BEAR FLAG / DESCENDING TRIANGLE (PUTS)
   Strong initial leg down, then upward-drifting consolidation.
-  Early entry: flag top rejects off 8/21 EMA AND RSI14 recovers to ~50.
-  Breakdown entry: 1-min candle breaks the flag lower support or
+  (Early "sell the flag top" entries are RETIRED in v14.12.)
+  Breakdown entry ONLY: 1-min candle breaks the flag lower support or
   flat-bottom with expanding volume. → APPROVE [TIER-2]
 
 SETUP 5 — TREND CONTINUATION (EMA RIDE)
@@ -2616,31 +2949,26 @@ SETUP 5 — TREND CONTINUATION (EMA RIDE)
   consolidations along the 8 EMA. → APPROVE [TIER-2]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DEAD TICKER — THE ONLY VALID NO_TRADE REASON
+NO_TRADE IS THE DEFAULT (v14.12)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-A ticker is only "explicitly dead" when ALL of these are true together:
-  - Volume below 0.4x the 20-candle average for 3+ consecutive 1-min candles
-  - Candle range (high minus low) below 0.3x ATR(14) on those same candles
-  - No directional structure — no HH/HL or LH/LL visible on the 1-min
+You are paid for WINNERS, not for activity. Zero trades on a day is a
+good result when there is no clean setup. Members prefer one clean
+win over three coin-flips.
 
-If price is making consistent directional closes → NOT dead.
-Choppy price action → NOT dead.
-Slow trend on low volume → NOT dead.
-Low volume alone → NOT dead.
-"Choppy" is NEVER a standalone NO_TRADE reason.
+Return NO_TRADE when ANY of these are true:
+  - Price is chopping across VWAP or the EMAs are tangled / flat
+  - The setup fights VWAP or the 8/21 EMA direction
+  - The level has already been crossed back and forth (contested)
+  - The move is already extended far from the level (chasing)
+  - You would describe the setup as "okay" rather than "clean"
 
-NO_TRADE is only permitted when:
-  - FOMC decision day (system will not call you on these days)
-  - Active circuit breaker (system will not call you when tripped)
-  - ALL tracked tickers are explicitly dead per all 3 conditions above
-
-If only one ticker is dead, analyze the other.
+When in doubt, pass. A missed trade costs nothing.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TIER TAGS & SIGNAL FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [TIER-1]  Clean Condition A — post signal immediately
-[TIER-2]  Condition B — add warning emoji, note lower confluence
+[TIER-2]  Condition C or Setups 2-5 — still requires VWAP + EMA alignment
 
 Signal description (you write this — execution engine handles the rest):
   - 1-2 sentences max in Junior's voice
@@ -2819,9 +3147,340 @@ def _update_structure(ticker: str, candle: dict, pmh, pml, day: str | None = Non
         if st.get("or_locked"):
             _cross(st.get("or_low"), "orl_break_down", "orl_reclaim_up", "BROKE DOWN through OPENING-RANGE LOW", "RECLAIMED UP through OPENING-RANGE LOW")
             _cross(st.get("or_high"), "orh_reject_down", "orh_break_up", "rejected below OPENING-RANGE HIGH", "BROKE UP through OPENING-RANGE HIGH")
+        # v14.12: session VWAP (regular hours only) + per-candle stamp for chop math
+        try:
+            _vt = str(candle.get("t") or "")
+            _vmin = None
+            if _vt:
+                _vdt = datetime.fromisoformat(_vt.replace("Z", "+00:00")).astimezone(ET)
+                _vmin = _vdt.hour * 60 + _vdt.minute
+            if (_vmin is None or _vmin >= 570) and candle.get("volume") and cur_close is not None:
+                _tp = (float(candle.get("high") or cur_close) + float(candle.get("low") or cur_close)
+                       + float(cur_close)) / 3.0
+                st["cum_pv"] = float(st.get("cum_pv") or 0.0) + _tp * float(candle["volume"])
+                st["cum_v"] = float(st.get("cum_v") or 0.0) + float(candle["volume"])
+                if st["cum_v"] > 0:
+                    st["vwap"] = round(st["cum_pv"] / st["cum_v"], 2)
+                    candle["vwap"] = st["vwap"]
+                # v14.13: session EMAs seeded at the first regular-hours bar
+                # (the 30-candle cache can't reproduce them otherwise)
+                _c = float(cur_close)
+                st["s_e8"] = _c if st.get("s_e8") is None else _c * (2 / 9) + st["s_e8"] * (7 / 9)
+                st["s_e21"] = _c if st.get("s_e21") is None else _c * (2 / 22) + st["s_e21"] * (20 / 22)
+                candle["e8"], candle["e21"] = st["s_e8"], st["s_e21"]
+        except Exception:
+            pass
         st["candles"] = (st.get("candles", []) + [candle])[-30:]
         _persist_structure()
     return st
+
+
+def _chop_metrics(candles: list) -> dict:
+    """v14.12: objective chop score from 1-min candles. VWAP side flips over the
+    last 20 bars + 8/21 EMA crossovers over the last 15. Trending tape flips
+    rarely; chop flips constantly."""
+    out = {"vwap_flips": None, "ema_crosses": None, "chop": False}
+    try:
+        sides = []
+        for c in candles[-20:]:
+            v, cl = c.get("vwap"), c.get("close")
+            if v is not None and cl is not None and cl != v:
+                sides.append(cl > v)
+        if len(sides) >= 5:
+            out["vwap_flips"] = sum(1 for a, b in zip(sides, sides[1:]) if a != b)
+        closes = [c.get("close") for c in candles if c.get("close") is not None]
+        if len(closes) >= 21:
+            k8, k21 = 2.0 / 9, 2.0 / 22
+            e8 = sum(closes[:8]) / 8.0
+            e21 = sum(closes[:21]) / 21.0
+            for x in closes[8:21]:
+                e8 = x * k8 + e8 * (1 - k8)
+            diffs = []
+            for x in closes[21:]:
+                e8 = x * k8 + e8 * (1 - k8)
+                e21 = x * k21 + e21 * (1 - k21)
+                diffs.append(e8 - e21)
+            tail = [d for d in diffs[-15:] if d != 0]
+            out["ema_crosses"] = sum(1 for a, b in zip(tail, tail[1:]) if (a > 0) != (b > 0))
+        out["chop"] = bool((out["vwap_flips"] or 0) >= CHOP_MAX_VWAP_FLIPS
+                           or (out["ema_crosses"] or 0) >= CHOP_MAX_EMA_CROSSES)
+    except Exception:
+        pass
+    return out
+
+
+def _ema_list(xs: list, p: int) -> list:
+    out, e, k = [], None, 2.0 / (p + 1)
+    for x in xs:
+        e = x if e is None else x * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+_RULES_LAST_T: dict = {}
+
+
+def _rules_decision(ticker: str) -> dict | None:
+    """v14.13 RULES ENGINE — VWAP PULLBACK (the backtest winner).
+    Trend: >= PULLBACK_TREND_BARS of the last 12 closes on one side of VWAP and
+    8 EMA on the same side of 21 EMA. Trigger: in the last 2 bars price pulled
+    back to within 0.15% of VWAP, and the current bar closes back in the trend
+    direction (above the prior close and VWAP for calls; mirror for puts).
+    Evaluated once per new 1-min candle, from 9:45 ET."""
+    st = _mkt_structure.get(ticker) or {}
+    cs = [c for c in (st.get("candles") or []) if c.get("vwap") is not None and c.get("close") is not None]
+    if len(cs) < 14:
+        return None
+    t = str(cs[-1].get("t") or "")
+    if _RULES_LAST_T.get(ticker) == t:
+        return None
+    _RULES_LAST_T[ticker] = t
+    try:
+        _bt = datetime.fromisoformat(t.replace("Z", "+00:00")).astimezone(ET)
+        if (_bt.hour, _bt.minute) < (9, 45):
+            return None
+    except Exception:
+        return None
+    C = [float(c["close"]) for c in cs]
+    VW = [float(c["vwap"]) for c in cs]
+    if all(c.get("e8") is not None and c.get("e21") is not None for c in cs[-2:]):
+        e8 = [c.get("e8") for c in cs]
+        e21 = [c.get("e21") for c in cs]
+    else:
+        e8, e21 = _ema_list(C, 8), _ema_list(C, 21)
+    i = len(C) - 1
+    need = max(6, PULLBACK_TREND_BARS - (2 if _drought_mode() else 0))
+    above = sum(1 for k in range(i - 12, i) if C[k] > VW[k])
+    below = 12 - above
+    direction = None
+    if above >= need and e8[i] > e21[i]:
+        if min(C[i - 2:i]) <= VW[i - 1] * 1.0015 and C[i] > C[i - 1] and C[i] > VW[i]:
+            direction = "call"
+    elif below >= need and e8[i] < e21[i]:
+        if max(C[i - 2:i]) >= VW[i - 1] * 0.9985 and C[i] < C[i - 1] and C[i] < VW[i]:
+            direction = "put"
+    if not direction:
+        return None
+    side = "above" if direction == "call" else "below"
+    desc = (f"{ticker} trending {side} VWAP all morning, pulled back to VWAP (${VW[i]:.2f}) and "
+            f"{'bounced' if direction == 'call' else 'rejected'} — {'calls' if direction == 'call' else 'puts'} "
+            f"on the trend continuation.")
+    return {"decision": "APPROVE", "ticker": ticker, "direction": direction, "tier": "TIER-1",
+            "setup": "VWAP_PULLBACK", "setup_description": desc, "reason": desc,
+            "chart_request": {"ticker": ticker, "timeframe": "1m", "indicators": "VWAP,EMA8,EMA21",
+                              "highlight": f"Pullback to VWAP {VW[i]:.2f} and {'bounce' if direction == 'call' else 'rejection'}"}}
+
+
+# ── SHADOW SCORECARD: setups tracked live with NO orders ─────────────────────
+SHADOW_ON = os.environ.get("SHADOW_SCORECARD", "1") == "1"
+# underlying move ~ +20% / -30% on a near-the-money weekly
+_SHADOW_TS = {"TSLA": (0.0085, 0.0125), "NVDA": (0.006, 0.009), "SPY": (0.0023, 0.0035)}
+_SHADOW_DAY: dict = {}
+
+
+def _shadow_track(ticker: str, levels: dict | None = None):
+    """Detect alternative setups on each new candle, open a paper position for
+    the first trigger of each setup per ticker per day, and resolve it with the
+    live exit logic (target / stop / break-even after half the target)."""
+    if not SHADOW_ON:
+        return
+    try:
+        st = _mkt_structure.get(ticker) or {}
+        cs = [c for c in (st.get("candles") or []) if c.get("close") is not None]
+        if len(cs) < 3:
+            return
+        today = datetime.now(ET).date().isoformat()
+        d = _SHADOW_DAY.get(ticker)
+        if not d or d.get("date") != today:
+            d = _SHADOW_DAY[ticker] = {"date": today, "last_t": "", "fired": set(), "open": []}
+        t = str(cs[-1].get("t") or "")
+        if t == d["last_t"]:
+            return
+        d["last_t"] = t
+        px = float(cs[-1]["close"]); prev = float(cs[-2]["close"])
+        bt = datetime.fromisoformat(t.replace("Z", "+00:00")).astimezone(ET)
+        mins = bt.hour * 60 + bt.minute
+        tg, sl = _SHADOW_TS.get(ticker, (0.006, 0.009))
+        # resolve open paper trades
+        still = []
+        for o in d["open"]:
+            mv = (px - o["px"]) / o["px"] * (1 if o["dir"] == "call" else -1)
+            o["peak"] = max(o["peak"], mv)
+            floor = 0.0 if o["peak"] >= tg / 2 else -sl
+            if mv >= tg:
+                _shadow_record(o, "W")
+            elif mv <= floor:
+                _shadow_record(o, "S" if floor == 0.0 else "L")
+            else:
+                still.append(o)
+        d["open"] = still
+        if mins < 575:
+            return
+        vw = st.get("vwap")
+        trig = []
+        levels = levels or {}
+        lv = {"PMH": levels.get("pmh"), "PML": levels.get("pml"),
+              "PRE-MKT HIGH": st.get("pm_high"), "PRE-MKT LOW": st.get("pm_low")}
+        closes = [float(c["close"]) for c in cs]
+        # key-level failed break -> reversal
+        for name, L in lv.items():
+            if not L:
+                continue
+            if max(closes[-4:-1]) > L * 1.0005 and px < L <= prev * 1.0005:
+                trig.append(("KEY-LEVEL REVERSAL", "put"))
+            if min(closes[-4:-1]) < L * 0.9995 and px > L >= prev * 0.9995:
+                trig.append(("KEY-LEVEL REVERSAL", "call"))
+        # 5-min opening range break
+        oh, ol = st.get("or_high"), st.get("or_low")
+        if oh and ol and mins <= 600:
+            if prev <= oh < px:
+                trig.append(("ORB-5", "call"))
+            if prev >= ol > px:
+                trig.append(("ORB-5", "put"))
+        # 15-min opening range break
+        if mins >= 585:
+            if "or15" not in d:
+                rng = [float(c["close"]) for c in cs
+                       if (datetime.fromisoformat(str(c.get("t")).replace("Z", "+00:00")).astimezone(ET).hour * 60
+                           + datetime.fromisoformat(str(c.get("t")).replace("Z", "+00:00")).astimezone(ET).minute) < 585]
+                d["or15"] = (max(rng), min(rng)) if len(rng) >= 10 else None
+            if d.get("or15"):
+                h15, l15 = d["or15"]
+                if prev <= h15 < px and (not vw or px > vw):
+                    trig.append(("ORB-15", "call"))
+                if prev >= l15 > px and (not vw or px < vw):
+                    trig.append(("ORB-15", "put"))
+        # stretched from VWAP -> first reversal candle
+        if vw and len(closes) >= 6:
+            x = {"TSLA": 0.008, "NVDA": 0.006, "SPY": 0.0025}.get(ticker, 0.006)
+            dv = (prev - vw) / vw
+            if dv > x and px < prev and prev >= max(closes[-6:-2]):
+                trig.append(("VWAP-EXTENSION FADE", "put"))
+            if dv < -x and px > prev and prev <= min(closes[-6:-2]):
+                trig.append(("VWAP-EXTENSION FADE", "call"))
+        # break & retest: level breaks, price comes back to it (within 0.1%) without
+        # closing >0.2% through, then the next push closes away in the break direction
+        br = d.setdefault("breaks", {})
+        _lv_all = {"PMH": levels.get("pmh"), "PML": levels.get("pml"),
+                   "PRE-MKT HIGH": st.get("pm_high"), "PRE-MKT LOW": st.get("pm_low"),
+                   "OR HIGH": oh if st.get("or_locked") else None,
+                   "OR LOW": ol if st.get("or_locked") else None}
+        for _nm, _L in _lv_all.items():
+            if not _L:
+                continue
+            _b = br.get(_nm)
+            if not _b:
+                if prev <= _L < px:
+                    br[_nm] = {"dir": "call", "n": 0, "touched": False}
+                elif prev >= _L > px:
+                    br[_nm] = {"dir": "put", "n": 0, "touched": False}
+                continue
+            if _b.get("done"):
+                continue
+            _b["n"] += 1
+            if _b["n"] > 20:
+                _b["done"] = True
+                continue
+            if _b["dir"] == "call":
+                if px < _L * 0.998:
+                    _b["done"] = True
+                elif px <= _L * 1.001:
+                    _b["touched"] = True
+                elif _b["touched"] and px > prev:
+                    trig.append(("BREAK & RETEST", "call")); _b["done"] = True
+            else:
+                if px > _L * 1.002:
+                    _b["done"] = True
+                elif px >= _L * 0.999:
+                    _b["touched"] = True
+                elif _b["touched"] and px < prev:
+                    trig.append(("BREAK & RETEST", "put")); _b["done"] = True
+        for name, direction in trig:
+            if name in d["fired"]:
+                continue
+            d["fired"].add(name)
+            d["open"].append({"setup": name, "tk": ticker, "dir": direction, "px": px,
+                              "t": bt.strftime("%H:%M"), "date": today, "peak": 0.0})
+            log.info(f"SHADOW: {name} {ticker} {direction} @ {px:.2f} {bt.strftime('%H:%M')}")
+    except Exception as e:
+        log.warning(f"shadow track {ticker} failed: {e}")
+
+
+def _shadow_record(o: dict, result: str):
+    with _state_lock:
+        s = load_state()
+        lg = s.get("shadow_log") or []
+        lg.append({"setup": o["setup"], "tk": o["tk"], "dir": o["dir"], "date": o["date"],
+                   "t": o["t"], "r": result})
+        s["shadow_log"] = lg[-300:]
+        _commit(s)
+
+
+def _shadow_close_window():
+    """Window end: unresolved paper trades are scored by where price sits now."""
+    for tk, d in list(_SHADOW_DAY.items()):
+        st = _mkt_structure.get(tk) or {}
+        cs = st.get("candles") or []
+        if not cs or not d.get("open"):
+            continue
+        px = float(cs[-1]["close"])
+        for o in d["open"]:
+            mv = (px - o["px"]) / o["px"] * (1 if o["dir"] == "call" else -1)
+            _shadow_record(o, "W" if mv > 0 else "L")
+        d["open"] = []
+
+
+def _shadow_summary() -> dict:
+    lg = load_state().get("shadow_log") or []
+    out = {}
+    for r in lg:
+        a = out.setdefault(r["setup"], {"W": 0, "L": 0, "S": 0})
+        a[r["r"]] = a.get(r["r"], 0) + 1
+    for k, a in out.items():
+        n = a["W"] + a["L"] + a["S"]
+        a["n"] = n
+        a["win_rate"] = round(a["W"] / n, 3) if n else None
+    return out
+
+
+def _gate_entry_quality(ticker: str, direction: str, now_et=None, skip_chop: bool = False) -> tuple:
+    """v14.12 HARD GATES enforced in code AFTER the model approves (the prompt is
+    advice; these are law). Returns (ok, reason)."""
+    if not QUALITY_GATES:
+        return True, ""
+    now_et = now_et or datetime.now(ET)
+    try:
+        _h, _m = (int(x) for x in ENTRY_START_ET.split(":"))
+        if (now_et.hour, now_et.minute) < (_h, _m):
+            return False, f"opening-noise gate — no entries before {ENTRY_START_ET} ET"
+    except Exception:
+        pass
+    st = _mkt_structure.get(ticker) or {}
+    cs = st.get("candles") or []
+    if not cs:
+        return True, ""
+    try:
+        last = float(cs[-1].get("close"))
+    except Exception:
+        return True, ""
+    vwap = st.get("vwap")
+    if vwap:
+        if direction == "call" and last <= vwap:
+            return False, f"VWAP gate — calls need price above VWAP ({last:.2f} vs VWAP {vwap:.2f})"
+        if direction == "put" and last >= vwap:
+            return False, f"VWAP gate — puts need price below VWAP ({last:.2f} vs VWAP {vwap:.2f})"
+    ind = _indicators(cs)
+    e8, e21 = ind.get("ema8"), ind.get("ema21")
+    if e8 is not None and e21 is not None:
+        if direction == "call" and e8 <= e21:
+            return False, f"trend gate — calls need 8 EMA above 21 EMA ({e8} vs {e21})"
+        if direction == "put" and e8 >= e21:
+            return False, f"trend gate — puts need 8 EMA below 21 EMA ({e8} vs {e21})"
+    q = _chop_metrics(cs)
+    if q.get("chop") and not _drought_mode() and not skip_chop:
+        return False, (f"chop gate — price flipped across VWAP {q.get('vwap_flips')}x (last 20 min) / "
+                       f"8-21 EMA crossed {q.get('ema_crosses')}x (last 15 min); no clean trend")
+    return True, ""
 
 
 def _indicators(candles: list) -> dict:
@@ -2897,6 +3556,17 @@ def _structure_context(ticker: str, pmh, pml) -> str:
     elif st.get("or_high") is not None:
         L.append("  Opening range: forming (locks 9:35) currently " + str(st.get("or_low")) + "-" + str(st.get("or_high")))
     cs = st.get("candles", [])
+    if st.get("vwap") and cs:
+        try:
+            _lc = float(cs[-1].get("close"))
+            _q = _chop_metrics(cs)
+            L.append("  VWAP (session): " + str(st.get("vwap")) + " — price is "
+                     + ("ABOVE (calls side)" if _lc > st["vwap"] else "BELOW (puts side)")
+                     + " | VWAP flips last 20 bars: " + str(_q.get("vwap_flips"))
+                     + " | 8/21 EMA crosses last 15 bars: " + str(_q.get("ema_crosses"))
+                     + ((" — CHOP" + ("" if _drought_mode() else ", NO_TRADE")) if _q.get("chop") else ""))
+        except Exception:
+            pass
     try:
         ind = _indicators(cs)
         if ind.get("ema8") is not None:
@@ -2914,6 +3584,14 @@ def _structure_context(ticker: str, pmh, pml) -> str:
     return chr(10).join(L)
 
 def _build_claude_prompt(alert_data: dict, session: dict, as_of: str | None = None) -> str:
+    _dn = _drought_sessions()
+    _drought_txt = (
+        f"DROUGHT MODE ACTIVE ({_dn} sessions with no trade):\n"
+        "- Members need action today. This OVERRIDES the chop / NO_TRADE-default rules.\n"
+        "- APPROVE the single best setup (Condition A/C or Setups 1-5) that is ALIGNED with VWAP and the "
+        "8/21 EMA direction, even if the tape is imperfect. Prefer a retest-and-hold entry.\n"
+        "- Still NO_TRADE for anything fighting VWAP or the EMA trend.\n\n"
+    ) if (QUALITY_GATES and _dn >= DROUGHT_DAYS > 0) else ""
     ticker     = alert_data.get("ticker",     "UNKNOWN")
     alert_type = alert_data.get("alert_type", "UNKNOWN")
     close      = alert_data.get("close",      "N/A")
@@ -2971,12 +3649,12 @@ OUTPUT CONTRACT (mandatory):
 
 ENTRY FRESHNESS RULE:
 - A break-based entry (Condition A, Condition C, Setup 1) is only valid if the triggering cross occurred within the LAST 5 candles, or price is retesting the broken level right now.
-- Do not chase an extended move: if the break happened earlier and price has already traveled far from the level and sits at/near session extremes, that is NO_TRADE unless a fresh Condition D reversal or a new break prints.
+- Do not chase an extended move: if the break happened earlier and price has already traveled far from the level and sits at/near session extremes, that is NO_TRADE unless a retest-and-hold of the level or a new break prints.
 
 REJECTION-THEN-RECLAIM GUARD:
 - If the SAME anchor recorded a rejection within the last 3 candles, do NOT approve an entry through that anchor off a single candle. Require the CURRENT candle AND the PRIOR candle to both close beyond the anchor before treating it as a confirmed break/reclaim. One-candle flips at a contested level are chop, not confirmation.
 
-POST-LOSS RE-ENTRY RULE:
+{_drought_txt}POST-LOSS RE-ENTRY RULE:
 - SESSION STATE shows today's losses per ticker and direction. After a loss on a ticker: the SAME direction is dead for the day. The OPPOSITE direction is allowed ONLY as TIER-1 — a decisive break of VWAP or the day's high/low with clearly above-average volume. An ordinary Tier-2 setup on a ticker that already cost us money today is NO_TRADE.
 
 WHIPSAW RULE:
@@ -3037,7 +3715,8 @@ def _week_ahead_scan() -> dict | None:
             f"testimony, or symposium appearances, with dates.\n"
             f"2. Any FOMC meetings/minutes this week.\n"
             f"3. High-impact US releases: CPI, PPI, Core PCE, GDP, NFP jobs report — dates.\n"
-            f"4. Earnings report dates THIS week for: {', '.join(TICKERS)}.\n"
+            f"4. Earnings report dates THIS week AND NEXT week for: "
+            f"{', '.join(sorted(set(TICKERS) | set(SWING_TICKERS)))}.\n"
             f"Respond with ONLY a JSON object, no prose:\n"
             f'{{"no_trade_dates": ["YYYY-MM-DD", ...],   // days with Fed-chair speeches or FOMC events\n'
             f' "earnings": ["TICKER:YYYY-MM-DD", ...],   // our tickers only\n'
@@ -3046,7 +3725,7 @@ def _week_ahead_scan() -> dict | None:
         response = _claude_client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1500,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
             messages=[{"role": "user", "content": prompt}],
         )
         _txt = " ".join(b.text for b in response.content if getattr(b, "type", "") == "text")
@@ -3115,6 +3794,9 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     tier  = claude_decision.get("tier", "TIER-1")
     setup = claude_decision.get("setup_description", "")
+    if _day_loss_limit_hit():
+        log.info("BLOCKED: daily loss limit reached — no new day trades today")
+        return False
 
     # v12: directional lockout + higher-bar re-entry, enforced with the decision in hand
     _ok, _why = _gate_ticker_lockout(ticker, "entry", direction)
@@ -3138,6 +3820,17 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         )
         return False
 
+    _okq, _whyq = _gate_entry_quality(
+        ticker, direction, skip_chop=(str(claude_decision.get("setup") or "") == "VWAP_PULLBACK"))
+    if not _okq:
+        log.info(f"BLOCKED post-decision (v14.12 quality): {_whyq}")
+        post_to_discord(
+            "daily-watchlist",
+            f"📚 **Setup we passed on — {ticker} {direction.upper()}** [{tier}]\n"
+            f"{setup}\n**Passed:** {_whyq}.",
+        )
+        return False
+
     occ, strike, ask = select_contract(ticker, direction)
     global _last_order_ask
     _last_order_ask = ask
@@ -3151,13 +3844,16 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         post_to_discord(
             "day-trade-signals",
             f"⚠️ Setup identified on **{ticker} {direction.upper()}** "
-            f"but no contract available in the $75–$150 range. Passing on this one.",
+            + (f"but {_last_itm_reason}. Passing on this one."
+               if DAY_CONTRACT_MODE == "itm" and _last_itm_reason else
+               "but no contract fit the selection rules. Passing on this one."),
         )
         post_to_discord(
             "daily-watchlist",
             f"📚 **Setup we passed on — {ticker} {direction.upper()}** [{tier}]\n"
             + (setup if setup else "Level-break setup confirmed by the model.")
-            + "\nPassed only because no contract fit the $0.75–$1.50 premium rule at selection time.",
+            + "\nPassed only because no contract fit the selection rules"
+            + (f" ({_last_itm_reason})." if DAY_CONTRACT_MODE == "itm" and _last_itm_reason else "."),
         )
         return False
 
@@ -3166,7 +3862,22 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     _, _dte_e, _ = _occ_expiry_dte(occ)
     _scale = 0.5 if (_dte_e is not None and _dte_e <= 1) else 1.0
     _scale_label = " · HALF-SIZE (1DTE safeguard)" if _scale == 0.5 else ""
-    qty = _position_size(_entry_ask, scale=_scale)
+    _scale = round(_scale * _day_risk_norm(), 4)
+    if _drought_mode():
+        _scale = round(_scale * DROUGHT_SIZE_SCALE, 4)
+        _scale_label += " · DROUGHT-RELIEF SIZE"
+    if DAY_CONTRACT_MODE == "itm":
+        # v14.13: budget-based sizing; 1 contract minimum when one fits the budget
+        _bud = (_sizing_cash() or 0) * DAY_ITM_BUDGET_PCT
+        _sc = (0.5 if (_dte_e is not None and _dte_e <= 1) else 1.0) * \
+              (DROUGHT_SIZE_SCALE if _drought_mode() else 1.0)
+        qty = int((_bud * _sc) // (_entry_ask * 100)) if _entry_ask > 0 else 0
+        if qty == 0 and 0 < _entry_ask * 100 <= _bud:
+            qty = 1
+        qty = min(qty, MAX_CONTRACTS)
+        log.info(f"ITM sizing: budget ${_bud:.0f} x{_sc} ask ${_entry_ask:.2f} -> {qty}")
+    else:
+        qty = _position_size(_entry_ask, scale=_scale)
     if qty == 0:
         _r = _risk()
         _cash = _sizing_cash() or 0
@@ -3242,7 +3953,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
                             f"manual intervention in progress. Do not follow this entry.")
             set_open_position({"ticker": ticker, "direction": direction, "occ_symbol": occ,
                                "qty": qty, "fill_price": fill_price, "stop_order_id": None,
-                               "target_price": round(fill_price * 1.40, 2), "peak_pnl": 0.0,
+                               "target_price": round(fill_price * (1 + DAY_TARGET_PCT), 2), "peak_pnl": 0.0,
                                "entry_time": datetime.now(ET).isoformat()})
             return True
         _pnl_d = round((_exit - fill_price) * 100 * qty, 2)
@@ -3259,7 +3970,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     arrow      = "🟢" if direction == "call" else "🔴"
     type_label = "CALL" if direction == "call" else "PUT"
-    target     = round(fill_price * 1.40, 2)
+    target     = round(fill_price * (1 + DAY_TARGET_PCT), 2)
     stop       = round(fill_price * (1 - _stop_pct()), 2)
     cost       = round(fill_price * 100 * qty,  2)
     stop_lbl   = f"-{int(_stop_pct()*100)}%"
@@ -3271,13 +3982,18 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"{arrow} **{ticker} {type_label}** [{tier}]{_scale_label}\n\n"
         f"**Contract:** {_fmt_occ(occ)}\n"
         f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
-        f"**Target:** ${target:.2f} (+40%)\n"
+        f"**Target:** ${target:.2f} (+{DAY_TARGET_PCT:.0%})\n"
         + (f"**Bracket resting at broker ✅** — target ${target:.2f} & stop ${stop:.2f} ({stop_lbl}) as one OCO: "
            f"either fills, the other cancels\n"
            + (f"Contract band: {_last_selection_tier}\n" if _last_selection_tier else "")
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
-        + "Protection: recovery rule (dip ≤-10% then back green → stop -10%) | locks AT +10% / +20% / +30% | target +40%. "
+        + (f"Protection: recovery rule (dip ≤-{RECOVERY_DIP:.0%} then back green → stop -{RECOVERY_DIP:.0%}) | "
+           + " / ".join(("+" + format(_t, ".0%") + "→" + ("BE" if abs(_l) < 1e-9 else format(_l, "+.0%"))) for _t, _l in DAY_LADDER)
+           + f" | target +{DAY_TARGET_PCT:.0%}"
+           + (f" | **members: take half off at +{DAY_TRIM_AT:.0%}**" if DAY_CONTRACT_MODE == "itm" else "")
+           + ". ")
+        + 
           "Take profits early whenever you're comfortable — the target is ours, the gains are yours\n\n"
         f"{setup}",
     )
@@ -3299,10 +4015,16 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "daily-watchlist",
         f"📚 **Setup breakdown — {ticker} {type_label}** [{tier}]\n"
         + (setup if setup else "Level-break setup confirmed.")
-        + f"\nEntry ${fill_price:.2f} x{qty} | Target ${target:.2f} (+40%) | Stop ${stop:.2f} ({stop_lbl})"
+        + f"\nEntry ${fill_price:.2f} x{qty} | Target ${target:.2f} (+{DAY_TARGET_PCT:.0%}) | Stop ${stop:.2f} ({stop_lbl})"
         + _cr_line,
     )
 
+    try:
+        with _state_lock:
+            _de = load_state(); _de["last_day_entry_date"] = datetime.now(ET).date().isoformat()
+            _de.pop("day_trim_bank", None); _commit(_de)
+    except Exception:
+        pass
     set_open_position({
         "ticker":        ticker,
         "direction":     direction,
@@ -3317,7 +4039,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "recovery_locked": False,
         "last_update_ts": time_module.time()
                           - int(os.environ.get("UPDATE_INTERVAL_MIN", "5")) * 60 + 180,
-        "target_price":  round(fill_price * 1.40, 2),
+        "target_price":  round(fill_price * (1 + DAY_TARGET_PCT), 2),
         "peak_pnl":      0.0,
         "entry_time":    datetime.now(ET).isoformat(),
     })
@@ -3614,7 +4336,7 @@ def _scheduler_loop():
                     lines.append(f"✅ {APP_VERSION} boot {_BOOT_ID} | trades {_s0.get('trade_count', 0)}/2 | "
                                  f"circuit {'ON' if _s0.get('circuit_breaker') else 'off'}")
                     send_emergency_dm(
-                        "\n".join(lines) + "\nWindow 9:30–10:30 ET. Watchlist posts 9:15.",
+                        "\n".join(lines) + f"\nWindow 9:30–{_win_end_label()} ET. Watchlist posts 9:15.",
                         prefix=("🚨 **TPP PRE-FLIGHT — ATTENTION NEEDED** 🚨" if bad
                                 else "✅ **TPP PRE-FLIGHT — ALL SYSTEMS GREEN**"),
                     )
@@ -3760,37 +4482,50 @@ def _scheduler_loop():
                             _bo, _why = _swing_entry_blackout_today()
                             if (not _bo and _swing_week_count() < SWING_MAX_PER_WEEK
                                     and len(_swing_positions()) < SWING_MAX_ACTIVE):
-                                for _tk in SWING_TICKERS:  # v14.10: wider universe
-                                    if any(p.get("ticker") == _tk for p in _swing_positions()):
+                                # v14.12: trend-filtered BREAKOUT + PULLBACK setups,
+                                # market-regime aligned, best setup tried first.
+                                _held = {p.get("ticker") for p in _swing_positions()}
+                                _lvls, _spy = [], None
+                                for _tk in SWING_TICKERS:
+                                    try:
+                                        _lv = _swing_levels(_tk)
+                                    except Exception:
+                                        _lv = None
+                                    if _lv is None:
                                         continue
-                                    _bars = _daily_bars(_tk)
-                                    if len(_bars) < 21:
-                                        continue
-                                    _hi20 = max(b["h"] for b in _bars[-21:-1])
-                                    _lo20 = min(b["l"] for b in _bars[-21:-1])
-                                    _px = _spot_price(_tk)
-                                    if not _px:
-                                        continue
-                                    _snap = load_state().get("swing_scan_snapshot") or {}
-                                    _snap[_tk] = {"px": _px, "hi20": _hi20, "lo20": _lo20,
-                                                  "t": datetime.now(ET).strftime("%H:%M")}
-                                    with _state_lock:
-                                        _ss2 = load_state(); _ss2["swing_scan_snapshot"] = _snap; _commit(_ss2)
-                                    log.info(f"SWING scan {_tk}: ${_px:.2f} vs 20d "
-                                             f"[{_lo20:.2f}–{_hi20:.2f}] "
-                                             f"(long needs >{_hi20 * 1.001:.2f}, short <{_lo20 * 0.999:.2f})")
-                                    if _px > _hi20 * 1.001:
-                                        if swing_execute_entry(
-                                                _tk, "call",
-                                                f"{_tk} is closing the day above its 20-day high "
-                                                f"(${_hi20:.2f}) — breakout swing per playbook."):
-                                            break
-                                    elif _px < _lo20 * 0.999:
-                                        if swing_execute_entry(
-                                                _tk, "put",
-                                                f"{_tk} is closing the day below its 20-day low "
-                                                f"(${_lo20:.2f}) — breakdown swing per playbook."):
-                                            break
+                                    if _tk == "SPY":
+                                        _spy = _lv
+                                    _lvls.append(_lv)
+                                if _spy is None:
+                                    try:
+                                        _spy = _swing_levels("SPY")
+                                    except Exception:
+                                        _spy = None
+                                _snap = {}
+                                _trig = []
+                                for _lv in _lvls:
+                                    _ok_reg = _lv["direction"] and _swing_regime_ok(_lv["direction"], _spy)
+                                    if _lv["trend"] != "none":
+                                        _snap[_lv["ticker"]] = {
+                                            "px": _lv["px"], "trend": _lv["trend"], "setup": _lv["setup"],
+                                            "prox": _lv["proximity"], "plan": _lv["plan"],
+                                            "regime_ok": bool(_ok_reg),
+                                            "t": datetime.now(ET).strftime("%H:%M")}
+                                    if _lv["trigger"] and _ok_reg and _lv["ticker"] not in _held:
+                                        _trig.append(_lv)
+                                with _state_lock:
+                                    _ss2 = load_state(); _ss2["swing_scan_snapshot"] = _snap; _commit(_ss2)
+                                log.info(f"SWING scan: {len(_lvls)} tickers read, {len(_snap)} trending, "
+                                         f"{len(_trig)} triggered")
+                                # pullbacks first (higher hit-rate), then strongest trend
+                                _trig.sort(key=lambda lv: (lv["setup"] != "PULLBACK", -lv["strength"]))
+                                for _lv in _trig:
+                                    if swing_execute_entry(
+                                            _lv["ticker"], _lv["direction"],
+                                            f"{_lv['ticker']} {_lv['setup'].lower()} swing — "
+                                            f"{_lv['plan']}; {_lv['trend']}trend confirmed "
+                                            f"(price vs 50-day ${_lv['sma50']:.2f})."):
+                                        break
                         except Exception as _swe:
                             log.error(f"swing entry scan failed: {_swe}")
 
@@ -3808,20 +4543,18 @@ def _scheduler_loop():
                             pass   # entry posts already told the story
                         elif _snap:
                             _lines = []
-                            for _tk2, d in _snap.items():
-                                _need_up = d["hi20"] * 1.001
-                                _need_dn = d["lo20"] * 0.999
-                                _dist_up = (_need_up - d["px"]) / d["px"]
-                                _dist_dn = (d["px"] - _need_dn) / d["px"]
+                            _top = sorted(_snap.items(),
+                                          key=lambda kv: (kv[1].get("prox") if kv[1].get("prox") is not None else 9))[:5]
+                            for _tk2, d in _top:
                                 _lines.append(
-                                    f"**{_tk2}** ${d['px']:.2f} — long trigger >{_need_up:.2f} "
-                                    f"({_dist_up:+.1%} away) | short trigger <{_need_dn:.2f} "
-                                    f"({_dist_dn:+.1%} away)")
+                                    f"**{_tk2}** ${d['px']:.2f} — {str(d.get('trend')).upper()}TREND · "
+                                    f"{d.get('setup')} · {d.get('plan')}"
+                                    + ("" if d.get("regime_ok") else " _(against market direction — skipped)_"))
                             post_to_discord(
                                 SWING_CHANNEL,
                                 "🧭 **Swing window closed — no entries today.**\n"
-                                "Every scan came back inside the 20-day range; we don't force "
-                                "swings, we wait for breaks.\n" + "\n".join(_lines)
+                                "No setup completed its trigger; we don't force swings. Closest setups "
+                                "for tomorrow:\n" + "\n".join(_lines)
                                 + f"\nWeek: {_swing_week_count()}/{SWING_MAX_PER_WEEK} slots used "
                                   f"| {len(_swing_positions())}/{SWING_MAX_ACTIVE} positions active. "
                                   "Hunt resumes next session 3:00 PM.",
@@ -3855,7 +4588,7 @@ def _scheduler_loop():
                         and not _no_trade_today()):
                     s = load_state()
                     if s["trade_count"] == 0 and not get_open_position():
-                        _post_scanning_update("10:15 AM — final stretch", "Window closes 10:30 — if nothing sets up we sit out. No forced trades.")
+                        _post_scanning_update("10:15 AM", f"Window closes {_win_end_label()} — if nothing sets up we sit out. No forced trades.")
                         for _ctk in TICKERS:
                             try:
                                 post_chart_to_discord("daily-watchlist", _ctk,
@@ -3869,7 +4602,7 @@ def _scheduler_loop():
                     _sp = load_state(); _sp["last_1015_date"] = today_s; _commit(_sp)
 
                 # ── 1-min scanner 9:25–10:30 AM ──────────────────────────
-                if dtime(9, 25) <= t <= dtime(10, 30) and _in_window():
+                if dtime(9, 25) <= t <= dtime(*_win_end()) and _in_window():
                     try:
                         for ticker in TICKERS:
                             # Structure stays fresh every tick, gates or not
@@ -3879,6 +4612,13 @@ def _scheduler_loop():
                                 continue
                             if time_module.time() - _boot_ts < 120:
                                 continue  # boot grace: ingest yes, entries no
+                            _shadow_track(ticker, levels)    # v14.13: paper-only scorecard
+                            if _day_loss_limit_hit():
+                                continue                     # one-loss day: done trading
+                            if DAY_ENGINE == "rules":
+                                _rd = _rules_decision(ticker)
+                                if not _rd:
+                                    continue
                             if not all_gates_pass(ticker, signal_type="entry"):
                                 continue
                             alert_data = {
@@ -3893,7 +4633,7 @@ def _scheduler_loop():
                                 "pml":        levels.get("pml"),
                             }
                             session  = load_state()
-                            decision = call_claude(alert_data, session)
+                            decision = _rd if DAY_ENGINE == "rules" else call_claude(alert_data, session)
                             if decision and decision.get("decision") == "APPROVE":
                                 direction = decision.get("direction", "").lower()
                                 if direction in ("call", "put"):
@@ -3902,9 +4642,29 @@ def _scheduler_loop():
                     except Exception as e:
                         log.error(f"Scanner error: {e}")
 
+            # ── v14.13: shadow scorecard — close the paper book at window end,
+            #    weekly private DM on the last trading day of the week ──
+            if (today.weekday() < 5 and today not in MARKET_HOLIDAYS
+                    and dtime(*_win_end()) < t <= dtime(15, 59)
+                    and load_state().get("last_shadow_close") != today_s):
+                with _state_lock:
+                    _sh = load_state(); _sh["last_shadow_close"] = today_s; _commit(_sh)
+                try:
+                    _shadow_close_window()
+                    if _next_trading_day(today).isocalendar()[1] != today.isocalendar()[1]:
+                        _sm = _shadow_summary()
+                        if _sm:
+                            send_emergency_dm(
+                                "📊 Weekly SHADOW SCORECARD (paper only — no orders):\n" + "\n".join(
+                                    f"{k}: {a['W']}W / {a['L']}L / {a['S']} scratch "
+                                    f"(win {a['win_rate']:.0%} of {a['n']})" for k, a in sorted(_sm.items())),
+                                prefix="📊 **TPP SCORECARD**")
+                except Exception as _she:
+                    log.warning(f"shadow close failed: {_she}")
+
             # ── Daily wrap 10:31+ — members get an official end to the day ──
             if (today.weekday() < 5 and today not in MARKET_HOLIDAYS
-                    and dtime(10, 31) <= t <= dtime(15, 59)
+                    and dtime(*_win_end()) < t <= dtime(15, 59)
                     and load_state().get("last_wrap_date") != today_s
                     and not get_open_position()
                     and not _no_trade_today()):
@@ -3930,8 +4690,10 @@ def _scheduler_loop():
                         _wrap = (f"🏁 **Window closed — day recap: {_wins}W / {len(_res) - _wins}L, "
                                  f"{'+' if _tot >= 0 else ''}${abs(_tot):.0f} net.**\n"
                                  + "\n".join(_lines)
-                                 + (f"\n🚫 {', '.join(_locked)} benched after a loss — one loss per "
-                                    f"ticker per day, that's the rule." if _locked else "")
+                                 + (("\n🛑 Done for the day after a loss — one losing trade max, "
+                                     "that's how we protect the downside.") if _day_loss_limit_hit()
+                                    else (f"\n🚫 {', '.join(_locked)} benched after a loss — one loss per "
+                                          f"ticker per day, that's the rule." if _locked else ""))
                                  + "\nEvery entry, exit, and stop was posted live above. "
                                    "Watchlist returns next trading day at 9:15.")
                     post_to_discord("daily-watchlist", _wrap)
@@ -4186,7 +4948,7 @@ def oco_test():
     if not occ:
         return jsonify({"ok": False, "error": "no contract found"}), 200
     fill = float(ask or 1.00)
-    target  = _tick(fill * 1.40)
+    target  = _tick(fill * (1 + DAY_TARGET_PCT))
     trigger = _tick(fill * (1 - _stop_pct()))
     payload = {
         "type": "OCO",
@@ -4246,6 +5008,16 @@ def status():
         "risk_mode":          _risk().get("tier", "?"),
         "swing_active":       len(_swing_positions()),
         "swing_week_used":    _swing_week_count(),
+        "quality_gates":      QUALITY_GATES,
+        "drought_sessions":   _drought_sessions(),
+        "drought_mode":       _drought_mode(),
+        "day_engine":         DAY_ENGINE,
+        "contract_mode":      DAY_CONTRACT_MODE,
+        "day_target_pct":     DAY_TARGET_PCT,
+        "window_end":         _win_end_label(),
+        "day_max_losses":     DAY_MAX_LOSSES,
+        "loss_limit_hit":     _day_loss_limit_hit(),
+        "shadow_scorecard":   _shadow_summary() if SHADOW_ON else None,
         "alloc_pct":          _risk()["alloc"],
         "stop_pct":           _stop_pct(),
         "no_trade_today":     _no_trade_today(),
