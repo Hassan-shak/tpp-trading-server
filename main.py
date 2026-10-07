@@ -127,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.13"
+APP_VERSION = "v14.14"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -310,7 +310,11 @@ DAY_ENGINE = os.environ.get("DAY_ENGINE", "rules").lower()            # rules | 
 DAY_CONTRACT_MODE = os.environ.get("DAY_CONTRACT_MODE", "itm").lower() # itm | cheap
 DAY_ITM_BUDGET_PCT = float(os.environ.get("DAY_ITM_BUDGET_PCT", "0.22"))
 DAY_ITM_MAX_DEPTH = int(os.environ.get("DAY_ITM_MAX_DEPTH", "2"))
-DAY_TARGET_PCT = float(os.environ.get("DAY_TARGET_PCT", "0.20" if DAY_CONTRACT_MODE == "itm" else "0.40"))
+# v14.14 (Oct 6, Junior): NO fixed +20% target — winners run. The broker OCO
+# limit leg sits at a far "runner cap" (+100% default) and the step-trail does
+# the exiting. New env names on purpose so stale DAY_TARGET_PCT/DAY_LADDER
+# values in Render can't silently bring the old +20% cap / +5% trail back.
+DAY_TARGET_PCT = float(os.environ.get("DAY_RUNNER_CAP_PCT", "2.00"))
 DAY_TRIM_AT = float(os.environ.get("DAY_TRIM_AT", "0.10"))   # sell half here (needs 2+ contracts)
 WINDOW_END_ET = os.environ.get("WINDOW_END_ET", "11:30")
 CHOP_CIRCUIT = os.environ.get("CHOP_CIRCUIT", "0") == "1"     # 10-min stagnant exit (untested -> off)
@@ -331,8 +335,42 @@ def _win_end_label() -> str:
 
 
 # Ladder: stop to break-even at +10% (+5% at +15%); the +20% target rests at broker.
-DAY_LADDER = _parse_ladder(os.environ.get(
-    "DAY_LADDER", "0.10:0.00,0.15:0.05" if DAY_CONTRACT_MODE == "itm" else "0.15:0.00,0.25:0.10,0.35:0.20"))
+# v14.14 STEP TRAIL (Junior's spec, Oct 6): +10% -> lock +5% (members take
+# half); +15% -> +10%; +20% -> +15% ... +40% -> +35%. From +50% the trail
+# WIDENS to give runners room: +50% -> +40%, +60% -> +50%, +70% -> +60% ...
+# up to the runner cap. Fewer, bigger steps up top = fewer order replacements.
+DAY_TRAIL_START = float(os.environ.get("DAY_TRAIL_START", "0.10"))
+DAY_TRAIL_STEP = float(os.environ.get("DAY_TRAIL_STEP", "0.05"))
+DAY_TRAIL_GAP = float(os.environ.get("DAY_TRAIL_GAP", "0.05"))
+DAY_TRAIL_WIDE_AT = float(os.environ.get("DAY_TRAIL_WIDE_AT", "0.50"))
+DAY_TRAIL_WIDE_STEP = float(os.environ.get("DAY_TRAIL_WIDE_STEP", "0.10"))
+DAY_TRAIL_WIDE_GAP = float(os.environ.get("DAY_TRAIL_WIDE_GAP", "0.10"))
+
+
+def _build_day_ladder() -> list:
+    out = []
+    t = DAY_TRAIL_START
+    while t <= DAY_TRAIL_WIDE_AT - DAY_TRAIL_WIDE_STEP + 1e-9 and t < DAY_TARGET_PCT - 1e-9:
+        out.append((round(t, 4), round(t - DAY_TRAIL_GAP, 4)))
+        t += DAY_TRAIL_STEP
+    t = DAY_TRAIL_WIDE_AT
+    while t < DAY_TARGET_PCT - 1e-9 and len(out) < 60:
+        out.append((round(t, 4), round(t - DAY_TRAIL_WIDE_GAP, 4)))
+        t += DAY_TRAIL_WIDE_STEP
+    return out
+
+
+DAY_LADDER = _build_day_ladder()
+
+# v14.14 KEY-LEVEL CHOP GATE (Oct 6 lesson: NVDA put entered 9:49 while price
+# chopped inside the pre-market range for 3 hours). If the tape is CHOPPY
+# (VWAP/EMA flip-flopping, or a dead-flat 15-min range) and price is inside the
+# pre-market range, sit in cash until it breaks out (KEY_HOLD_BARS closes
+# through the high/low). A clean trend or reversal inside the range still trades.
+KEY_LEVEL_GATE = os.environ.get("KEY_LEVEL_GATE", "1") == "1"
+KEY_HOLD_BARS = int(os.environ.get("KEY_HOLD_BARS", "2"))
+KEY_BUFFER_PCT = float(os.environ.get("KEY_BUFFER_PCT", "0.0005"))
+SIDEWAYS_MAX_RANGE = float(os.environ.get("SIDEWAYS_MAX_RANGE_PCT", "0.0015"))   # 15-min range < 0.15% = dead flat
 QUALITY_GATES = os.environ.get("QUALITY_GATES", "1") == "1"
 ENTRY_START_ET = os.environ.get("ENTRY_START_ET", "09:40")
 CHOP_MAX_VWAP_FLIPS = int(os.environ.get("CHOP_MAX_VWAP_FLIPS", "3"))    # in last 20 bars
@@ -991,7 +1029,7 @@ def _adopt_as_swing(item: dict) -> bool:
     _swing_save_positions(plist)
     log.critical(f"[{_BOOT_ID}] SWING-ADOPTED {occ} (DTE {dte}) basis ${basis:.2f} "
                  f"— swing management + GTC bracket reattached")
-    post_to_discord(SWING_CHANNEL,
+    post_to_discord("profits-and-recaps",
                     f"♻️ **Swing reattached after restart** — {_fmt_occ(occ)} "
                     f"(basis ${basis:.2f} × {qty}). GTC bracket re-armed; candle-close "
                     f"stop, trail, and trim all active. Nothing was left unmanaged.")
@@ -1072,7 +1110,7 @@ def _adopt_broker_positions():
                 prefix="🚨 **TPP PROTECTION ALERT** 🚨")
         post_to_discord("daily-watchlist",
                         f"♻️ Reattached to open position **{_fmt_occ(occ)}** after a "
-                        f"restart — managing per playbook (target +40%, trailing stop, "
+                        f"restart — managing per playbook (step-trail stop, "
                         f"3:45 ET flatten).")
     except Exception as e:
         log.critical(f"[{_BOOT_ID}] Position adoption failed: {e}")
@@ -1213,7 +1251,7 @@ def _swing_pick_expiry(ticker: str) -> str | None:
                 except Exception:
                     continue
                 dte = (d - today).days
-                if SWING_DTE_MIN <= dte <= SWING_DTE_MAX:
+                if max(SWING_DTE_MIN, 60) <= dte <= SWING_DTE_MAX:
                     cands.append((dte, ds))
         if not cands:
             return None
@@ -1223,73 +1261,174 @@ def _swing_pick_expiry(ticker: str) -> str | None:
         return None
 
 
-def swing_select_contract(ticker: str, direction: str) -> tuple:
-    """$1.50–$5.00 band on the 90–365 DTE monthly; spread ≤5% of mid;
-    within 8% of spot; closest-to-money wins. Returns (occ, strike, ask, exp)."""
-    exp_str = _swing_pick_expiry(ticker)
+def _option_quotes_bulk(occs: list) -> dict:
+    """v14.14: many option NBBOs in one Alpaca call (100 symbols per request).
+    Returns {compact_symbol: {"bid":, "ask":}}."""
+    out = {}
+    key = os.environ.get("ALPACA_API_KEY", "")
+    sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+    syms = [o.replace(" ", "") for o in occs if o]
+    for i in range(0, len(syms), 100):
+        chunk = syms[i:i + 100]
+        try:
+            r = requests.get("https://data.alpaca.markets/v1beta1/options/quotes/latest",
+                             headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                             params={"symbols": ",".join(chunk)}, timeout=8)
+            if r.status_code == 200:
+                for k, q in (r.json().get("quotes") or {}).items():
+                    out[k] = {"bid": q.get("bp"), "ask": q.get("ap")}
+            else:
+                log.warning(f"bulk option quotes http {r.status_code}")
+        except Exception as e:
+            log.warning(f"bulk option quotes failed: {e}")
+    return out
+
+
+def _swing_budget_cap() -> float | None:
+    """Largest premium the half-size swing allocation can buy 1 contract of."""
+    cap = None
+    for c in range(5, 2001, 5):
+        p = c / 100.0
+        try:
+            if _position_size(p, scale=0.5) >= 1:
+                cap = p
+            else:
+                break
+        except Exception:
+            return None
+    return cap
+
+
+def swing_select_contract(ticker: str, direction: str, diag: dict | None = None) -> tuple:
+    """v14.14 AFFORDABILITY-FIRST swing contract finder.
+    Expiries: ~120/90/75/60/45/30 DTE, longest first (min SWING_MIN_DTE=30).
+    Strikes: walk from at-the-money OUT to SWING_OTM_CAP_PCT (25%) — further
+    OTM = cheaper. Accept the first (closest-to-money) contract that is
+    in the premium band, affordable at half-size, and spread <= 10% of mid.
+    `diag` (optional dict) is filled with WHY each strike was rejected.
+    Returns (occ, strike, ask, expiry)."""
+    d = diag if diag is not None else {}
+    reasons = {"no_quote": 0, "over_band_max": 0, "over_budget": 0, "wide_spread": 0, "under_band_min": 0}
+    samples = {k: [] for k in reasons}
+    d.update(ticker=ticker, direction=direction, reasons=reasons, rejected_samples=samples,
+             band=[SWING_PREMIUM_MIN, SWING_PREMIUM_MAX], max_spread_pct=SWING_MAX_SPREAD,
+             otm_cap_pct=SWING_MAX_OTM)
     spot = _spot_price(ticker)
-    if not exp_str or not spot:
+    d["spot"] = spot
+    if not spot:
+        d["result"] = "no spot price"
         return None, None, None, None
+    d["budget_cap_per_contract"] = _swing_budget_cap()
     try:
         resp = requests.get(f"{TT_BASE}/option-chains/{ticker}/nested",
-                            headers=_tt_headers(),
-                            params={"expiration-date": exp_str}, timeout=10)
+                            headers=_tt_headers(), timeout=10)
         if resp.status_code != 200:
+            d["result"] = f"option chain http {resp.status_code}"
             return None, None, None, None
-        strike_map = {}
+        today = datetime.now(ET).date()
+        exps = {}
         for it in resp.json().get("data", {}).get("items", []):
             for exp in it.get("expirations", []):
-                if exp.get("expiration-date") != exp_str:
+                ds = exp.get("expiration-date")
+                try:
+                    dte = (datetime.strptime(ds, "%Y-%m-%d").date() - today).days
+                except Exception:
                     continue
-                for s in exp.get("strikes", []):
+                smap = exps.setdefault(ds, {"dte": dte, "strikes": {}})["strikes"]
+                for st_ in exp.get("strikes", []):
                     try:
-                        k = float(s.get("strike-price"))
-                        occ = s.get("call") if direction == "call" else s.get("put")
-                        if occ:
-                            strike_map[k] = occ
+                        k = float(st_.get("strike-price"))
+                        o = st_.get("call") if direction == "call" else st_.get("put")
+                        if o:
+                            smap[k] = o
                     except Exception:
                         continue
-        # v14.3: side-aware full walk of the allowed moneyness range. The old
-        # 24-nearest-strike window never reached the $1.50-$5.00 zone on
-        # LEAP-priced chains (SPY: 24 strikes = 2% of spot where calls cost
-        # $10-20). Walk near->far across the whole cap, stop early once
-        # premiums fall below the band floor.
-        _cap = SWING_MAX_OTM
-        if direction == "call":
-            side = [k for k in strike_map if spot * 0.99 <= k <= spot * (1 + _cap)]
-        else:
-            side = [k for k in strike_map if spot * (1 - _cap) <= k <= spot * 1.01]
-        best = None
-        for strike in sorted(side, key=lambda k: abs(k - spot)):
-            occ = strike_map[strike]
-            q = _live_option_quote(occ)
-            if not q:
+        # v14.14: ladder of expiries ~120 -> 90 -> 75 -> 60 -> 45 -> 30 days:
+        # the LONGEST-dated contract that's affordable + liquid wins (more time
+        # for the swing to work), stepping shorter only when needed.
+        pool = sorted((v["dte"], ds) for ds, v in exps.items()
+                      if SWING_DTE_MIN <= v["dte"] <= SWING_DTE_MAX)
+        order = []
+        for tgt in (120, 90, 75, 60, 45, SWING_DTE_MIN):
+            if tgt < SWING_DTE_MIN or not pool:
                 continue
-            ask = float(q.get("ask") or 0)
-            bid = float(q.get("bid") or 0)
-            if ask <= 0:
-                continue
-            if ask < SWING_PREMIUM_MIN:
-                break        # beyond the band — further OTM only gets cheaper
-            mid = (ask + bid) / 2.0
-            if mid <= 0 or (ask - bid) / mid > MAX_SPREAD_MID:
-                continue
-            if not (SWING_PREMIUM_MIN <= ask <= SWING_PREMIUM_MAX):
-                continue
-            # v14.7: swings run half-size — skip contracts the scaled
-            # allocation can't afford instead of aborting later
-            if _position_size(ask, scale=0.5) == 0:
-                continue
-            best = (occ, strike, ask, exp_str)
-            break
-        if best:
-            log.info(f"SWING contract {best[0]} ask {best[2]} exp {exp_str}")
-            return best
-        log.info(f"SWING: no qualifying contract for {ticker} {direction} ({exp_str})")
+            best_e = min(pool, key=lambda x: abs(x[0] - tgt))
+            if best_e not in order:
+                order.append(best_e)
+        d["expiries_tried"] = []
+        for dte, ds in order:
+            smap = exps[ds]["strikes"]
+            if direction == "call":
+                side = sorted(k for k in smap if spot * 0.99 <= k <= spot * (1 + SWING_MAX_OTM))
+            else:
+                side = sorted((k for k in smap if spot * (1 - SWING_MAX_OTM) <= k <= spot * 1.01), reverse=True)
+            d["expiries_tried"].append({"expiry": ds, "dte": dte, "strikes_checked": len(side)})
+            quotes = _option_quotes_bulk([smap[k] for k in side])
+            for k in side:
+                occ = smap[k]
+                q = quotes.get(occ.replace(" ", "")) or {}
+                ask = float(q.get("ask") or 0)
+                bid = float(q.get("bid") or 0)
+                if ask <= 0:
+                    reasons["no_quote"] += 1
+                    continue
+                mid = (ask + bid) / 2.0
+                spr = (ask - bid) / mid if mid > 0 else 9.9
+                row = {"occ": occ, "strike": k, "expiry": ds, "dte": dte, "bid": bid, "ask": ask,
+                       "spread_pct": round(spr, 3), "otm_pct": round(abs(k - spot) / spot, 3)}
+                if ask < SWING_PREMIUM_MIN:
+                    reasons["under_band_min"] += 1
+                    if len(samples["under_band_min"]) < 2:
+                        samples["under_band_min"].append(row)
+                    break                       # further OTM only gets cheaper
+                why = None
+                if ask > SWING_PREMIUM_MAX:
+                    why = "over_band_max"
+                elif _position_size(ask, scale=0.5) == 0:
+                    why = "over_budget"
+                elif spr > SWING_MAX_SPREAD:
+                    why = "wide_spread"
+                if why:
+                    reasons[why] += 1
+                    samples[why] = (samples[why] + [row])[-2:]   # keep the 2 cheapest seen
+                    continue
+                d["result"] = "ok"
+                d["pick"] = row
+                log.info(f"SWING contract {occ} ask {ask} exp {ds} ({dte} DTE, {row['otm_pct']:.0%} OTM)")
+                return occ, k, ask, ds
+        d["result"] = "none"
+        log.info(f"SWING: no qualifying contract for {ticker} {direction} — {reasons}")
         return None, None, None, None
     except Exception as e:
+        d["result"] = f"error {e}"
         log.warning(f"swing_select_contract {ticker}: {e}")
         return None, None, None, None
+
+
+def _swing_diag_line(d: dict) -> str:
+    """One readable line explaining a failed contract search."""
+    r = d.get("reasons") or {}
+    bits = []
+    lbl = {"over_band_max": "over $" + format(SWING_PREMIUM_MAX, ".2f") + " band",
+           "over_budget": "over budget (max ~$" + format(d.get("budget_cap_per_contract") or 0, ".2f") + "/contract)",
+           "wide_spread": "spread > " + format(SWING_MAX_SPREAD, ".0%") + " of mid",
+           "no_quote": "no quote", "under_band_min": "under $" + format(SWING_PREMIUM_MIN, ".2f")}
+    for k, n in r.items():
+        if n:
+            bits.append(f"{n} {lbl.get(k, k)}")
+    cheapest = None
+    for k in ("over_budget", "over_band_max", "wide_spread"):
+        for row in (d.get("rejected_samples") or {}).get(k) or []:
+            if cheapest is None or row["ask"] < cheapest["ask"]:
+                cheapest = dict(row, why=lbl.get(k, k))
+    out = (f"{d.get('result')}: " + (", ".join(bits) or "no strikes in range")
+           + f" (searched to {SWING_MAX_OTM:.0%} OTM, "
+           + ", ".join(f"{e['dte']}DTE" for e in (d.get("expiries_tried") or [])) + ")")
+    if cheapest:
+        out += (f". Closest miss: {_fmt_occ(cheapest['occ'])} ask ${cheapest['ask']:.2f} "
+                f"bid ${cheapest['bid']:.2f} ({cheapest['spread_pct']:.0%} spread, "
+                f"{cheapest['otm_pct']:.0%} OTM) — {cheapest['why']}")
+    return out
 
 
 # ═══════════════════ SWING SUBSYSTEM (v14) ═══════════════════
@@ -1298,14 +1437,20 @@ def swing_select_contract(ticker: str, direction: str) -> tuple:
 SWING_CHANNEL      = "swing-trade-signals"
 SWING_PREMIUM_MIN  = float(os.environ.get("SWING_PREMIUM_MIN", "0.75"))
 SWING_PREMIUM_MAX  = float(os.environ.get("SWING_PREMIUM_MAX", "5.00"))
-SWING_DTE_MIN      = int(os.environ.get("SWING_DTE_MIN", "90"))    # 3 months
+SWING_DTE_MIN      = int(os.environ.get("SWING_MIN_DTE", "30"))    # v14.14: from 30 days out
 SWING_DTE_MAX      = int(os.environ.get("SWING_DTE_MAX", "365"))   # 12 months
 SWING_MAX_PER_WEEK = int(os.environ.get("SWING_MAX_PER_WEEK", "2"))
 SWING_MAX_ACTIVE   = int(os.environ.get("SWING_MAX_ACTIVE", "3"))
 SWING_STOP_PCT     = 0.30          # initial, 15-min candle-CLOSE rule
 SWING_TARGET_PCT   = 1.00          # +100% full exit
 SWING_TRIM_AT      = 0.30          # +30% -> auto-sell 50%
-SWING_MAX_OTM      = float(os.environ.get("SWING_MAX_OTM_PCT", "0.15"))
+SWING_MAX_OTM      = float(os.environ.get("SWING_OTM_CAP_PCT", "0.25"))   # v14.14: reach further OTM for affordable swings
+# v14.14 (Oct 6, Junior): swings run in PAPER mode — watchlist to members
+# (top 3 only, #daily-watchlist), simulated trades + management by DM only.
+SWING_MODE         = os.environ.get("SWING_MODE", "paper").lower()          # paper | live
+SWING_WATCHLIST_N  = int(os.environ.get("SWING_WATCHLIST_N", "3"))
+SWING_MAX_SPREAD   = float(os.environ.get("SWING_MAX_SPREAD_MID", "0.10"))  # swings hold for weeks: 10% of mid ok
+
 # step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
 SWING_LADDER = [(0.10, 0.02), (0.15, 0.05), (0.20, 0.15), (0.30, 0.25),
                 (0.40, 0.35), (0.50, 0.50), (0.60, 0.60), (0.70, 0.70),
@@ -1510,10 +1655,7 @@ def _swing_replace_bracket(pos: dict, new_floor: float) -> bool:
     occ, fill, qty = pos["occ_symbol"], pos["fill_price"], int(pos["qty"])
     if new_floor <= float(pos.get("floor") or 0):
         return True
-    if pos.get("oco_id"):
-        _cancel_complex_order(pos["oco_id"])
-    else:
-        _tt_sweep_closing_orders(occ)
+    _clear_closing_orders(occ)
     target = _tick(fill * (1 + SWING_TARGET_PCT))
     oco_id, _ = place_oco_bracket(occ, fill, qty, trigger_override=_tick(new_floor),
                                   target_override=target, tif="GTC")
@@ -1563,6 +1705,8 @@ def swing_monitor():
                     f"{'✅' if pnl_p >= 0 else '❌'} **SWING {_fmt_occ(occ)} CLOSED** — "
                     f"broker fill detected\nEntry: ${fill:.2f} → Exit: ~${est:.2f} (est.)\n"
                     f"P&L: {pnl_p:+.1%} (${(est - fill) * 100 * qty:+.0f} est. on {qty})")
+                post_to_discord("profits-and-recaps", f"🏁 **SWING {tkr} closed** ({pnl_p:+.1%}) — "
+                                f"full recap in #swing-trade-signals.")
                 changed = True
                 continue
         q = _live_option_quote(occ)
@@ -1590,6 +1734,8 @@ def swing_monitor():
                     f"-30%\nEntry: ${fill:.2f} → Exit: ${exit_px:.2f}\n"
                     f"P&L: {pnl_f:+.1%} (${(exit_px - fill) * 100 * qty:+.0f} on {qty}) — "
                     f"loss capped per the plan.")
+                post_to_discord("profits-and-recaps", f"🏁 **SWING {tkr} closed** ({pnl_f:+.1%}) — "
+                                f"full recap in #swing-trade-signals.")
                 continue
 
         # recovery: dipped <=-15%, back to breakeven -> floor to -15%
@@ -1612,7 +1758,7 @@ def swing_monitor():
             _tt_sweep_closing_orders(occ)
             _swing_replace_bracket(pos, max(float(pos.get("floor") or 0), fill * 1.25))
             post_to_discord(
-                SWING_CHANNEL,
+                "profits-and-recaps",
                 f"✂️ **SWING TRIM — {_fmt_occ(occ)}**: +30% hit, **sold {half} of {qty} "
                 f"({exit_px:+.2f}) to lock gains** (+${(exit_px - fill) * 100 * half:.0f} banked). "
                 f"The remaining {pos['qty']} runs for +100% with the trail behind it.")
@@ -1693,30 +1839,29 @@ def swing_watchlist_job():
         except Exception:
             spy = None
     bo, why = _swing_entry_blackout_today()
-    hdr = ("@everyone 🧭 **Swing Watchlist** — entry window 3:00–3:50 PM ET\n"
-           + (f"🛑 **No new swings today** — {why}. Watch these for the next window.\n" if bo else ""))
+    hdr = (f"🧭 **Swing Watchlist** — the top {SWING_WATCHLIST_N} swing setups on our radar\n"
+           + ("_Tracking only — not trade signals. Swing signals are paused while we test these setups._\n"
+              if SWING_MODE == "paper" else "")
+           + (f"🛑 **No new swings today** — {why}.\n" if bo else ""))
     if not levels:
         send_emergency_dm(f"SWING DATA FAILURE: daily bars unavailable for all {len(SWING_TICKERS)} "
                           f"swing tickers — the swing engine is blind today. Check Alpaca.",
                           prefix="🚨 **TPP SWING ALERT** 🚨")
-        post_to_discord(SWING_CHANNEL, hdr + "Market data is delayed on our end today — "
-                        "the swing scan is paused and the team has been alerted.")
         return
     cands = [lv for lv in levels if lv["trend"] != "none" and lv["proximity"] is not None
              and _swing_regime_ok(lv["direction"], spy)]
     cands.sort(key=lambda lv: (lv["proximity"], -lv["strength"]))
     lines = []
-    for lv in cands[:3]:
-        occ = ask = None
-        try:
-            occ, _k, ask, _e = swing_select_contract(lv["ticker"], lv["direction"])
-        except Exception:
-            pass
+    _top = cands[:SWING_WATCHLIST_N]
+    with _state_lock:
+        _wls = load_state()
+        _wls["swing_wl"] = {"date": datetime.now(ET).date().isoformat(),
+                            "tickers": [lv["ticker"] for lv in _top]}
+        _commit(_wls)
+    for lv in _top:
         tag = "🔥 TRIGGERED" if lv["trigger"] else f"{lv['proximity']:.1%} from trigger"
         lines.append(f"**{lv['ticker']}** ${lv['px']:.2f} — {lv['trend'].upper()}TREND · "
-                     f"{lv['setup']} ({tag})\n  {lv['plan']}"
-                     + (f" → **{_fmt_occ(occ)}** (~${ask:.2f})" if occ else
-                        " → contract chosen at entry"))
+                     f"{lv['setup']} ({tag})\n  {lv['plan']}")
     if not lines:
         trend_n = sum(1 for lv in levels if lv["trend"] != "none")
         body = (f"No clean swing setups today — {trend_n}/{len(levels)} tickers trending, none "
@@ -1725,15 +1870,309 @@ def swing_watchlist_job():
                 + " its 50-day). We only swing with the trend.")
     else:
         body = "\n".join(lines)
-    post_to_discord(
-        SWING_CHANNEL,
-        hdr + body
-        + f"\nRules: max {SWING_MAX_PER_WEEK} new swings/week, {SWING_MAX_ACTIVE} active | "
-          f"this week: {_swing_week_count()}/{SWING_MAX_PER_WEEK} used",
-    )
+    post_to_discord("daily-watchlist", hdr + body)
+    # v14.14: private contract report — what we'd buy for each, or exactly why not
+    try:
+        _rep = []
+        for lv in _top:
+            _dg = {}
+            _o, _k, _a, _e = swing_select_contract(lv["ticker"], lv["direction"], _dg)
+            if _o:
+                _pk = _dg.get("pick") or {}
+                _rep.append(f"**{lv['ticker']} {lv['direction'].upper()}** → {_fmt_occ(_o)} ask ${_a:.2f} "
+                            f"(bid ${_pk.get('bid', 0):.2f}, {_pk.get('spread_pct', 0):.0%} spread, "
+                            f"{_pk.get('otm_pct', 0):.0%} OTM, {_pk.get('dte')} DTE)")
+            else:
+                _rep.append(f"**{lv['ticker']} {lv['direction'].upper()}** → none. {_swing_diag_line(_dg)}")
+        if _rep:
+            send_emergency_dm("Watchlist contracts (what the paper test would buy):\n" + "\n".join(_rep),
+                              prefix="🧪 **SWING PAPER TEST** (no real orders)")
+    except Exception as _re:
+        log.warning(f"swing contract report failed: {_re}")
     if fails:
         log.warning(f"SWING watchlist: {fails} ticker(s) had no daily data")
     log.info("JOB: swing watchlist posted")
+
+
+# ═══════════════════ SWING PAPER ENGINE (v14.14) ═══════════════════
+# Simulated swings: real setups, real contracts, real quotes — NO orders.
+# Fill = ask at entry, exits at the bid, managed with the exact live swing
+# rules (-40% disaster, -30% on 15-min closes, recovery -15%, trim half at
+# +30%, 10-rung step trail, +100% target). Everything reports to Junior by DM.
+# The book rides along in a tiny footer on each paper DM so a redeploy can
+# rebuild it (Render wipes /tmp on every restart).
+_PAPER_TAG = "PAPERBOOK:"
+
+
+def _paper_book() -> dict:
+    b = load_state().get("swing_paper") or {}
+    b.setdefault("open", [])
+    b.setdefault("closed", [])
+    b.setdefault("week", {})
+    b.setdefault("stats", {"n": 0, "w": 0, "l": 0, "sum_pct": 0.0, "skips": 0})
+    return b
+
+
+def _paper_save(b: dict):
+    with _state_lock:
+        st = load_state()
+        st["swing_paper"] = b
+        _commit(st)
+
+
+def _paper_footer(b: dict) -> str:
+    import base64, zlib
+    slim = {"open": b.get("open", []), "closed": (b.get("closed") or [])[-6:],
+            "week": {k: v for k, v in (b.get("week") or {}).items() if k == _iso_week_key()},
+            "stats": b.get("stats")}
+    raw = json.dumps(slim, separators=(",", ":"), default=str).encode()
+    return "\n-# " + _PAPER_TAG + base64.b64encode(zlib.compress(raw, 9)).decode()
+
+
+def _paper_dm(msg: str, b: dict | None = None):
+    body = msg[:1350]
+    if b is not None:
+        foot = _paper_footer(b)
+        if len(body) + len(foot) < 1900:
+            body += foot
+    send_emergency_dm(body, prefix="🧪 **SWING PAPER TEST** (no real orders)")
+
+
+def _paper_resync_from_dm():
+    """Boot: rebuild the paper book from the newest PAPERBOOK footer in the DM."""
+    import base64, zlib
+    if load_state().get("swing_paper") or not JUNIOR_USER_IDS:
+        return
+    try:
+        hdr = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
+        dm = requests.post(f"{DISCORD_API}/users/@me/channels", headers=hdr,
+                           json={"recipient_id": JUNIOR_USER_IDS[0]}, timeout=10)
+        if dm.status_code not in (200, 201):
+            return
+        r = requests.get(f"{DISCORD_API}/channels/{dm.json()['id']}/messages",
+                         headers=hdr, params={"limit": 100}, timeout=10)
+        if r.status_code != 200:
+            return
+        for m in r.json():                       # newest first
+            c = m.get("content") or ""
+            if _PAPER_TAG in c:
+                enc = c.split(_PAPER_TAG, 1)[1].strip().split()[0]
+                b = json.loads(zlib.decompress(base64.b64decode(enc)).decode())
+                b.setdefault("open", []); b.setdefault("closed", [])
+                b.setdefault("week", {}); b.setdefault("stats", {"n": 0, "w": 0, "l": 0, "sum_pct": 0.0, "skips": 0})
+                _paper_save(b)
+                log.info(f"PAPER book restored from DM: {len(b['open'])} open, {b['stats'].get('n')} closed")
+                return
+    except Exception as e:
+        log.warning(f"paper resync failed: {e}")
+
+
+def swing_paper_scan():
+    """3:45 PM (daily candle essentially closed): paper-enter watchlist setups
+    whose trigger is live and aligned with the market. Same caps as live."""
+    wl = load_state().get("swing_wl") or {}
+    today_s = datetime.now(ET).date().isoformat()
+    tickers = wl.get("tickers") if wl.get("date") == today_s else None
+    if not tickers:
+        log.info("PAPER scan: no watchlist today")
+        return
+    bo, why = _swing_entry_blackout_today()
+    spy = None
+    try:
+        spy = _swing_levels("SPY")
+    except Exception:
+        pass
+    trig = []
+    for tk in tickers:
+        try:
+            lv = _swing_levels(tk)
+        except Exception:
+            lv = None
+        if lv and lv["trigger"] and lv["direction"] and _swing_regime_ok(lv["direction"], spy):
+            trig.append(lv)
+    trig.sort(key=lambda lv: (lv["setup"] != "PULLBACK", -lv["strength"]))
+    log.info(f"PAPER scan 3:45: {len(trig)} of {len(tickers)} watchlist setups triggered")
+    if bo:
+        if trig:
+            log.info(f"PAPER scan: blackout ({why}) — {len(trig)} triggered setups not entered")
+        return
+    for lv in trig:
+        swing_paper_entry(lv)
+
+
+def swing_paper_entry(lv: dict) -> bool:
+    b = _paper_book()
+    tk, direction = lv["ticker"], lv["direction"]
+    wk = _iso_week_key()
+    if any(p.get("ticker") == tk for p in b["open"]):
+        return False
+    if len(b["open"]) >= SWING_MAX_ACTIVE or int(b["week"].get(wk) or 0) >= SWING_MAX_PER_WEEK:
+        return False
+    if _swing_earnings_within_48h(tk):
+        log.info(f"PAPER skip {tk}: earnings inside {SWING_EARNINGS_DAYS} days")
+        return False
+    dg = {}
+    occ, k, ask, exp = swing_select_contract(tk, direction, dg)
+    if not occ:
+        b["stats"]["skips"] = int(b["stats"].get("skips") or 0) + 1
+        _paper_save(b)
+        _paper_dm(f"⏭️ **{tk} {direction.upper()} triggered — no paper entry.** "
+                  f"{lv['setup']}: {lv['plan']}.\nContract search: {_swing_diag_line(dg)}", b)
+        return False
+    pk = dg.get("pick") or {}
+    pos = {"ticker": tk, "direction": direction, "occ": occ, "strike": k, "exp": exp,
+           "entry": float(ask), "entry_date": datetime.now(ET).date().isoformat(),
+           "setup": lv["setup"], "plan": lv["plan"], "spot_in": lv["px"],
+           "peak": 0.0, "trough": 0.0, "stage": 0, "floor": None, "rec": False,
+           "trimmed": False, "trim_pct": None, "cref": None, "last_bid": None}
+    b["open"].append(pos)
+    b["week"] = {wk: int(b["week"].get(wk) or 0) + 1}
+    _paper_save(b)
+    qty_real = _position_size(ask, scale=0.5)
+    _paper_dm(
+        f"🟢 **PAPER ENTRY — {tk} {direction.upper()}** ({lv['setup']})\n"
+        f"Why: {lv['plan']} (stock ${lv['px']:.2f})\n"
+        f"Contract: **{_fmt_occ(occ)}** (exp {exp}, {pk.get('dte')} DTE, {pk.get('otm_pct', 0):.0%} OTM)\n"
+        f"Sim fill: ${ask:.2f} at the ask (bid ${pk.get('bid', 0):.2f}, spread {pk.get('spread_pct', 0):.0%}) "
+        f"— live sizing would buy {qty_real} contract(s) = ${ask * 100 * qty_real:.0f}\n"
+        f"Plan: -30% stop on 15-min closes (-40% hard), recovery -15%, half off at +30%, "
+        f"step-trail from +10%, +100% target.\n"
+        f"Week: {b['week'][wk]}/{SWING_MAX_PER_WEEK} | open {len(b['open'])}/{SWING_MAX_ACTIVE}", b)
+    return True
+
+
+def _paper_close(b: dict, p: dict, bid: float, reason: str) -> dict:
+    fill = float(p["entry"])
+    pnl = (bid - fill) / fill
+    res = 0.5 * float(p["trim_pct"]) + 0.5 * pnl if p.get("trimmed") and p.get("trim_pct") is not None else pnl
+    try:
+        days = (datetime.now(ET).date() - date.fromisoformat(p["entry_date"])).days
+    except Exception:
+        days = None
+    rec = {"ticker": p["ticker"], "dir": p["direction"], "setup": p.get("setup"), "occ": p["occ"],
+           "entry": fill, "exit": round(bid, 2), "pct": round(res, 4), "peak": round(p.get("peak") or 0, 4),
+           "days": days, "reason": reason, "closed": datetime.now(ET).date().isoformat()}
+    b["closed"] = (b.get("closed") or []) + [rec]
+    stt = b["stats"]
+    stt["n"] = int(stt.get("n") or 0) + 1
+    stt["w" if res > 0 else "l"] = int(stt.get("w" if res > 0 else "l") or 0) + 1
+    stt["sum_pct"] = round(float(stt.get("sum_pct") or 0) + res, 4)
+    return rec
+
+
+def swing_paper_monitor():
+    """Manage open paper swings with the live swing rules (throttled 60s)."""
+    b = _paper_book()
+    if not b["open"]:
+        return
+    st0 = load_state()
+    if time_module.time() - float(st0.get("paper_mon_ts") or 0) < 60:
+        return
+    with _state_lock:
+        st1 = load_state(); st1["paper_mon_ts"] = time_module.time(); _commit(st1)
+    now = datetime.now(ET)
+    quotes = _option_quotes_bulk([p["occ"] for p in b["open"]])
+    keep, events, closes = [], [], []
+    for p in b["open"]:
+        q = quotes.get(p["occ"].replace(" ", "")) or {}
+        bid = float(q.get("bid") or 0)
+        if bid <= 0:
+            keep.append(p)
+            continue
+        fill = float(p["entry"])
+        pnl = (bid - fill) / fill
+        p["last_bid"] = bid
+        p["peak"] = max(float(p.get("peak") or 0), pnl)
+        p["trough"] = min(float(p.get("trough") or 0), pnl)
+        cref = f"{now.date().isoformat()} {now.hour}:{now.minute // 15}"
+        new_bucket = p.get("cref") != cref
+        p["cref"] = cref
+        floor = p.get("floor")
+        try:
+            dte = (date.fromisoformat(p["exp"]) - now.date()).days
+        except Exception:
+            dte = 99
+        reason = None
+        if pnl <= -0.40:
+            reason = "hard stop -40% (resting GTC)"
+        elif floor is not None and pnl <= float(floor):
+            reason = f"trail floor {float(floor):+.0%} hit"
+        elif new_bucket and pnl <= -SWING_STOP_PCT:
+            reason = "15-min close below -30%"
+        elif pnl >= SWING_TARGET_PCT:
+            reason = "+100% target"
+        elif dte <= 7:
+            reason = f"expiry in {dte} days — time exit"
+        if reason:
+            closes.append(_paper_close(b, p, bid, reason))
+            continue
+        if (not p.get("rec") and p["trough"] <= -0.15 and pnl >= 0 and int(p.get("stage") or 0) == 0):
+            p["rec"] = True
+            p["floor"] = max(float(floor) if floor is not None else -1.0, -0.15)
+            events.append(f"🔄 {p['ticker']} dipped {p['trough']:+.0%} and came back — floor raised to -15%")
+        if not p.get("trimmed") and p["peak"] >= SWING_TRIM_AT:
+            p["trimmed"] = True
+            p["trim_pct"] = round(pnl, 4)
+            p["floor"] = max(float(p.get("floor") if p.get("floor") is not None else -1.0), 0.25)
+            events.append(f"✂️ {p['ticker']} hit +30% — half sold at ${bid:.2f} ({pnl:+.0%}), "
+                          f"floor now +25% on the rest")
+        want = 0
+        for i, (thr, lock) in enumerate(SWING_LADDER, start=1):
+            if p["peak"] >= thr:
+                want = i
+        if want > int(p.get("stage") or 0):
+            lock = SWING_LADDER[want - 1][1]
+            p["stage"] = want
+            nf = max(float(p.get("floor") if p.get("floor") is not None else -1.0), lock)
+            if p.get("floor") is None or nf > float(p["floor"]):
+                p["floor"] = nf
+                events.append(f"🔔 {p['ticker']} peak {p['peak']:+.0%} — floor stepped to {nf:+.0%} "
+                              f"(now {pnl:+.0%}, bid ${bid:.2f})")
+        keep.append(p)
+    b["open"] = keep
+    _paper_save(b)
+    for rec in closes:
+        stt = b["stats"]
+        _paper_dm(f"{'✅' if rec['pct'] > 0 else '❌'} **PAPER EXIT — {rec['ticker']} {rec['dir'].upper()}** "
+                  f"({rec['setup']}) — {rec['reason']}\n"
+                  f"${rec['entry']:.2f} → ${rec['exit']:.2f} | result **{rec['pct']:+.1%}** "
+                  f"(peak {rec['peak']:+.0%}, {rec['days']} days)\n"
+                  f"Paper record: {stt['w']}W / {stt['l']}L | avg {stt['sum_pct'] / max(stt['n'], 1):+.1%} per trade", b)
+    if events:
+        _paper_dm("\n".join(events), b)
+
+
+def swing_paper_daily_summary():
+    b = _paper_book()
+    wl = load_state().get("swing_wl") or {}
+    today_s = datetime.now(ET).date().isoformat()
+    lines = [f"📒 **Swing paper test — {today_s}**"]
+    if wl.get("date") == today_s and wl.get("tickers"):
+        lines.append("Watchlist: " + ", ".join(wl["tickers"]))
+    if b["open"]:
+        lines.append("**Open:**")
+        for p in b["open"]:
+            lb = p.get("last_bid")
+            pn = ((float(lb) - float(p["entry"])) / float(p["entry"])) if lb else None
+            fl = p.get("floor")
+            lines.append(f"• {p['ticker']} {p['direction'].upper()} {_fmt_occ(p['occ'])} — in ${float(p['entry']):.2f}"
+                         + (f", now ${float(lb):.2f} ({pn:+.1%})" if lb else "")
+                         + f", peak {float(p.get('peak') or 0):+.0%}, floor "
+                         + (f"{float(fl):+.0%}" if fl is not None else "-30% (15-min close)")
+                         + (" | half trimmed" if p.get("trimmed") else "")
+                         + f" | since {p['entry_date']}")
+    else:
+        lines.append("No open paper swings.")
+    stt = b["stats"]
+    if stt.get("n"):
+        lines.append(f"**Record:** {stt['w']}W / {stt['l']}L ({stt['w'] / stt['n']:.0%} win) | "
+                     f"avg {stt['sum_pct'] / stt['n']:+.1%} per trade | {stt.get('skips', 0)} triggers skipped (no contract)")
+        for r in (b.get("closed") or [])[-3:]:
+            lines.append(f"  · {r['ticker']} {r['setup']} {r['pct']:+.1%} ({r['reason']})")
+    else:
+        lines.append(f"Record: no closed paper trades yet | {stt.get('skips', 0)} triggers skipped (no contract)")
+    lines.append(f"Week slots: {int(b['week'].get(_iso_week_key()) or 0)}/{SWING_MAX_PER_WEEK}")
+    _paper_dm("\n".join(lines), b)
 
 
 def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
@@ -1750,22 +2189,15 @@ def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
     if len(plist) >= SWING_MAX_ACTIVE or any(p.get("ticker") == ticker for p in plist):
         return False
     if _swing_earnings_within_48h(ticker):
-        post_to_discord(SWING_CHANNEL,
-                        f"📚 **Swing passed — {ticker} {direction.upper()}**: earnings "
-                        f"inside {SWING_EARNINGS_DAYS} days. Swings don't hold into "
-                        f"binary events.")
+        log.info(f"SWING passed {ticker} {direction}: earnings inside {SWING_EARNINGS_DAYS} days")
         return False
     occ, strike, ask, exp = swing_select_contract(ticker, direction)
     if not occ:
-        post_to_discord(SWING_CHANNEL,
-                        f"📚 **Swing passed — {ticker} {direction.upper()}**: setup triggered but "
-                        f"no contract fit the budget/liquidity rules. Checking the next setup.")
+        log.info(f"SWING passed {ticker} {direction}: no contract fit the budget/liquidity rules")
         return False
     qty = _position_size(ask, scale=0.5)   # v14.7: swings are ALWAYS half-size
     if qty == 0:
-        post_to_discord(SWING_CHANNEL,
-                        f"📚 **Swing passed — {ticker} {direction.upper()}**: contract "
-                        f"${ask:.2f} exceeds the tier allocation. Rules are never bent.")
+        log.info(f"SWING passed {ticker} {direction}: ${ask:.2f} exceeds the tier allocation")
         return False
     _tt_sweep_closing_orders(occ)
     fill = enter_trade(occ, qty)
@@ -2144,6 +2576,51 @@ def _tt_sweep_closing_orders(occ: str) -> int:
     return swept
 
 
+def _tt_count_closing_orders(occ: str) -> int | None:
+    """v14.14: how many working orders (incl. ones mid-cancel) touch this symbol."""
+    _sym = occ.replace(" ", "")
+    n = 0
+    for _ep in ("orders", "complex-orders"):
+        try:
+            r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}",
+                             headers=_tt_headers(),
+                             params={"status[]": ["Live", "Received", "Routed", "Cancel Requested",
+                                                  "Replace Requested", "In Flight"]},
+                             timeout=8)
+            if r.status_code != 200:
+                return None
+            for it in (r.json().get("data") or {}).get("items") or []:
+                _legs = list(it.get("legs") or [])
+                for _o in (it.get("orders") or []):
+                    _legs += _o.get("legs") or []
+                if any(_sym == str(l.get("symbol", "")).replace(" ", "") for l in _legs):
+                    n += 1
+        except Exception:
+            return None
+    return n
+
+
+def _clear_closing_orders(occ: str, timeout: float = 6.0) -> bool:
+    """v14.14: cancel EVERY working order on this symbol and WAIT until the
+    broker confirms none are left (cancels are async). Called before every
+    stop raise, trim and close so orders can never stack up and lock the
+    contracts (the 'too many pending orders, can't close' problem)."""
+    _tt_sweep_closing_orders(occ)
+    t0 = time_module.time()
+    while time_module.time() - t0 < timeout:
+        n = _tt_count_closing_orders(occ)
+        if n == 0:
+            return True
+        if n is None:
+            break
+        time_module.sleep(0.75)
+    _tt_sweep_closing_orders(occ)            # one more pass, then proceed
+    n = _tt_count_closing_orders(occ)
+    if n:
+        log.critical(f"CLEAR: {n} order(s) still working on {occ} after {timeout:.0f}s")
+    return n == 0
+
+
 def _tt_order_status(order_id: str) -> tuple[str, float | None]:
     """One robust status check. Handles both response shapes (order directly
     under data, or nested under data.order) and case-insensitive statuses.
@@ -2342,6 +2819,8 @@ def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1,
 
 def close_position_tt(occ_symbol: str, reason: str, current_bid: float, qty: int = 1) -> float:
     log.info(f"Closing {occ_symbol} — {reason}")
+    # v14.14: nothing may be left resting that could lock the contracts
+    _clear_closing_orders(occ_symbol)
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Limit",
@@ -2355,6 +2834,7 @@ def close_position_tt(occ_symbol: str, reason: str, current_bid: float, qty: int
         log.warning(f"Limit close not filled in {CLOSE_TIMEOUT}s — escalating to market")
         if order_id:
             _tt_cancel_order(order_id)
+        _clear_closing_orders(occ_symbol)
         mkt_id = _tt_place_order({
             "time-in-force": "Day",
             "order-type":    "Market",
@@ -2555,7 +3035,7 @@ def monitor_open_position():
         if _rec_floor > _cur_floor:
             _ok_r = False
             if pos.get("oco_id"):
-                _cancel_complex_order(pos.get("oco_id"))
+                _clear_closing_orders(occ)
                 _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_rec_floor)
                 if _new_oco:
                     pos["oco_id"] = _new_oco
@@ -2568,12 +3048,12 @@ def monitor_open_position():
                     send_emergency_dm(f"RECOVERY: OCO re-place failed for {occ}; "
                                       f"plain stop {'set' if _sid_r else 'ALSO FAILED'} at ${_rec_floor:.2f}")
             elif pos.get("stop_order_id"):
-                cancel_resting_stop(pos.get("stop_order_id"))
+                _clear_closing_orders(occ)
                 _sid_r = place_stop_loss(occ, fill_price, _q, trigger_override=_rec_floor)
                 pos["stop_order_id"] = _sid_r
                 _ok_r = bool(_sid_r)
             else:
-                _tt_sweep_closing_orders(occ)
+                _clear_closing_orders(occ)
                 _new_oco_r, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_rec_floor)
                 if _new_oco_r:
                     pos["oco_id"] = _new_oco_r
@@ -2605,7 +3085,7 @@ def monitor_open_position():
         _half = _q // 2
         pos["trimmed"] = True
         set_open_position(pos)
-        _tt_sweep_closing_orders(occ)
+        _clear_closing_orders(occ)
         _tx = close_position_tt(occ, f"TRIM +{DAY_TRIM_AT:.0%} (half)", current_bid, _half)
         _rem = _q - (_half if _tx else 0)
         if _tx:
@@ -2615,7 +3095,8 @@ def monitor_open_position():
                                         "qty": _half, "orig_qty": _q, "fill": fill_price}
                 _commit(_sb)
             pos["qty"] = _rem
-        _floor_t = _tick(fill_price) if _tx else float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
+        _floor_t = (_tick(fill_price * (1 + DAY_LADDER[0][1])) if _tx
+                    else float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct())))
         _new_t, _ = place_oco_bracket(occ, fill_price, _rem, trigger_override=_floor_t)
         if _new_t:
             pos["oco_id"] = _new_t
@@ -2631,7 +3112,7 @@ def monitor_open_position():
                 "profits-and-recaps",
                 f"✂️ **{_fmt_occ(occ)} — +{DAY_TRIM_AT:.0%} hit: sold {_half} of {_q} @ ${_tx:.2f}** "
                 f"(+${(_tx - fill_price) * 100 * _half:.0f} banked). Stop on the remaining {_rem} moved to "
-                f"break-even ${_floor_t:.2f} — this trade can't turn into a big loss now.")
+                f"${_floor_t:.2f} (+{DAY_LADDER[0][1]:.0%} locked) — this trade is now a guaranteed winner.")
         _q = pos["qty"] = _rem
         set_open_position(pos)
 
@@ -2653,7 +3134,7 @@ def monitor_open_position():
         _desired = _tick(fill_price * (1 + _lock))
         _ok = False
         if pos.get("oco_id"):
-            _cancel_complex_order(pos.get("oco_id"))
+            _clear_closing_orders(occ)
             _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
             if _new_oco:
                 pos["oco_id"] = _new_oco
@@ -2666,7 +3147,7 @@ def monitor_open_position():
                 send_emergency_dm(f"TIER {_want}: OCO re-place failed for {occ}; "
                                   f"plain stop {'set' if _sid2 else 'ALSO FAILED'} at ${_desired:.2f}")
         elif pos.get("stop_order_id"):
-            cancel_resting_stop(pos.get("stop_order_id"))
+            _clear_closing_orders(occ)
             _sid2 = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
             pos["stop_order_id"] = _sid2
             _ok = bool(_sid2)
@@ -2674,7 +3155,7 @@ def monitor_open_position():
             # v13.7: adopted/orphaned position with no known order ids — sweep
             # whatever rests at the broker and arm fresh protection at the new
             # floor. Silence is never an option here.
-            _tt_sweep_closing_orders(occ)
+            _clear_closing_orders(occ)
             _new_oco, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
             if _new_oco:
                 pos["oco_id"] = _new_oco
@@ -2689,6 +3170,16 @@ def monitor_open_position():
                     f"at ${_desired:.2f} — software hard stop is the only floor.",
                     prefix="🚨 **TPP PROTECTION ALERT** 🚨")
         if _ok:
+            _nw = _tt_count_closing_orders(occ)
+            if _nw is not None and _nw > 1:
+                log.critical(f"RATCHET: {_nw} working orders on {occ} after re-arm — collapsing to one")
+                _clear_closing_orders(occ)
+                _fix, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_desired)
+                pos["oco_id"], pos["stop_order_id"] = _fix, None
+                if not _fix:
+                    pos["stop_order_id"] = place_stop_loss(occ, fill_price, _q, trigger_override=_desired)
+                send_emergency_dm(f"RATCHET: found {_nw} stacked orders on {occ}; cleared and re-armed ONE "
+                                  f"at ${_desired:.2f}.")
             pos["ratchet_stage"] = _want
             pos["floor_trigger"] = _desired
             _take = ("Green and comfortable? Take profits — don't wait for us."
@@ -2698,11 +3189,11 @@ def monitor_open_position():
             if _want == 1 and DAY_CONTRACT_MODE == "itm":
                 # v14.13: the tested win-rate lever — members bank half at +10%
                 _take = ("**🔔 TAKE HALF OFF NOW.** Sell half your contracts here and let the rest "
-                         f"ride to the +{DAY_TARGET_PCT:.0%} target with your stop at break-even. "
-                         "Only 1 contract? Move your stop to your entry price.")
+                         f"ride with your stop at +{DAY_LADDER[0][1]:.0%} — the trail keeps raising it as it climbs. "
+                         f"Only 1 contract? Move your stop to ${_desired:.2f} (+{DAY_LADDER[0][1]:.0%}).")
             post_to_discord(
                 "profits-and-recaps",
-                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised (stage {_want}/{len(_LADDER)}).**\n"
+                f"🔔 **{_fmt_occ(occ)} — {pnl_pct:+.1%}, protection raised.**\n"
                 f"Stop moved to ${_desired:.2f} — {_msg}.\n{_take}",
             )
         set_open_position(pos)
@@ -2719,8 +3210,8 @@ def monitor_open_position():
             f"📊 **Open trade update — {_fmt_occ(occ)}**\n"
             f"Bid ${current_bid:.2f} | P&L {pnl_pct:+.1%} (entry ${fill_price:.2f}) | "
             f"peak {peak_pnl:+.1%} | protective floor ${float(pos.get('floor_trigger') or fill_price * (1 - _stop_pct())):.2f}\n"
-            f"Target ${round(fill_price * (1 + DAY_TARGET_PCT), 2):.2f} — managed automatically; exit call posts the moment anything fires."
-            + ("\n💰 Green — taking profits early is always allowed. Our target is +40%, but your gains are yours."
+            f"No fixed target — stop trails 5 pts behind up to +40%, then 10 pts behind every +10% (+50% → +40%). Exit call posts the moment anything fires."
+            + ("\n💰 Green — taking profits early is always allowed. Your gains are yours."
                if pnl_pct >= 0.10 else ""),
         )
         try:
@@ -2742,13 +3233,16 @@ def monitor_open_position():
     elif pnl_pct <= -_stop_pct():
         reason = f"HARD STOP {-_stop_pct():+.0%} (software)"
 
-    # 2. Profit target (v14.13: DAY_TARGET_PCT)
+    # 2. Runner cap (v14.14: far cap, default +100%)
     elif pnl_pct >= DAY_TARGET_PCT:
-        reason = f"PROFIT TARGET +{DAY_TARGET_PCT:.0%}"
+        reason = f"PROFIT TARGET +{DAY_TARGET_PCT:.0%} (runner cap)"
 
-    # 2. Trailing stop — arms at +10%, trails 15% below peak
-    elif peak_pnl >= max(DAY_LADDER[0][0], 0.15) and pnl_pct <= (peak_pnl - 0.15):
-        reason = f"TRAILING STOP (peak {peak_pnl:+.1%})"
+    # 2b. Trailing stop — software backup of the broker stop: once the ladder
+    #     has raised the floor, a bid under the floor exits.
+    elif (int(pos.get("ratchet_stage") or 0) >= 1 and pos.get("floor_trigger")
+          and current_bid < float(pos.get("floor_trigger"))):
+        reason = (f"TRAILING STOP (peak {peak_pnl:+.1%}, floor "
+                  f"${float(pos.get('floor_trigger')):.2f})")
 
     # 3. 10-min chop circuit
     else:
@@ -2772,11 +3266,15 @@ def monitor_open_position():
         cancel_resting_stop(pos.get("stop_order_id"))
         exit_price    = close_position_tt(occ, reason, current_bid, _q)
         if exit_price is None:
-            # Close did not go through — position stays tracked; re-arm a stop
-            # so we are never unprotected while retrying, and try again next tick.
-            if pos.get("stop_order_id"):
-                pos["stop_order_id"] = place_stop_loss(occ, fill_price, _q)
-                set_open_position(pos)
+            # Close did not go through — position stays tracked; re-arm ONE
+            # protective order at the current floor so we are never unprotected
+            # while retrying, and try again next tick.
+            _fl = float(pos.get("floor_trigger") or fill_price * (1 - _stop_pct()))
+            _clear_closing_orders(occ)
+            _ro, _ = place_oco_bracket(occ, fill_price, _q, trigger_override=_fl)
+            pos["oco_id"] = _ro
+            pos["stop_order_id"] = None if _ro else place_stop_loss(occ, fill_price, _q, trigger_override=_fl)
+            set_open_position(pos)
             return
         pnl_dollar    = (exit_price - fill_price) * 100 * _q
         pnl_pct_final = (exit_price - fill_price) / fill_price
@@ -3260,7 +3758,7 @@ def _rules_decision(ticker: str) -> dict | None:
         if max(C[i - 2:i]) >= VW[i - 1] * 0.9985 and C[i] < C[i - 1] and C[i] < VW[i]:
             direction = "put"
     if not direction:
-        return None
+        return _retest_decision(ticker, st, cs, C, VW, e8, e21, i)
     side = "above" if direction == "call" else "below"
     desc = (f"{ticker} trending {side} VWAP all morning, pulled back to VWAP (${VW[i]:.2f}) and "
             f"{'bounced' if direction == 'call' else 'rejected'} — {'calls' if direction == 'call' else 'puts'} "
@@ -3269,6 +3767,80 @@ def _rules_decision(ticker: str) -> dict | None:
             "setup": "VWAP_PULLBACK", "setup_description": desc, "reason": desc,
             "chart_request": {"ticker": ticker, "timeframe": "1m", "indicators": "VWAP,EMA8,EMA21",
                               "highlight": f"Pullback to VWAP {VW[i]:.2f} and {'bounce' if direction == 'call' else 'rejection'}"}}
+
+
+_RETEST_FIRED: dict = {}
+RETEST_TOUCH = float(os.environ.get("RETEST_TOUCH_PCT", "0.001"))   # retest = within 0.1% of the level
+RETEST_FAIL = float(os.environ.get("RETEST_FAIL_PCT", "0.002"))     # a close 0.2% back through = failed break
+
+
+def _key_levels_for(st: dict) -> list:
+    """(name, level, side) the break & retest engine trades every day:
+    pre-market high/low + the 9:30-9:35 opening-range high/low."""
+    out = []
+    if st.get("pm_high"):
+        out.append(("pre-market high", float(st["pm_high"]), "call"))
+    if st.get("pm_low"):
+        out.append(("pre-market low", float(st["pm_low"]), "put"))
+    if st.get("or_locked"):
+        if st.get("or_high"):
+            out.append(("opening-range high", float(st["or_high"]), "call"))
+        if st.get("or_low"):
+            out.append(("opening-range low", float(st["or_low"]), "put"))
+    return out
+
+
+def _retest_decision(ticker: str, st: dict, cs: list, C: list, VW: list, e8: list, e21: list, i: int) -> dict | None:
+    """v14.14 KEY-LEVEL BREAK & RETEST (live). The high-probability way to
+    trade the break Junior wanted on Oct 6 (NVDA under the $241.02 pre-market
+    low): 1) two straight 1-min closes through the key level = confirmed
+    break; 2) price comes BACK to the level (bar touches within 0.1%) without
+    closing 0.2% back through it = retest holds; 3) the current bar closes
+    away from the level in the break direction, on the right side of VWAP with
+    8 EMA vs 21 EMA aligned -> entry. Once per level per day. Stateless (read
+    from the candle history) so a restart can't lose a setup in progress."""
+    today = datetime.now(ET).date().isoformat()
+    fired = _RETEST_FIRED.setdefault(ticker, {})
+    if fired.get("_d") != today:
+        fired.clear()
+        fired["_d"] = today
+    H = [float(c.get("high") if c.get("high") is not None else c["close"]) for c in cs]
+    Lo = [float(c.get("low") if c.get("low") is not None else c["close"]) for c in cs]
+    for name, L, d in _key_levels_for(st):
+        if fired.get(name):
+            continue
+        up = d == "call"
+        beyond = (lambda x: x > L * (1 + KEY_BUFFER_PCT)) if up else (lambda x: x < L * (1 - KEY_BUFFER_PCT))
+        failed = (lambda x: x < L * (1 - RETEST_FAIL)) if up else (lambda x: x > L * (1 + RETEST_FAIL))
+        # 1) first confirmed break (two straight closes beyond) in the history
+        j = next((k for k in range(1, i) if beyond(C[k - 1]) and beyond(C[k])), None)
+        if j is None or j >= i - 1:
+            continue
+        if any(failed(C[k]) for k in range(j, i + 1)):
+            fired[name] = "failed"          # break failed — level is dead for today
+            continue
+        # 2) retest after the break
+        touched = any((Lo[k] <= L * (1 + RETEST_TOUCH)) if up else (H[k] >= L * (1 - RETEST_TOUCH))
+                      for k in range(j + 1, i))
+        if not touched:
+            continue
+        # 3) push away in the break direction, trend aligned
+        if up:
+            ok = beyond(C[i]) and C[i] > C[i - 1] and C[i] > VW[i] and e8[i] > e21[i]
+        else:
+            ok = beyond(C[i]) and C[i] < C[i - 1] and C[i] < VW[i] and e8[i] < e21[i]
+        if not ok:
+            continue
+        fired[name] = "entered"
+        desc = (f"{ticker} broke {'above' if up else 'below'} the {name} ${L:.2f}, came back to retest it, "
+                f"the level held, and it's pushing {'higher' if up else 'lower'} "
+                f"({'above' if up else 'below'} VWAP ${VW[i]:.2f}, trend aligned) — "
+                f"{'calls' if up else 'puts'} on the confirmed break.")
+        return {"decision": "APPROVE", "ticker": ticker, "direction": d, "tier": "TIER-1",
+                "setup": "KEY_LEVEL_RETEST", "key_level": L, "setup_description": desc, "reason": desc,
+                "chart_request": {"ticker": ticker, "timeframe": "1m", "indicators": "VWAP,EMA8,EMA21",
+                                  "highlight": f"{name} {L:.2f} break & retest"}}
+    return None
 
 
 # ── SHADOW SCORECARD: setups tracked live with NO orders ─────────────────────
@@ -3481,6 +4053,44 @@ def _gate_entry_quality(ticker: str, direction: str, now_et=None, skip_chop: boo
         return False, (f"chop gate — price flipped across VWAP {q.get('vwap_flips')}x (last 20 min) / "
                        f"8-21 EMA crossed {q.get('ema_crosses')}x (last 15 min); no clean trend")
     return True, ""
+
+
+def _gate_key_levels(ticker: str, direction: str) -> tuple:
+    """v14.14: no entries while price chops INSIDE the pre-market range.
+    Falls back to the opening range if pre-market levels are missing."""
+    if not KEY_LEVEL_GATE:
+        return True, ""
+    st = _mkt_structure.get(ticker) or {}
+    hi, lo, lbl = st.get("pm_high"), st.get("pm_low"), "pre-market"
+    if not hi or not lo:
+        if st.get("or_locked"):
+            hi, lo, lbl = st.get("or_high"), st.get("or_low"), "opening-range"
+    if not hi or not lo:
+        log.warning(f"KEY-LEVEL gate: no levels for {ticker} — gate open")
+        return True, ""
+    cs_all = st.get("candles") or []
+    closes = [float(c["close"]) for c in cs_all if c.get("close") is not None]
+    n = max(1, KEY_HOLD_BARS)
+    if len(closes) < n:
+        return False, "not enough candles to confirm a key-level break"
+    tail = closes[-n:]
+    hi, lo = float(hi), float(lo)
+    if direction == "call" and all(c > hi * (1 + KEY_BUFFER_PCT) for c in tail):
+        return True, ""                      # confirmed break above the range
+    if direction == "put" and all(c < lo * (1 - KEY_BUFFER_PCT) for c in tail):
+        return True, ""                      # confirmed break below the range
+    # Inside (or not yet through) the range: trade it ONLY if the tape is clean.
+    q = _chop_metrics(cs_all)
+    rng15 = closes[-15:]
+    tight = (len(rng15) >= 10 and (max(rng15) - min(rng15)) / closes[-1] < SIDEWAYS_MAX_RANGE)
+    if q.get("chop") or tight:
+        why = (f"VWAP crossed {q.get('vwap_flips')}x in 20 min / EMAs crossed {q.get('ema_crosses')}x in 15 min"
+               if q.get("chop") else
+               f"last 15 min stuck in a {(max(rng15) - min(rng15)) / closes[-1]:.2%} range")
+        edge = (f"above the {lbl} high ${hi:.2f}" if direction == "call" else f"below the {lbl} low ${lo:.2f}")
+        return False, (f"CHOP inside the {lbl} range ${lo:.2f}-${hi:.2f} ({why}) — sitting in cash "
+                       f"until price closes {n} bars {edge}")
+    return True, ""                          # clean trend/reversal inside the range: allowed
 
 
 def _indicators(candles: list) -> dict:
@@ -3831,6 +4441,13 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         )
         return False
 
+    _okk, _whyk = ((True, "") if str(claude_decision.get("setup") or "") == "KEY_LEVEL_RETEST"
+                   else _gate_key_levels(ticker, direction))
+    if not _okk:
+        # silent to members (no spam) — log only
+        log.info(f"BLOCKED post-decision (v14.14 key-level): {ticker} {direction} — {_whyk}")
+        return False
+
     occ, strike, ask = select_contract(ticker, direction)
     global _last_order_ask
     _last_order_ask = ask
@@ -3982,19 +4599,18 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         f"{arrow} **{ticker} {type_label}** [{tier}]{_scale_label}\n\n"
         f"**Contract:** {_fmt_occ(occ)}\n"
         f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
-        f"**Target:** ${target:.2f} (+{DAY_TARGET_PCT:.0%})\n"
-        + (f"**Bracket resting at broker ✅** — target ${target:.2f} & stop ${stop:.2f} ({stop_lbl}) as one OCO: "
-           f"either fills, the other cancels\n"
+        f"**Target:** no fixed target — winners run; stop trails 5 pts behind to +40%, then 10 pts behind (runner cap ${target:.2f})\n"
+        + (f"**Stop resting at broker ✅** — ${stop:.2f} ({stop_lbl})\n"
            + (f"Contract band: {_last_selection_tier}\n" if _last_selection_tier else "")
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
         + (f"Protection: recovery rule (dip ≤-{RECOVERY_DIP:.0%} then back green → stop -{RECOVERY_DIP:.0%}) | "
-           + " / ".join(("+" + format(_t, ".0%") + "→" + ("BE" if abs(_l) < 1e-9 else format(_l, "+.0%"))) for _t, _l in DAY_LADDER)
-           + f" | target +{DAY_TARGET_PCT:.0%}"
+           + " / ".join(("+" + format(_t, ".0%") + "→" + ("BE" if abs(_l) < 1e-9 else format(_l, "+.0%"))) for _t, _l in DAY_LADDER[:5])
+           + " … +40%→+35% | +50%→+40%, +60%→+50% … (10-pt room above +50%)"
            + (f" | **members: take half off at +{DAY_TRIM_AT:.0%}**" if DAY_CONTRACT_MODE == "itm" else "")
            + ". ")
         + 
-          "Take profits early whenever you're comfortable — the target is ours, the gains are yours\n\n"
+          "Take profits early whenever you're comfortable — the gains are yours\n\n"
         f"{setup}",
     )
     log.info("Signal posted to #day-trade-signals")
@@ -4015,7 +4631,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "daily-watchlist",
         f"📚 **Setup breakdown — {ticker} {type_label}** [{tier}]\n"
         + (setup if setup else "Level-break setup confirmed.")
-        + f"\nEntry ${fill_price:.2f} x{qty} | Target ${target:.2f} (+{DAY_TARGET_PCT:.0%}) | Stop ${stop:.2f} ({stop_lbl})"
+        + f"\nEntry ${fill_price:.2f} x{qty} | Step-trail from +10% (no fixed target) | Stop ${stop:.2f} ({stop_lbl})"
         + _cr_line,
     )
 
@@ -4297,6 +4913,18 @@ def _scheduler_loop():
                         swing_monitor()
                     except Exception as _sme:
                         log.error(f"swing monitor failed: {_sme}")
+                    try:
+                        swing_paper_monitor()
+                    except Exception as _spe:
+                        log.error(f"swing paper monitor failed: {_spe}")
+                if (SWING_MODE == "paper" and dtime(15, 55) <= t <= dtime(16, 10)
+                        and load_state().get("last_paper_summary_date") != today_s):
+                    with _state_lock:
+                        _ps = load_state(); _ps["last_paper_summary_date"] = today_s; _commit(_ps)
+                    try:
+                        swing_paper_daily_summary()
+                    except Exception as _pde:
+                        log.error(f"swing paper summary failed: {_pde}")
 
                 # ── 9:00 AM self pre-flight — DM the vitals before the day ──
                 if ((8, 55) <= (now.hour, now.minute) <= (9, 14)
@@ -4475,7 +5103,16 @@ def _scheduler_loop():
                         except Exception as _swe:
                             log.error(f"swing watchlist failed: {_swe}")
                     _sw_last = float(load_state().get("swing_scan_ts") or 0)
-                    if time_module.time() - _sw_last >= 300:      # every 5 min
+                    _wl_t = set((load_state().get("swing_wl") or {}).get("tickers") or [])
+                    if (SWING_MODE == "paper" and t >= dtime(15, 45)
+                            and load_state().get("last_paper_scan_date") != today_s):
+                        with _state_lock:
+                            _pw = load_state(); _pw["last_paper_scan_date"] = today_s; _commit(_pw)
+                        try:
+                            swing_paper_scan()
+                        except Exception as _pse:
+                            log.error(f"swing paper scan failed: {_pse}")
+                    if SWING_MODE != "paper" and time_module.time() - _sw_last >= 300:      # every 5 min
                         with _state_lock:
                             _sw = load_state(); _sw["swing_scan_ts"] = time_module.time(); _commit(_sw)
                         try:
@@ -4511,7 +5148,8 @@ def _scheduler_loop():
                                             "prox": _lv["proximity"], "plan": _lv["plan"],
                                             "regime_ok": bool(_ok_reg),
                                             "t": datetime.now(ET).strftime("%H:%M")}
-                                    if _lv["trigger"] and _ok_reg and _lv["ticker"] not in _held:
+                                    if (_lv["trigger"] and _ok_reg and _lv["ticker"] not in _held
+                                            and (not _wl_t or _lv["ticker"] in _wl_t)):
                                         _trig.append(_lv)
                                 with _state_lock:
                                     _ss2 = load_state(); _ss2["swing_scan_snapshot"] = _snap; _commit(_ss2)
@@ -4550,9 +5188,8 @@ def _scheduler_loop():
                                     f"**{_tk2}** ${d['px']:.2f} — {str(d.get('trend')).upper()}TREND · "
                                     f"{d.get('setup')} · {d.get('plan')}"
                                     + ("" if d.get("regime_ok") else " _(against market direction — skipped)_"))
-                            post_to_discord(
-                                SWING_CHANNEL,
-                                "🧭 **Swing window closed — no entries today.**\n"
+                            log.info(
+                                "SWING window closed — no entries today.\n"
                                 "No setup completed its trigger; we don't force swings. Closest setups "
                                 "for tomorrow:\n" + "\n".join(_lines)
                                 + f"\nWeek: {_swing_week_count()}/{SWING_MAX_PER_WEEK} slots used "
@@ -4904,6 +5541,17 @@ def swing_test():
     return jsonify(out), 200
 
 
+@app.route("/swing-contracts")
+def swing_contracts():
+    """v14.14 liquidity/affordability diagnosis: /swing-contracts?ticker=QQQ&dir=call
+    Shows the pick, or every reason strikes were rejected. No orders."""
+    tk = (request.args.get("ticker") or "QQQ").upper()
+    dg = {}
+    occ, k, ask, exp = swing_select_contract(tk, request.args.get("dir", "call").lower(), dg)
+    dg["summary"] = ("picked " + _fmt_occ(occ) + f" @ ${ask:.2f}") if occ else _swing_diag_line(dg)
+    return jsonify(dg), 200
+
+
 @app.route("/chart-test")
 def chart_test():
     """Render + upload one chart on demand and report exactly what happened.
@@ -5008,6 +5656,10 @@ def status():
         "risk_mode":          _risk().get("tier", "?"),
         "swing_active":       len(_swing_positions()),
         "swing_week_used":    _swing_week_count(),
+        "swing_mode":         SWING_MODE,
+        "swing_paper":        {"open": len(_paper_book()["open"]), **_paper_book()["stats"]},
+        "key_level_gate":     KEY_LEVEL_GATE,
+        "day_trail":          " / ".join(f"+{t:.0%}->+{l:.0%}" for t, l in DAY_LADDER[:10]) + f" ... cap +{DAY_TARGET_PCT:.0%}",
         "quality_gates":      QUALITY_GATES,
         "drought_sessions":   _drought_sessions(),
         "drought_mode":       _drought_mode(),
@@ -5477,6 +6129,7 @@ def _boot_in_worker():
     _hydrate_structure()
     _adopt_broker_positions()
     _resync_day_state_from_discord()
+    _paper_resync_from_dm()
     _ensure_scheduler()
 
 
