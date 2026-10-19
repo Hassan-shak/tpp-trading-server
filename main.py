@@ -127,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.14"
+APP_VERSION = "v14.15"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -485,11 +485,26 @@ def _save_state(s: dict):
         log.warning(f"State save failed: {e}")
 
 
+# v14.15: keys that live across days. The midnight reset used to build a
+# blank state and silently erase the swing paper book (the Oct 8 AAPL/XOM
+# paper trades vanished on Oct 9), live swing positions, the swing week
+# counter and the shadow log (so the "weekly" scorecard only held Friday).
+PERSIST_KEYS = ("swing_positions", "swing_week", "swing_paper", "shadow_log",
+                "journal", "journal_seq", "gate_dm")
+
+
 def load_state() -> dict:
     global _state
     today = datetime.now(ET).strftime("%Y-%m-%d")
     if _state.get("last_reset_date") == today:
         return _state
+    _prev = dict(_state) if _state else {}
+    if not _prev:
+        try:
+            with open(_TMP_PATH) as f:
+                _prev = json.load(f) or {}
+        except Exception:
+            _prev = {}
     # Try disk
     try:
         with open(_TMP_PATH) as f:
@@ -510,8 +525,11 @@ def load_state() -> dict:
                 return _state
         except Exception:
             pass
-    log.info(f"New trading day {today} — resetting session state")
+    log.info(f"New trading day {today} — resetting session state (multi-day books kept)")
     _state = _blank_state(today)
+    for _k in PERSIST_KEYS:
+        if _prev.get(_k) is not None:
+            _state[_k] = _prev[_k]
     _save_state(_state)
     return _state
 
@@ -564,6 +582,9 @@ def set_open_position(position: dict):
 def clear_open_position():
     with _state_lock:
         s = load_state()
+        if s.get("open_position"):
+            _LAST_CLEARED.clear()
+            _LAST_CLEARED.update(pos=dict(s["open_position"]), ts=time_module.time())
         s["open_position"] = None
         _commit(s)
 
@@ -581,7 +602,7 @@ def _post_trade_close_pointer(ticker: str | None, pnl_pct: float | None):
 
 def record_trade_result(win: bool, ticker: str | None = None,
                         pnl_pct: float | None = None, pnl_dollar: float | None = None,
-                        direction: str | None = None):
+                        direction: str | None = None, exit_reason: str | None = None):
   # v14.13: fold any half-trim already banked on this trade into the result
   try:
     _bk = load_state().get("day_trim_bank")
@@ -600,6 +621,14 @@ def record_trade_result(win: bool, ticker: str | None = None,
   except Exception:
     pass
   _post_trade_close_pointer(ticker, pnl_pct)
+  try:
+    _jp = load_state().get("open_position")
+    if not (_jp and _jp.get("ticker") == ticker):
+        _jp = (_LAST_CLEARED.get("pos") if time_module.time() - float(_LAST_CLEARED.get("ts") or 0) < 600
+               else None)
+    _journal_day_close(_jp, ticker, direction, pnl_pct, pnl_dollar, exit_reason)
+  except Exception as _jx:
+    log.warning(f"day journal hook failed: {_jx}")
   with _state_lock:
     s = load_state()
     s.setdefault("today_results", []).append(
@@ -1299,26 +1328,113 @@ def _swing_budget_cap() -> float | None:
     return cap
 
 
-def swing_select_contract(ticker: str, direction: str, diag: dict | None = None) -> tuple:
-    """v14.14 AFFORDABILITY-FIRST swing contract finder.
-    Expiries: ~120/90/75/60/45/30 DTE, longest first (min SWING_MIN_DTE=30).
-    Strikes: walk from at-the-money OUT to SWING_OTM_CAP_PCT (25%) — further
-    OTM = cheaper. Accept the first (closest-to-money) contract that is
-    in the premium band, affordable at half-size, and spread <= 10% of mid.
-    `diag` (optional dict) is filled with WHY each strike was rejected.
+SWING_DELTA_MIN    = float(os.environ.get("SWING_DELTA_MIN", "0.35"))
+SWING_DELTA_MAX    = float(os.environ.get("SWING_DELTA_MAX", "0.55"))
+SWING_DELTA_TARGET = float(os.environ.get("SWING_DELTA_TARGET", "0.45"))
+SWING_PICK_DTE_MIN = int(os.environ.get("SWING_PICK_DTE_MIN", "30"))
+SWING_PICK_DTE_MAX = int(os.environ.get("SWING_PICK_DTE_MAX", "60"))
+SWING_PAPER_PREMIUM_MAX = float(os.environ.get("SWING_PAPER_PREMIUM_MAX", "15.00"))
+
+
+def _norm_cdf(x: float) -> float:
+    import math
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_price(spot, k, t, vol, call, r=0.04):
+    import math
+    if t <= 0 or vol <= 0:
+        return max(0.0, (spot - k) if call else (k - spot))
+    d1 = (math.log(spot / k) + (r + vol * vol / 2) * t) / (vol * math.sqrt(t))
+    d2 = d1 - vol * math.sqrt(t)
+    if call:
+        return spot * _norm_cdf(d1) - k * math.exp(-r * t) * _norm_cdf(d2)
+    return k * math.exp(-r * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
+def _bs_delta(spot: float, k: float, dte: int, mid: float, call: bool, r: float = 0.04) -> float | None:
+    """v14.15: option delta (0..1, puts as absolute value) from the option's
+    own mid price — implied vol by bisection, then Black-Scholes delta.
+    Used when the data feed doesn't send greeks."""
+    import math
+    try:
+        t = max(dte, 1) / 365.0
+        if mid <= 0 or spot <= 0 or k <= 0:
+            return None
+        lo, hi = 0.01, 5.0
+        if _bs_price(spot, k, t, hi, call, r) < mid:
+            return 1.0 if ((spot > k) if call else (spot < k)) else None
+        for _ in range(60):
+            m = (lo + hi) / 2
+            if _bs_price(spot, k, t, m, call, r) > mid:
+                hi = m
+            else:
+                lo = m
+        vol = (lo + hi) / 2
+        d1 = (math.log(spot / k) + (r + vol * vol / 2) * t) / (vol * math.sqrt(t))
+        return round(_norm_cdf(d1) if call else 1.0 - _norm_cdf(d1), 3)
+    except Exception:
+        return None
+
+
+def _option_snapshots_bulk(occs: list) -> dict:
+    """v14.15: quotes + greeks (delta) in one Alpaca call where available.
+    Falls back to plain quotes. {compact: {"bid":, "ask":, "delta": float|None}}"""
+    out = {}
+    key = os.environ.get("ALPACA_API_KEY", "")
+    sec = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
+    syms = [o.replace(" ", "") for o in occs if o]
+    for i in range(0, len(syms), 100):
+        chunk = syms[i:i + 100]
+        try:
+            r = requests.get("https://data.alpaca.markets/v1beta1/options/snapshots",
+                             headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                             params={"symbols": ",".join(chunk), "feed": "opra"}, timeout=8)
+            if r.status_code == 200:
+                for k, sn in (r.json().get("snapshots") or {}).items():
+                    q = sn.get("latestQuote") or {}
+                    g = sn.get("greeks") or {}
+                    dl = g.get("delta")
+                    out[k] = {"bid": q.get("bp"), "ask": q.get("ap"),
+                              "delta": abs(float(dl)) if dl is not None else None}
+        except Exception as e:
+            log.warning(f"option snapshots failed: {e}")
+    missing = [s for s in syms if s not in out or not out[s].get("ask")]
+    if missing:
+        for k, q in _option_quotes_bulk(missing).items():
+            out[k] = {"bid": q.get("bid"), "ask": q.get("ask"), "delta": None}
+    return out
+
+
+def swing_select_contract(ticker: str, direction: str, diag: dict | None = None,
+                          enforce_budget: bool = True) -> tuple:
+    """v14.15 DELTA-FIRST swing contract finder (the PLTR lesson).
+    The old finder walked out to 25% OTM on 120-day expiries until something
+    was cheap — AAPL $400C with the stock at $341 — so the option barely moved
+    when the stock did. Now:
+      * expiries 30-60 days out (closest to 45 first), 30-90 only if none
+      * the contract must move 0.35-0.55 per $1 of stock (delta), closest to 0.45
+      * premium band + spread rules as before; live entries must also fit the
+        half-size budget. If nothing in the delta band is affordable the ticker
+        is SKIPPED — we never drop to a far-out strike just to fit the budget.
+    enforce_budget=False (paper test) ignores the budget/band cap so setups
+    get tested on the RIGHT contract; the paper record notes affordability.
     Returns (occ, strike, ask, expiry)."""
     d = diag if diag is not None else {}
-    reasons = {"no_quote": 0, "over_band_max": 0, "over_budget": 0, "wide_spread": 0, "under_band_min": 0}
+    reasons = {"no_quote": 0, "delta_out": 0, "over_band_max": 0, "over_budget": 0,
+               "wide_spread": 0, "under_band_min": 0}
     samples = {k: [] for k in reasons}
+    pmax = SWING_PREMIUM_MAX if enforce_budget else max(SWING_PREMIUM_MAX, SWING_PAPER_PREMIUM_MAX)
     d.update(ticker=ticker, direction=direction, reasons=reasons, rejected_samples=samples,
-             band=[SWING_PREMIUM_MIN, SWING_PREMIUM_MAX], max_spread_pct=SWING_MAX_SPREAD,
-             otm_cap_pct=SWING_MAX_OTM)
+             band=[SWING_PREMIUM_MIN, pmax], max_spread_pct=SWING_MAX_SPREAD,
+             delta_band=[SWING_DELTA_MIN, SWING_DELTA_MAX], otm_cap_pct=SWING_MAX_OTM)
     spot = _spot_price(ticker)
     d["spot"] = spot
     if not spot:
         d["result"] = "no spot price"
         return None, None, None, None
     d["budget_cap_per_contract"] = _swing_budget_cap()
+    call = direction == "call"
     try:
         resp = requests.get(f"{TT_BASE}/option-chains/{ticker}/nested",
                             headers=_tt_headers(), timeout=10)
@@ -1338,64 +1454,71 @@ def swing_select_contract(ticker: str, direction: str, diag: dict | None = None)
                 for st_ in exp.get("strikes", []):
                     try:
                         k = float(st_.get("strike-price"))
-                        o = st_.get("call") if direction == "call" else st_.get("put")
+                        o = st_.get("call") if call else st_.get("put")
                         if o:
                             smap[k] = o
                     except Exception:
                         continue
-        # v14.14: ladder of expiries ~120 -> 90 -> 75 -> 60 -> 45 -> 30 days:
-        # the LONGEST-dated contract that's affordable + liquid wins (more time
-        # for the swing to work), stepping shorter only when needed.
-        pool = sorted((v["dte"], ds) for ds, v in exps.items()
-                      if SWING_DTE_MIN <= v["dte"] <= SWING_DTE_MAX)
-        order = []
-        for tgt in (120, 90, 75, 60, 45, SWING_DTE_MIN):
-            if tgt < SWING_DTE_MIN or not pool:
-                continue
-            best_e = min(pool, key=lambda x: abs(x[0] - tgt))
-            if best_e not in order:
-                order.append(best_e)
+        mid_dte = (SWING_PICK_DTE_MIN + SWING_PICK_DTE_MAX) / 2.0
+        pool = [(v["dte"], ds) for ds, v in exps.items()
+                if SWING_PICK_DTE_MIN <= v["dte"] <= SWING_PICK_DTE_MAX]
+        if not pool:
+            pool = [(v["dte"], ds) for ds, v in exps.items()
+                    if SWING_PICK_DTE_MIN <= v["dte"] <= max(90, SWING_PICK_DTE_MAX)]
+        pool.sort(key=lambda x: abs(x[0] - mid_dte))
+        order = pool[:3]
         d["expiries_tried"] = []
+        best = None
         for dte, ds in order:
             smap = exps[ds]["strikes"]
-            if direction == "call":
-                side = sorted(k for k in smap if spot * 0.99 <= k <= spot * (1 + SWING_MAX_OTM))
-            else:
-                side = sorted((k for k in smap if spot * (1 - SWING_MAX_OTM) <= k <= spot * 1.01), reverse=True)
+            lo_k, hi_k = spot * 0.85, spot * (1 + min(SWING_MAX_OTM, 0.15))
+            if not call:
+                lo_k, hi_k = spot * (1 - min(SWING_MAX_OTM, 0.15)), spot * 1.15
+            side = sorted(k for k in smap if lo_k <= k <= hi_k)
             d["expiries_tried"].append({"expiry": ds, "dte": dte, "strikes_checked": len(side)})
-            quotes = _option_quotes_bulk([smap[k] for k in side])
+            quotes = _option_snapshots_bulk([smap[k] for k in side])
             for k in side:
                 occ = smap[k]
                 q = quotes.get(occ.replace(" ", "")) or {}
                 ask = float(q.get("ask") or 0)
                 bid = float(q.get("bid") or 0)
-                if ask <= 0:
+                if ask <= 0 or bid <= 0:
                     reasons["no_quote"] += 1
                     continue
                 mid = (ask + bid) / 2.0
                 spr = (ask - bid) / mid if mid > 0 else 9.9
+                dl = q.get("delta")
+                if dl is None:
+                    dl = _bs_delta(spot, k, dte, mid, call)
                 row = {"occ": occ, "strike": k, "expiry": ds, "dte": dte, "bid": bid, "ask": ask,
-                       "spread_pct": round(spr, 3), "otm_pct": round(abs(k - spot) / spot, 3)}
-                if ask < SWING_PREMIUM_MIN:
-                    reasons["under_band_min"] += 1
-                    if len(samples["under_band_min"]) < 2:
-                        samples["under_band_min"].append(row)
-                    break                       # further OTM only gets cheaper
+                       "spread_pct": round(spr, 3), "delta": dl,
+                       "otm_pct": round(((k - spot) if call else (spot - k)) / spot, 3)}
                 why = None
-                if ask > SWING_PREMIUM_MAX:
+                if dl is None or not (SWING_DELTA_MIN <= dl <= SWING_DELTA_MAX):
+                    why = "delta_out"
+                elif ask < SWING_PREMIUM_MIN:
+                    why = "under_band_min"
+                elif ask > pmax:
                     why = "over_band_max"
-                elif _position_size(ask, scale=0.5) == 0:
+                elif enforce_budget and _position_size(ask, scale=0.5) == 0:
                     why = "over_budget"
                 elif spr > SWING_MAX_SPREAD:
                     why = "wide_spread"
                 if why:
                     reasons[why] += 1
-                    samples[why] = (samples[why] + [row])[-2:]   # keep the 2 cheapest seen
+                    if why != "delta_out" or (dl is not None and abs(dl - SWING_DELTA_TARGET) < 0.15):
+                        samples[why] = (samples[why] + [row])[-2:]
                     continue
-                d["result"] = "ok"
-                d["pick"] = row
-                log.info(f"SWING contract {occ} ask {ask} exp {ds} ({dte} DTE, {row['otm_pct']:.0%} OTM)")
-                return occ, k, ask, ds
+                score = abs(dl - SWING_DELTA_TARGET) + abs(dte - mid_dte) / 300.0
+                if best is None or score < best[0]:
+                    best = (score, row)
+        if best:
+            row = best[1]
+            d["result"] = "ok"
+            d["pick"] = row
+            log.info(f"SWING contract {row['occ']} ask {row['ask']} exp {row['expiry']} "
+                     f"({row['dte']} DTE, delta {row['delta']}, {row['otm_pct']:+.0%} OTM)")
+            return row["occ"], row["strike"], row["ask"], row["expiry"]
         d["result"] = "none"
         log.info(f"SWING: no qualifying contract for {ticker} {direction} — {reasons}")
         return None, None, None, None
@@ -1412,22 +1535,23 @@ def _swing_diag_line(d: dict) -> str:
     lbl = {"over_band_max": "over $" + format(SWING_PREMIUM_MAX, ".2f") + " band",
            "over_budget": "over budget (max ~$" + format(d.get("budget_cap_per_contract") or 0, ".2f") + "/contract)",
            "wide_spread": "spread > " + format(SWING_MAX_SPREAD, ".0%") + " of mid",
-           "no_quote": "no quote", "under_band_min": "under $" + format(SWING_PREMIUM_MIN, ".2f")}
+           "no_quote": "no quote", "under_band_min": "under $" + format(SWING_PREMIUM_MIN, ".2f"),
+           "delta_out": "delta outside " + format(SWING_DELTA_MIN, ".2f") + "-" + format(SWING_DELTA_MAX, ".2f")}
     for k, n in r.items():
         if n:
             bits.append(f"{n} {lbl.get(k, k)}")
     cheapest = None
-    for k in ("over_budget", "over_band_max", "wide_spread"):
+    for k in ("over_budget", "over_band_max", "wide_spread", "delta_out"):
         for row in (d.get("rejected_samples") or {}).get(k) or []:
             if cheapest is None or row["ask"] < cheapest["ask"]:
                 cheapest = dict(row, why=lbl.get(k, k))
     out = (f"{d.get('result')}: " + (", ".join(bits) or "no strikes in range")
-           + f" (searched to {SWING_MAX_OTM:.0%} OTM, "
+           + f" (delta {SWING_DELTA_MIN:.2f}-{SWING_DELTA_MAX:.2f}, "
            + ", ".join(f"{e['dte']}DTE" for e in (d.get("expiries_tried") or [])) + ")")
     if cheapest:
         out += (f". Closest miss: {_fmt_occ(cheapest['occ'])} ask ${cheapest['ask']:.2f} "
                 f"bid ${cheapest['bid']:.2f} ({cheapest['spread_pct']:.0%} spread, "
-                f"{cheapest['otm_pct']:.0%} OTM) — {cheapest['why']}")
+                f"delta {cheapest.get('delta')}) — {cheapest['why']}")
     return out
 
 
@@ -1593,6 +1717,31 @@ def _swing_levels(ticker: str) -> dict | None:
         ema20 = c * k + ema20 * (1 - k)
     hi20 = max(float(b["h"]) for b in done[-20:])
     lo20 = min(float(b["l"]) for b in done[-20:])
+    # v14.15 context for the journal: strength vs SPY, volume, daily range
+    ret20 = (px - closes[-21]) / closes[-21] if len(closes) >= 21 else 0.0
+    rs20 = None
+    try:
+        if ticker != "SPY":
+            _sb = [b for b in _daily_bars("SPY", 80) if str(b.get("t", ""))[:10] < today]
+            if len(_sb) >= 21:
+                _spx = _spot_price("SPY") or float(_sb[-1]["c"])
+                rs20 = round(ret20 - (_spx - float(_sb[-21]["c"])) / float(_sb[-21]["c"]), 4)
+        else:
+            rs20 = 0.0
+    except Exception:
+        rs20 = None
+    try:
+        _v20 = sum(float(b.get("v") or 0) for b in done[-20:]) / 20.0
+        _vtd = float(bars[-1].get("v") or 0) if str(bars[-1].get("t", ""))[:10] >= today else float(done[-1].get("v") or 0)
+        vol_ratio = round(_vtd / _v20, 2) if _v20 else None
+    except Exception:
+        vol_ratio = None
+    try:
+        _tr = [max(float(done[i]["h"]), float(done[i - 1]["c"])) - min(float(done[i]["l"]), float(done[i - 1]["c"]))
+               for i in range(len(done) - 14, len(done))]
+        atr_pct = round(sum(_tr) / 14.0 / px, 4)
+    except Exception:
+        atr_pct = None
     prev_h, prev_l = float(done[-1]["h"]), float(done[-1]["l"])
     low2 = min(float(done[-1]["l"]), float(done[-2]["l"]))
     high2 = max(float(done[-1]["h"]), float(done[-2]["h"]))
@@ -1601,6 +1750,7 @@ def _swing_levels(ticker: str) -> dict | None:
     out = {"ticker": ticker, "px": round(px, 2), "trend": "up" if up else ("down" if dn else "none"),
            "hi20": round(hi20, 2), "lo20": round(lo20, 2), "ema20": round(ema20, 2),
            "sma50": round(sma50, 2), "strength": abs(sma20 - sma20_prev) / sma20_prev,
+           "rs20": rs20, "ret20": round(ret20, 4), "vol_ratio": vol_ratio, "atr_pct": atr_pct,
            "trigger": None, "setup": None, "direction": None, "proximity": None, "plan": ""}
     if up:
         out["direction"] = "call"
@@ -1881,7 +2031,7 @@ def swing_watchlist_job():
                 _pk = _dg.get("pick") or {}
                 _rep.append(f"**{lv['ticker']} {lv['direction'].upper()}** → {_fmt_occ(_o)} ask ${_a:.2f} "
                             f"(bid ${_pk.get('bid', 0):.2f}, {_pk.get('spread_pct', 0):.0%} spread, "
-                            f"{_pk.get('otm_pct', 0):.0%} OTM, {_pk.get('dte')} DTE)")
+                            f"delta {_pk.get('delta')}, {_pk.get('dte')} DTE)")
             else:
                 _rep.append(f"**{lv['ticker']} {lv['direction'].upper()}** → none. {_swing_diag_line(_dg)}")
         if _rep:
@@ -1892,6 +2042,547 @@ def swing_watchlist_job():
     if fails:
         log.warning(f"SWING watchlist: {fails} ticker(s) had no daily data")
     log.info("JOB: swing watchlist posted")
+
+
+# ═══════════════════ TRADE JOURNAL + WEEKLY REPORT (v14.15) ═══════════════════
+# Every closed trade — live day trades, shadow (paper-only day setups) and swing
+# paper trades — is written to ONE journal with the setup, the conditions at
+# entry, how it played out, and WHY it won or lost (rules below). The journal
+# survives the daily reset (PERSIST_KEYS) AND restarts: each entry is also
+# saved to Discord (DISCORD_CHANNEL_JOURNAL if set, else Junior's DM) with a
+# compact data footer, and rebuilt from there at boot.
+# Friday after the close: a weekly report DM — every trade with its why, the
+# record per setup, what the winners had in common, and a KEEP / ADJUST /
+# NEED MORE TRADES verdict per setup — plus the full journal as a CSV file.
+_JRNL_TAG = "JRNL:"
+JOURNAL_MAX = 800
+SETUP_GATE = os.environ.get("SETUP_GATE", "1") == "1"
+SETUP_GATE_MIN_N = int(os.environ.get("SETUP_GATE_MIN_N", "10"))
+SETUP_KEEP_WIN = float(os.environ.get("SETUP_KEEP_WIN", "0.55"))
+SETUP_FAIL_WIN = float(os.environ.get("SETUP_FAIL_WIN", "0.45"))
+_KIND_LABEL = {"day": "LIVE DAY", "shadow": "SHADOW DAY", "swing_paper": "SWING PAPER",
+               "swing": "LIVE SWING"}
+_journal_chan_cache: dict = {}
+JOURNAL_DAY = os.environ.get("JOURNAL_DAY", "0") == "1"   # swings only by default
+
+
+def _journal_channel() -> str | None:
+    cid = os.environ.get("DISCORD_CHANNEL_JOURNAL", "").strip()
+    if cid:
+        return cid
+    if _journal_chan_cache.get("dm"):
+        return _journal_chan_cache["dm"]
+    if not JUNIOR_USER_IDS:
+        return None
+    try:
+        r = requests.post(f"{DISCORD_API}/users/@me/channels",
+                          headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                                   "Content-Type": "application/json"},
+                          json={"recipient_id": JUNIOR_USER_IDS[0]}, timeout=10)
+        if r.status_code in (200, 201):
+            _journal_chan_cache["dm"] = r.json()["id"]
+            return _journal_chan_cache["dm"]
+    except Exception as e:
+        log.warning(f"journal channel lookup failed: {e}")
+    return None
+
+
+def _journal() -> list:
+    return list(load_state().get("journal") or [])
+
+
+def _pct(x, d=1):
+    return "n/a" if x is None else f"{x * 100:+.{d}f}%"
+
+
+def _journal_why(r: dict) -> tuple:
+    """Rules-based explanation of a result. Returns (cause_code, [reasons]).
+    cause codes: WIN_CLEAN, WIN_DIP, WIN_TRAIL, WIN_TARGET,
+                 GAVE_BACK, CONTRACT, FAILED_FAST, NO_FOLLOW, WRONG_WAY"""
+    k = r.get("kind")
+    pct = float(r.get("pct") or 0)
+    peak = float(r.get("peak") or 0)
+    trough = float(r.get("trough") or 0)
+    fav = r.get("stock_fav")
+    why_exit = str(r.get("exit_reason") or "").lower()
+    c = r.get("ctx") or {}
+    out = []
+    if pct > 0:
+        if "target" in why_exit or "+100%" in why_exit:
+            code = "WIN_TARGET"; out.append("ran all the way to the profit target")
+        elif any(w in why_exit for w in ("trail", "floor", "lock")):
+            code = "WIN_TRAIL"; out.append(f"ran to {_pct(peak, 0)} and the trailing stop locked in profit")
+        elif trough <= -0.10:
+            code = "WIN_DIP"; out.append(f"dipped to {_pct(trough, 0)} first, then worked")
+        else:
+            code = "WIN_CLEAN"; out.append("worked right away (never went meaningfully red)")
+    else:
+        mins = r.get("mins")
+        days = r.get("days")
+        fast = (mins is not None and mins <= 15) or (k == "swing_paper" and days is not None and days <= 1)
+        if peak >= 0.10:
+            code = "GAVE_BACK"
+            out.append(f"was up {_pct(peak, 0)} then reversed into a loss — the exit gave it all back")
+        elif fav is not None and fav > 0.003 and k != "shadow":
+            code = "CONTRACT"
+            out.append(f"the stock moved OUR way ({_pct(fav)}) but the option still lost — "
+                       f"contract choice (delta {c.get('delta', 'n/a')}) / time decay")
+        elif fast and peak < 0.03:
+            code = "FAILED_FAST"
+            out.append("reversed right after entry — fake-out or late entry")
+        elif any(w in why_exit for w in ("chop", "flatten", "time exit", "eod", "window")) or abs(pct) < 0.06:
+            code = "NO_FOLLOW"
+            out.append("no follow-through — the stock went nowhere")
+        else:
+            code = "WRONG_WAY"
+            out.append("the stock moved against the setup" + (f" ({_pct(fav)})" if fav is not None else ""))
+        stop_lvl = -_stop_pct() if k == "day" else None
+        if stop_lvl is not None and pct < stop_lvl - 0.05:
+            out.append(f"stop filled late ({_pct(pct)} vs {_pct(stop_lvl, 0)} plan) — slippage")
+    # contributing conditions (same checks for wins and losses so the report
+    # can compare them)
+    if c.get("with_spy") is False:
+        out.append("traded AGAINST the market (SPY going the other way)")
+    ch = c.get("vwap_dist")
+    if ch is not None and abs(ch) > 0.003:
+        out.append(f"entered {_pct(abs(ch), 2)} away from VWAP (chasing)")
+    vr = c.get("vol_ratio")
+    if vr is not None and vr < 0.8:
+        out.append(f"light volume ({vr:.1f}x normal)")
+    rs = c.get("rs20")
+    if rs is not None and k in ("swing_paper", "swing"):
+        if (rs < 0 and r.get("dir") == "call") or (rs > 0 and r.get("dir") == "put"):
+            out.append("stock was WEAKER than SPY for the trade direction")
+    dl = c.get("delta")
+    if dl is not None and dl < 0.30:
+        out.append(f"low-delta contract ({dl:.2f}) — barely moves with the stock")
+    return code, out
+
+
+_FIX = {"GAVE_BACK": "lock profits sooner (tighter trail / take half earlier)",
+        "CONTRACT": "use a closer-to-the-money contract (higher delta, more time)",
+        "FAILED_FAST": "wait for a confirmation candle — stop chasing the first move",
+        "NO_FOLLOW": "only take it with strong volume / a clear trend day",
+        "WRONG_WAY": "add a filter (see the condition checks below) so it only fires in its best conditions"}
+
+
+def journal_add(rec: dict, flush: bool = True):
+    """Add one closed trade. Never raises."""
+    try:
+        with _state_lock:
+            s = load_state()
+            seq = int(s.get("journal_seq") or 0) + 1
+            s["journal_seq"] = seq
+            rec = dict(rec)
+            rec.setdefault("closed", datetime.now(ET).date().isoformat())
+            rec["id"] = f"{rec.get('kind', 'x')[:2]}{datetime.now(ET).strftime('%y%m%d%H%M%S')}{seq % 1000:03d}"
+            code, why = _journal_why(rec)
+            rec["cause"] = code
+            rec["why"] = why
+            rec["win"] = float(rec.get("pct") or 0) > 0
+            rec["_p"] = False
+            jl = (s.get("journal") or []) + [rec]
+            s["journal"] = jl[-JOURNAL_MAX:]
+            _commit(s)
+        log.info(f"JOURNAL +{rec.get('kind')} {rec.get('ticker')} {rec.get('setup')} "
+                 f"{_pct(rec.get('pct'))} [{code}]")
+        if flush:
+            _journal_flush()
+    except Exception as e:
+        log.warning(f"journal_add failed: {e}")
+
+
+def _journal_line(r: dict) -> str:
+    return (f"{'✅' if r.get('win') else '❌'} {_KIND_LABEL.get(r.get('kind'), r.get('kind'))} · "
+            f"**{r.get('ticker')} {str(r.get('dir') or '').upper()}** {r.get('setup')} "
+            f"{_pct(r.get('pct'))} (peak {_pct(r.get('peak'), 0)}) — {(r.get('why') or [''])[0]}")
+
+
+def _journal_flush():
+    """Save unsaved journal entries to Discord (human line + data footer)."""
+    import base64, zlib
+    jl = _journal()
+    todo = [r for r in jl if not r.get("_p")]
+    if not todo:
+        return
+    cid = _journal_channel()
+    if not cid:
+        return
+    hdr = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
+    done_ids = set()
+    i = 0
+    while i < len(todo):
+        n = min(6, len(todo) - i)
+        while n >= 1:
+            chunk = todo[i:i + n]
+            slim = [{k: v for k, v in r.items() if k != "_p"} for r in chunk]
+            enc = base64.b64encode(zlib.compress(json.dumps(slim, separators=(",", ":"),
+                                                            default=str).encode(), 9)).decode()
+            text = "📓 **Trade journal**\n" + "\n".join(_journal_line(r)[:220] for r in chunk)
+            body = text + "\n-# " + _JRNL_TAG + enc
+            if len(body) <= 1990 or n == 1:
+                break
+            n -= 1
+        if len(body) > 1990:          # single oversized entry: drop the long text fields
+            r0 = dict(slim[0]); r0.pop("plan", None); r0["why"] = (r0.get("why") or [])[:2]
+            enc = base64.b64encode(zlib.compress(json.dumps([r0], separators=(",", ":"),
+                                                            default=str).encode(), 9)).decode()
+            body = "📓 **Trade journal**\n" + _journal_line(chunk[0])[:200] + "\n-# " + _JRNL_TAG + enc
+        try:
+            rr = requests.post(f"{DISCORD_API}/channels/{cid}/messages", headers=hdr,
+                               json={"content": body[:2000]}, timeout=10)
+            if rr.status_code in (200, 201):
+                done_ids.update(r["id"] for r in chunk)
+            else:
+                log.warning(f"journal save failed {rr.status_code}: {rr.text[:150]}")
+                break
+        except Exception as e:
+            log.warning(f"journal save failed: {e}")
+            break
+        i += n
+    if done_ids:
+        with _state_lock:
+            s = load_state()
+            for r in s.get("journal") or []:
+                if r.get("id") in done_ids:
+                    r["_p"] = True
+            _commit(s)
+
+
+def _journal_resync():
+    """Boot: rebuild the journal from the saved Discord messages (newest 1,000)."""
+    import base64, zlib
+    cid = _journal_channel()
+    if not cid:
+        return
+    hdr = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    have = {r.get("id") for r in _journal()}
+    found, before = [], None
+    try:
+        for _page in range(10):
+            params = {"limit": 100}
+            if before:
+                params["before"] = before
+            r = requests.get(f"{DISCORD_API}/channels/{cid}/messages", headers=hdr,
+                             params=params, timeout=10)
+            if r.status_code != 200:
+                break
+            msgs = r.json()
+            if not msgs:
+                break
+            for m in msgs:
+                c = m.get("content") or ""
+                if _JRNL_TAG in c:
+                    try:
+                        enc = c.split(_JRNL_TAG, 1)[1].strip().split()[0]
+                        for rec in json.loads(zlib.decompress(base64.b64decode(enc)).decode()):
+                            if rec.get("id") and rec["id"] not in have:
+                                rec["_p"] = True
+                                found.append(rec)
+                                have.add(rec["id"])
+                    except Exception:
+                        continue
+            before = msgs[-1]["id"]
+            if len(msgs) < 100:
+                break
+    except Exception as e:
+        log.warning(f"journal resync failed: {e}")
+    if found:
+        with _state_lock:
+            s = load_state()
+            jl = (s.get("journal") or []) + found
+            jl.sort(key=lambda x: (str(x.get("closed") or ""), str(x.get("id") or "")))
+            s["journal"] = jl[-JOURNAL_MAX:]
+            _commit(s)
+    log.info(f"JOURNAL restored: {len(found)} entries from Discord ({len(_journal())} total)")
+
+
+def _setup_stats(rows: list) -> dict:
+    n = len(rows)
+    w = sum(1 for r in rows if r.get("win"))
+    avg = sum(float(r.get("pct") or 0) for r in rows) / n if n else 0.0
+    usd = sum(float(r.get("usd") or 0) for r in rows if r.get("usd") is not None)
+    return {"n": n, "w": w, "l": n - w, "win": (w / n) if n else None, "avg": avg, "usd": usd}
+
+
+def _setup_verdict(kind: str, st: dict, rows: list) -> str:
+    if st["n"] < 5:
+        return f"⏳ NEED MORE TRADES ({st['n']} so far — judging at 5+, going live needs {SETUP_GATE_MIN_N}+)"
+    if st["win"] >= SETUP_KEEP_WIN and st["avg"] > 0:
+        if kind in ("shadow", "swing_paper") and st["n"] >= SETUP_GATE_MIN_N:
+            return "✅ KEEP — proven on paper. READY TO GO LIVE (your call)"
+        return "✅ KEEP — replicate it"
+    causes = {}
+    for r in rows:
+        if not r.get("win"):
+            causes[r.get("cause")] = causes.get(r.get("cause"), 0) + 1
+    top = max(causes, key=causes.get) if causes else None
+    return f"🔧 ADJUST — main loss cause: {top or 'n/a'} → {_FIX.get(top, 'review the trades')}"
+
+
+def _condition_checks(rows: list) -> list:
+    """Compare win rates when a condition was true vs false (needs 2+ each)."""
+    tests = {
+        "with SPY (market same direction)": lambda r: (r.get("ctx") or {}).get("with_spy"),
+        "stock stronger than SPY": lambda r: (None if (r.get("ctx") or {}).get("rs20") is None else
+                                              (((r.get("ctx") or {})["rs20"] > 0) == (r.get("dir") == "call"))),
+        "volume above normal": lambda r: (None if (r.get("ctx") or {}).get("vol_ratio") is None else
+                                          (r.get("ctx") or {})["vol_ratio"] >= 1.0),
+        "entry near VWAP (<0.3%)": lambda r: (None if (r.get("ctx") or {}).get("vwap_dist") is None else
+                                              abs((r.get("ctx") or {})["vwap_dist"]) <= 0.003),
+        "before 10:30 AM": lambda r: (None if not (r.get("ctx") or {}).get("hhmm") else
+                                      str((r.get("ctx") or {})["hhmm"]) < "10:30"),
+        "contract delta 0.40+": lambda r: (None if (r.get("ctx") or {}).get("delta") is None else
+                                           (r.get("ctx") or {})["delta"] >= 0.40),
+    }
+    out = []
+    for name, f in tests.items():
+        yes, no = [], []
+        for r in rows:
+            try:
+                v = f(r)
+            except Exception:
+                v = None
+            if v is True:
+                yes.append(r)
+            elif v is False:
+                no.append(r)
+        if len(yes) >= 2 and len(no) >= 2:
+            wy = sum(1 for r in yes if r.get("win")) / len(yes)
+            wn = sum(1 for r in no if r.get("win")) / len(no)
+            if abs(wy - wn) >= 0.20:
+                better = "WITH" if wy > wn else "WITHOUT"
+                out.append(f"wins more {better} '{name}': {wy:.0%} of {len(yes)} vs {wn:.0%} of {len(no)}")
+    return out
+
+
+def swing_setup_proven(setup: str) -> tuple:
+    """v14.15 SWING GO-LIVE RULE: a swing setup may place REAL trades only
+    after its paper record proves it — SETUP_GATE_MIN_N+ closed paper trades,
+    win rate >= SETUP_KEEP_WIN and a positive average (last 20). Losing or
+    unproven setups stay paper-only and keep being scored."""
+    if not SETUP_GATE:
+        return True, ""
+    rows = [r for r in _journal() if r.get("kind") == "swing_paper" and r.get("setup") == setup][-20:]
+    st = _setup_stats(rows)
+    if st["n"] >= SETUP_GATE_MIN_N and st["win"] >= SETUP_KEEP_WIN and st["avg"] > 0:
+        return True, ""
+    return False, (f"{setup} not proven on paper yet ({st['w']}W/{st['l']}L of {st['n']}; "
+                   f"needs {SETUP_GATE_MIN_N}+ trades, {SETUP_KEEP_WIN:.0%}+ wins, positive average)")
+
+
+def setup_gate_ok(kind: str, setup: str) -> tuple:
+    """Only setups that are NOT failing trade live. A live setup is paused once
+    it has SETUP_GATE_MIN_N+ journaled trades with win rate < SETUP_FAIL_WIN
+    and a negative average (last 20 trades). Returns (ok, why)."""
+    if not SETUP_GATE or not setup:
+        return True, ""
+    rows = [r for r in _journal() if r.get("kind") == kind and r.get("setup") == setup][-20:]
+    st = _setup_stats(rows)
+    if st["n"] >= SETUP_GATE_MIN_N and st["win"] < SETUP_FAIL_WIN and st["avg"] < 0:
+        return False, (f"{setup} is paused by the setup gate — last {st['n']} trades "
+                       f"{st['w']}W/{st['l']}L ({st['win']:.0%}), avg {_pct(st['avg'])}")
+    return True, ""
+
+
+def _journal_csv(rows: list) -> bytes:
+    import csv, io
+    cols = ["closed", "kind", "ticker", "dir", "setup", "result", "pct", "peak", "trough", "usd",
+            "entry", "exit", "exit_reason", "cause", "why", "stock_fav", "mins", "days",
+            "with_spy", "vwap_dist", "vol_ratio", "rs20", "delta", "dte", "hhmm", "occ", "plan"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for r in rows:
+        c = r.get("ctx") or {}
+        w.writerow([r.get("closed"), r.get("kind"), r.get("ticker"), r.get("dir"), r.get("setup"),
+                    "WIN" if r.get("win") else "LOSS", r.get("pct"), r.get("peak"), r.get("trough"),
+                    r.get("usd"), r.get("entry"), r.get("exit"), r.get("exit_reason"), r.get("cause"),
+                    " | ".join(r.get("why") or []), r.get("stock_fav"), r.get("mins"), r.get("days"),
+                    c.get("with_spy"), c.get("vwap_dist"), c.get("vol_ratio"), c.get("rs20"),
+                    c.get("delta"), c.get("dte"), c.get("hhmm"), r.get("occ"), r.get("plan")])
+    return buf.getvalue().encode()
+
+
+def _dm_send_chunks(text: str, prefix: str):
+    """Split a long report into <=1900-char DMs on line boundaries."""
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 1800:
+            parts.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        parts.append(cur)
+    for i, p in enumerate(parts):
+        send_emergency_dm(p.rstrip(), prefix=prefix if i == 0 else "📒 (cont.)")
+
+
+def _dm_upload(filename: str, data: bytes, content: str):
+    hdr = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    for uid in JUNIOR_USER_IDS:
+        try:
+            dm = requests.post(f"{DISCORD_API}/users/@me/channels",
+                               headers=dict(hdr, **{"Content-Type": "application/json"}),
+                               json={"recipient_id": uid}, timeout=10)
+            if dm.status_code not in (200, 201):
+                continue
+            requests.post(f"{DISCORD_API}/channels/{dm.json()['id']}/messages", headers=hdr,
+                          data={"payload_json": json.dumps({"content": content})},
+                          files={"files[0]": (filename, data, "text/csv")}, timeout=20)
+        except Exception as e:
+            log.warning(f"report upload failed: {e}")
+
+
+def weekly_report(send: bool = True, week: str | None = None) -> str:
+    """Friday report: every trade this week with why it won/lost, the record
+    per setup (this week + all time), conditions that separate winners from
+    losers, and a verdict per setup."""
+    jl = _journal()
+    today = datetime.now(ET).date()
+    wk = week or f"{today.isocalendar()[0]}-W{today.isocalendar()[1]:02d}"
+
+    def _wk(r):
+        try:
+            d = date.fromisoformat(str(r.get("closed"))[:10])
+            return f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
+        except Exception:
+            return ""
+    this = [r for r in jl if _wk(r) == wk]
+    if not JOURNAL_DAY:
+        jl = [r for r in jl if r.get("kind") in ("swing_paper", "swing")]
+        this = [r for r in this if r.get("kind") in ("swing_paper", "swing")]
+    L = [f"📒 **WEEKLY SWING REPORT — {wk}**",
+         f"{len(this)} trades closed this week · {len(jl)} in the journal all-time", ""]
+    for kind in ("day", "shadow", "swing_paper", "swing"):
+        all_k = [r for r in jl if r.get("kind") == kind]
+        wk_k = [r for r in this if r.get("kind") == kind]
+        if not all_k:
+            continue
+        L.append(f"__**{_KIND_LABEL[kind]}**__")
+        for setup in sorted({r.get("setup") for r in all_k}, key=str):
+            rows_all = [r for r in all_k if r.get("setup") == setup]
+            rows_wk = [r for r in wk_k if r.get("setup") == setup]
+            sa, sw = _setup_stats(rows_all), _setup_stats(rows_wk)
+            L.append(f"**{setup}** — week {sw['w']}W/{sw['l']}L"
+                     + (f" ({sw['win']:.0%}, avg {_pct(sw['avg'])})" if sw["n"] else "")
+                     + f" · all-time {sa['w']}W/{sa['l']}L"
+                     + (f" ({sa['win']:.0%}, avg {_pct(sa['avg'])})" if sa["n"] else "")
+                     + (f" · ${sa['usd']:+.0f}" if kind == "day" and sa["usd"] else ""))
+            L.append("  → " + _setup_verdict(kind, sa, rows_all))
+            wins = [r for r in rows_all if r.get("win")]
+            if wins:
+                wc = {}
+                for r in wins:
+                    wc[r.get("cause")] = wc.get(r.get("cause"), 0) + 1
+                L.append("  winners: " + ", ".join(f"{k} ×{v}" for k, v in sorted(wc.items(), key=lambda x: -x[1])))
+            for cc in _condition_checks(rows_all):
+                L.append("  🔎 " + cc)
+        L.append("")
+    if this:
+        L.append("__**Every trade this week**__")
+        for r in this:
+            L.append(f"{'✅' if r.get('win') else '❌'} {str(r.get('closed'))[5:]} "
+                     f"{_KIND_LABEL.get(r.get('kind'), '')} {r.get('ticker')} {str(r.get('dir') or '').upper()} "
+                     f"{r.get('setup')} {_pct(r.get('pct'))} (peak {_pct(r.get('peak'), 0)})"
+                     + (f" ${float(r['usd']):+.0f}" if r.get("usd") is not None else ""))
+            for y in (r.get("why") or [])[:3]:
+                L.append(f"   · {y}")
+    else:
+        L.append("No trades closed this week.")
+    text = "\n".join(L)
+    # short coach summary from Claude (optional, never blocks the report)
+    coach = ""
+    if this:
+        try:
+            _brief = json.dumps([{k: r.get(k) for k in ("kind", "ticker", "dir", "setup", "pct", "peak",
+                                                         "cause", "why", "ctx")} for r in this][-60:],
+                                default=str)[:12000]
+            _cl = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=1)
+            _rp = _cl.messages.create(
+                model=CLAUDE_MODEL, max_tokens=500,
+                messages=[{"role": "user", "content":
+                           "You are reviewing one week of an options trading bot's SWING trade journal (paper test before going live). In plain English "
+                           "for a beginner, under 900 characters: (1) which setups worked and the conditions "
+                           "they shared, (2) which lost and the single most likely fix for each. Only use the "
+                           "data below; if the sample is too small to conclude, say so. No hype.\n" + _brief}])
+            coach = _rp.content[0].text.strip()
+        except Exception as e:
+            log.warning(f"weekly coach summary failed: {e}")
+    if coach:
+        text += "\n\n🧠 **Coach summary**\n" + coach[:1500]
+    if send:
+        _dm_send_chunks(text, prefix="📒 **TPP WEEKLY SWING REPORT**")
+        try:
+            _dm_upload(f"tpp_swing_journal_{wk}.csv", _journal_csv(jl),
+                       f"📎 Full swing journal ({len(jl)} trades) — open in Excel/Google Sheets.")
+        except Exception as e:
+            log.warning(f"journal csv failed: {e}")
+    return text
+
+
+def _day_entry_ctx(ticker: str, direction: str, occ: str | None) -> dict:
+    """Conditions at a day-trade entry, for the journal."""
+    c = {"hhmm": datetime.now(ET).strftime("%H:%M")}
+    try:
+        st = _mkt_structure.get(ticker) or {}
+        cs = [x for x in (st.get("candles") or []) if x.get("close") is not None]
+        if cs:
+            px = float(cs[-1]["close"])
+            c["px"] = px
+            vw = st.get("vwap")
+            if vw:
+                c["vwap_dist"] = round((px - float(vw)) / float(vw), 4)
+            vols = [float(x.get("volume") or 0) for x in cs[-21:-1]]
+            if vols and sum(vols) > 0:
+                c["vol_ratio"] = round(float(cs[-1].get("volume") or 0) / (sum(vols) / len(vols)), 2)
+        sp = _mkt_structure.get("SPY") or {}
+        scs = [x for x in (sp.get("candles") or []) if x.get("close") is not None]
+        if scs and sp.get("vwap"):
+            spy_up = float(scs[-1]["close"]) > float(sp["vwap"])
+            c["with_spy"] = spy_up if direction == "call" else (not spy_up)
+        if occ:
+            k = int(occ.replace(" ", "")[-8:]) / 1000.0
+            if c.get("px"):
+                c["itm"] = round(((c["px"] - k) if direction == "call" else (k - c["px"])) / c["px"], 4)
+    except Exception as e:
+        log.warning(f"entry ctx {ticker}: {e}")
+    return c
+
+
+_LAST_CLEARED: dict = {}
+
+
+def _journal_day_close(pos: dict | None, ticker, direction, pnl_pct, pnl_dollar, exit_reason):
+    if not JOURNAL_DAY:
+        return
+    try:
+        pos = pos or {}
+        ctx = dict(pos.get("ctx") or {})
+        mins, fav = None, None
+        try:
+            et = datetime.fromisoformat(pos.get("entry_time"))
+            mins = round((datetime.now(ET) - et).total_seconds() / 60, 1)
+        except Exception:
+            pass
+        try:
+            st = _mkt_structure.get(ticker) or {}
+            cs = [x for x in (st.get("candles") or []) if x.get("close") is not None]
+            if cs and ctx.get("px"):
+                fav = (float(cs[-1]["close"]) - ctx["px"]) / ctx["px"] * (1 if direction == "call" else -1)
+        except Exception:
+            pass
+        journal_add({"kind": "day", "ticker": ticker, "dir": direction,
+                     "setup": pos.get("setup") or "AI_DECISION", "occ": pos.get("occ_symbol"),
+                     "entry": pos.get("fill_price"), "pct": round(float(pnl_pct or 0), 4),
+                     "usd": None if pnl_dollar is None else round(float(pnl_dollar), 2),
+                     "peak": round(float(pos.get("peak_pnl") or 0), 4),
+                     "trough": round(float(pos.get("trough_pnl") or 0), 4),
+                     "exit_reason": exit_reason or "", "mins": mins,
+                     "stock_fav": None if fav is None else round(fav, 4),
+                     "plan": str(pos.get("setup_desc") or "")[:200], "ctx": ctx})
+    except Exception as e:
+        log.warning(f"journal (day) failed: {e}")
 
 
 # ═══════════════════ SWING PAPER ENGINE (v14.14) ═══════════════════
@@ -1970,12 +2661,9 @@ def _paper_resync_from_dm():
 def swing_paper_scan():
     """3:45 PM (daily candle essentially closed): paper-enter watchlist setups
     whose trigger is live and aligned with the market. Same caps as live."""
-    wl = load_state().get("swing_wl") or {}
-    today_s = datetime.now(ET).date().isoformat()
-    tickers = wl.get("tickers") if wl.get("date") == today_s else None
-    if not tickers:
-        log.info("PAPER scan: no watchlist today")
-        return
+    # v14.15: test EVERY swing ticker (not just the 3 watchlist names) so the
+    # track record builds faster. Members still only see the top-3 watchlist.
+    tickers = list(SWING_TICKERS)
     bo, why = _swing_entry_blackout_today()
     spy = None
     try:
@@ -2005,14 +2693,14 @@ def swing_paper_entry(lv: dict) -> bool:
     tk, direction = lv["ticker"], lv["direction"]
     wk = _iso_week_key()
     if any(p.get("ticker") == tk for p in b["open"]):
-        return False
-    if len(b["open"]) >= SWING_MAX_ACTIVE or int(b["week"].get(wk) or 0) >= SWING_MAX_PER_WEEK:
+        return False                     # one position per stock — no doubling up
+    if len(b["open"]) >= SWING_PAPER_MAX_OPEN or int(b["week"].get(wk) or 0) >= SWING_PAPER_MAX_WEEK:
         return False
     if _swing_earnings_within_48h(tk):
         log.info(f"PAPER skip {tk}: earnings inside {SWING_EARNINGS_DAYS} days")
         return False
     dg = {}
-    occ, k, ask, exp = swing_select_contract(tk, direction, dg)
+    occ, k, ask, exp = swing_select_contract(tk, direction, dg, enforce_budget=False)
     if not occ:
         b["stats"]["skips"] = int(b["stats"].get("skips") or 0) + 1
         _paper_save(b)
@@ -2024,7 +2712,12 @@ def swing_paper_entry(lv: dict) -> bool:
            "entry": float(ask), "entry_date": datetime.now(ET).date().isoformat(),
            "setup": lv["setup"], "plan": lv["plan"], "spot_in": lv["px"],
            "peak": 0.0, "trough": 0.0, "stage": 0, "floor": None, "rec": False,
-           "trimmed": False, "trim_pct": None, "cref": None, "last_bid": None}
+           "trimmed": False, "trim_pct": None, "cref": None, "last_bid": None,
+           "ctx": {"rs20": lv.get("rs20"), "ret20": lv.get("ret20"), "vol_ratio": lv.get("vol_ratio"),
+                   "atr_pct": lv.get("atr_pct"), "trend_str": round(float(lv.get("strength") or 0), 4),
+                   "delta": pk.get("delta"), "dte": pk.get("dte"), "otm": pk.get("otm_pct"),
+                   "spread": pk.get("spread_pct"), "with_spy": True,
+                   "live_qty": _position_size(ask, scale=0.5)}}
     b["open"].append(pos)
     b["week"] = {wk: int(b["week"].get(wk) or 0) + 1}
     _paper_save(b)
@@ -2032,13 +2725,19 @@ def swing_paper_entry(lv: dict) -> bool:
     _paper_dm(
         f"🟢 **PAPER ENTRY — {tk} {direction.upper()}** ({lv['setup']})\n"
         f"Why: {lv['plan']} (stock ${lv['px']:.2f})\n"
-        f"Contract: **{_fmt_occ(occ)}** (exp {exp}, {pk.get('dte')} DTE, {pk.get('otm_pct', 0):.0%} OTM)\n"
+        f"Contract: **{_fmt_occ(occ)}** (exp {exp}, {pk.get('dte')} DTE, delta {pk.get('delta')}, "
+        f"{pk.get('otm_pct', 0):+.0%} OTM)\n"
         f"Sim fill: ${ask:.2f} at the ask (bid ${pk.get('bid', 0):.2f}, spread {pk.get('spread_pct', 0):.0%}) "
-        f"— live sizing would buy {qty_real} contract(s) = ${ask * 100 * qty_real:.0f}\n"
+        + (f"— live sizing would buy {qty_real} contract(s) = ${ask * 100 * qty_real:.0f}\n" if qty_real
+           else "— too expensive for the live account today (tracked anyway to prove the setup)\n") +
         f"Plan: -30% stop on 15-min closes (-40% hard), recovery -15%, half off at +30%, "
         f"step-trail from +10%, +100% target.\n"
-        f"Week: {b['week'][wk]}/{SWING_MAX_PER_WEEK} | open {len(b['open'])}/{SWING_MAX_ACTIVE}", b)
+        f"Week: {b['week'][wk]}/{SWING_PAPER_MAX_WEEK} | open {len(b['open'])}/{SWING_PAPER_MAX_OPEN}", b)
     return True
+
+
+SWING_PAPER_MAX_OPEN = int(os.environ.get("SWING_PAPER_MAX_OPEN", "5"))
+SWING_PAPER_MAX_WEEK = int(os.environ.get("SWING_PAPER_MAX_WEEK", "5"))
 
 
 def _paper_close(b: dict, p: dict, bid: float, reason: str) -> dict:
@@ -2052,7 +2751,21 @@ def _paper_close(b: dict, p: dict, bid: float, reason: str) -> dict:
     rec = {"ticker": p["ticker"], "dir": p["direction"], "setup": p.get("setup"), "occ": p["occ"],
            "entry": fill, "exit": round(bid, 2), "pct": round(res, 4), "peak": round(p.get("peak") or 0, 4),
            "days": days, "reason": reason, "closed": datetime.now(ET).date().isoformat()}
-    b["closed"] = (b.get("closed") or []) + [rec]
+    b["closed"] = ((b.get("closed") or []) + [rec])[-40:]
+    try:
+        _sp = _spot_price(p["ticker"])
+        _si = float(p.get("spot_in") or 0)
+        _fav = ((_sp - _si) / _si * (1 if p["direction"] == "call" else -1)) if (_sp and _si) else None
+        journal_add({"kind": "swing_paper", "ticker": p["ticker"], "dir": p["direction"],
+                     "setup": p.get("setup"), "occ": p["occ"], "entry": fill, "exit": round(bid, 2),
+                     "pct": round(res, 4), "peak": round(float(p.get("peak") or 0), 4),
+                     "trough": round(float(p.get("trough") or 0), 4), "exit_reason": reason,
+                     "opened": p.get("entry_date"), "closed": rec["closed"], "days": days,
+                     "plan": p.get("plan"), "spot_in": _si, "spot_out": _sp,
+                     "stock_fav": round(_fav, 4) if _fav is not None else None,
+                     "trimmed": bool(p.get("trimmed")), "ctx": p.get("ctx") or {}})
+    except Exception as _je:
+        log.warning(f"journal (paper) failed: {_je}")
     stt = b["stats"]
     stt["n"] = int(stt.get("n") or 0) + 1
     stt["w" if res > 0 else "l"] = int(stt.get("w" if res > 0 else "l") or 0) + 1
@@ -2171,7 +2884,7 @@ def swing_paper_daily_summary():
             lines.append(f"  · {r['ticker']} {r['setup']} {r['pct']:+.1%} ({r['reason']})")
     else:
         lines.append(f"Record: no closed paper trades yet | {stt.get('skips', 0)} triggers skipped (no contract)")
-    lines.append(f"Week slots: {int(b['week'].get(_iso_week_key()) or 0)}/{SWING_MAX_PER_WEEK}")
+    lines.append(f"Week slots: {int(b['week'].get(_iso_week_key()) or 0)}/{SWING_PAPER_MAX_WEEK}")
     _paper_dm("\n".join(lines), b)
 
 
@@ -2541,63 +3254,81 @@ def _tt_actual_exit_fill(occ: str) -> tuple[float | None, int]:
         return None, 0
 
 
-def _tt_sweep_closing_orders(occ: str) -> int:
-    """v13.7: cancel every live order (simple + complex) that references this
-    option symbol. Used before (re)placing protection so the broker never
-    holds duplicate closing orders — the silent-rejection trap behind the
-    Aug 25 frozen-ratchet incident. Returns count canceled; best-effort."""
-    swept = 0
+_WORKING = {"live", "received", "routed", "in flight", "in-flight", "contingent",
+            "cancel requested", "replace requested"}
+_CANCELABLE = {"live", "received", "routed", "contingent", "in flight", "in-flight"}
+
+
+def _tt_working_units(occ: str) -> list | None:
+    """v14.15: the protection 'units' working at the broker for this symbol.
+    One OCO bracket = ONE unit (its two child orders are also listed under
+    /orders with a complex-order-id — those are folded into the parent, the
+    old counter saw 1 bracket as 3 and raised false 'stacked' alarms).
+    Status is filtered HERE, not trusted to the query string. Each unit:
+    {"ep": "orders"|"complex-orders", "id":, "status":, "cancelable": bool}.
+    Returns None if the broker could not be read."""
     _sym = occ.replace(" ", "")
-    for _ep in ("orders", "complex-orders"):
+    units = []
+    for _ep in ("complex-orders", "orders"):
         try:
-            r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}",
-                             headers=_tt_headers(),
-                             params={"status[]": ["Live", "Received", "Routed"]},
-                             timeout=8)
+            # /live = everything working today (plus today's finished ones,
+            # filtered out below by status); fall back to the filtered list.
+            r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}/live",
+                             headers=_tt_headers(), timeout=8)
             if r.status_code != 200:
-                continue
-            items = (r.json().get("data") or {}).get("items") or []
-            for it in items:
-                _id = it.get("id")
-                _legs = it.get("legs") or []
-                for _o in (it.get("orders") or []):     # complex orders nest orders->legs
-                    _legs += _o.get("legs") or []
-                if _id and any(_sym == str(l.get("symbol", "")).replace(" ", "")
-                               for l in _legs):
-                    try:
-                        requests.delete(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}/{_id}",
-                                        headers=_tt_headers(), timeout=8)
-                        swept += 1
-                        log.info(f"SWEEP: canceled resting {_ep[:-1]} {_id} for {occ}")
-                    except Exception:
-                        pass
+                r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}",
+                                 headers=_tt_headers(),
+                                 params={"status[]": ["Live", "Received", "Routed", "Contingent",
+                                                      "Cancel Requested", "Replace Requested", "In Flight"]},
+                                 timeout=8)
+            if r.status_code != 200:
+                return None
+            for it in (r.json().get("data") or {}).get("items") or []:
+                if _ep == "orders" and (it.get("complex-order-id") or it.get("complex-order-tag")):
+                    continue                     # child of a bracket — counted with its parent
+                _legs = list(it.get("legs") or [])
+                _kids = list(it.get("orders") or [])
+                for _o in _kids:
+                    _legs = _legs + list(_o.get("legs") or [])
+                if not any(_sym == str(l.get("symbol", "")).replace(" ", "") for l in _legs):
+                    continue
+                _st = str(it.get("status") or "").strip().lower()
+                if not _st and _kids:            # complex order: working if any child is
+                    _ks = [str(_o.get("status") or "").strip().lower() for _o in _kids]
+                    _st = next((s for s in _ks if s in _WORKING), _ks[0] if _ks else "")
+                if _st in _WORKING:
+                    units.append({"ep": _ep, "id": it.get("id"), "status": _st,
+                                  "cancelable": _st in _CANCELABLE})
+        except Exception:
+            return None
+    return units
+
+
+def _tt_sweep_closing_orders(occ: str) -> int:
+    """v13.7/v14.15: cancel every working protection unit on this symbol
+    (brackets are canceled as a whole at the complex endpoint, never leg by
+    leg). Returns count of cancel requests the broker accepted."""
+    swept = 0
+    for u in (_tt_working_units(occ) or []):
+        if not u["cancelable"] or not u["id"]:
+            continue
+        try:
+            r = requests.delete(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{u['ep']}/{u['id']}",
+                                headers=_tt_headers(), timeout=8)
+            if r.status_code in (200, 201, 202, 204):
+                swept += 1
+                log.info(f"SWEEP: cancel sent for {u['ep'][:-1]} {u['id']} ({occ})")
+            else:
+                log.warning(f"SWEEP: cancel {u['ep'][:-1]} {u['id']} refused {r.status_code}: {r.text[:160]}")
         except Exception as e:
-            log.warning(f"sweep {_ep} failed: {e}")
+            log.warning(f"SWEEP cancel failed {u['id']}: {e}")
     return swept
 
 
 def _tt_count_closing_orders(occ: str) -> int | None:
-    """v14.14: how many working orders (incl. ones mid-cancel) touch this symbol."""
-    _sym = occ.replace(" ", "")
-    n = 0
-    for _ep in ("orders", "complex-orders"):
-        try:
-            r = requests.get(f"{TT_BASE}/accounts/{TT_ACCOUNT}/{_ep}",
-                             headers=_tt_headers(),
-                             params={"status[]": ["Live", "Received", "Routed", "Cancel Requested",
-                                                  "Replace Requested", "In Flight"]},
-                             timeout=8)
-            if r.status_code != 200:
-                return None
-            for it in (r.json().get("data") or {}).get("items") or []:
-                _legs = list(it.get("legs") or [])
-                for _o in (it.get("orders") or []):
-                    _legs += _o.get("legs") or []
-                if any(_sym == str(l.get("symbol", "")).replace(" ", "") for l in _legs):
-                    n += 1
-        except Exception:
-            return None
-    return n
+    """v14.15: number of working protection UNITS (a bracket counts once)."""
+    u = _tt_working_units(occ)
+    return None if u is None else len(u)
 
 
 def _clear_closing_orders(occ: str, timeout: float = 6.0) -> bool:
@@ -2605,20 +3336,54 @@ def _clear_closing_orders(occ: str, timeout: float = 6.0) -> bool:
     broker confirms none are left (cancels are async). Called before every
     stop raise, trim and close so orders can never stack up and lock the
     contracts (the 'too many pending orders, can't close' problem)."""
-    _tt_sweep_closing_orders(occ)
-    t0 = time_module.time()
-    while time_module.time() - t0 < timeout:
-        n = _tt_count_closing_orders(occ)
-        if n == 0:
-            return True
-        if n is None:
-            break
-        time_module.sleep(0.75)
-    _tt_sweep_closing_orders(occ)            # one more pass, then proceed
+    if _tt_count_closing_orders(occ) == 0:
+        return True
+    for _pass in (1, 2):
+        _tt_sweep_closing_orders(occ)
+        t0 = time_module.time()
+        _lim = timeout if _pass == 1 else timeout * 2
+        while time_module.time() - t0 < _lim:
+            n = _tt_count_closing_orders(occ)
+            if n == 0:
+                return True
+            if n is None:
+                break
+            time_module.sleep(0.75)
     n = _tt_count_closing_orders(occ)
     if n:
-        log.critical(f"CLEAR: {n} order(s) still working on {occ} after {timeout:.0f}s")
+        log.critical(f"CLEAR: {n} order(s) still working on {occ} after two sweeps")
     return n == 0
+
+
+_ARM_REFUSE_DM: dict = {}
+_ARM_REFUSED_TS: dict = {}
+
+
+def _arm_guard(occ: str, what: str) -> bool:
+    """v14.15 THE NO-STACKING LAW, enforced at the only two functions that
+    place closing orders: nothing new is placed while ANY older closing order
+    on the symbol is still working. If the old one won't clear, it stays as
+    the protection (plus the software stop) and we refuse to add another —
+    stacked sells are what lock a position so it can't be closed."""
+    n = _tt_count_closing_orders(occ)
+    if n == 0:
+        return True
+    if n is None:
+        log.warning(f"ARM GUARD: broker order list unreadable for {occ} — placing {what} anyway")
+        return True
+    if time_module.time() - _ARM_REFUSED_TS.get(occ, 0) < 30:
+        log.warning(f"ARM GUARD: {what} on {occ} refused again (old order still working)")
+        return False
+    if _clear_closing_orders(occ):
+        return True
+    _ARM_REFUSED_TS[occ] = time_module.time()
+    log.critical(f"ARM GUARD: refused to place {what} on {occ} — {n} older order(s) still working")
+    if time_module.time() - _ARM_REFUSE_DM.get(occ, 0) > 300:
+        _ARM_REFUSE_DM[occ] = time_module.time()
+        send_emergency_dm(f"ORDER GUARD: did NOT place a new {what} on {occ} because an older closing "
+                          f"order is still working at the broker and would not cancel. The older order "
+                          f"stays as protection and the software stop is active. Check TT Orders if this repeats.")
+    return False
 
 
 def _tt_order_status(order_id: str) -> tuple[str, float | None]:
@@ -2721,6 +3486,8 @@ def place_oco_bracket(occ_symbol: str, fill_price: float, qty: int = 1,
     falls back to plain stop + software target — the pre-v11.7 behavior)."""
     target  = _tick(target_override) if target_override else _tick(fill_price * (1 + DAY_TARGET_PCT))
     trigger = _tick(trigger_override) if trigger_override else _tick(fill_price * (1 - _stop_pct()))
+    if not _arm_guard(occ_symbol, "bracket"):
+        return None, None
     payload = {
         "type": "OCO",
         "orders": [
@@ -2803,6 +3570,8 @@ def place_stop_loss(occ_symbol: str, fill_price: float, qty: int = 1,
                     trigger_override: float | None = None) -> str | None:
     sp       = _stop_pct()
     trigger  = _tick(trigger_override) if trigger_override else _tick(fill_price * (1 - sp))
+    if not _arm_guard(occ_symbol, "stop"):
+        return None
     order_id = _tt_place_order({
         "time-in-force": "Day",
         "order-type":    "Stop",
@@ -2923,7 +3692,8 @@ def monitor_open_position():
                     prefix="⚖️ **TPP RECONCILE**")
                 record_trade_result(_pnl_p >= 0, ticker=pos.get("ticker"),
                                     pnl_pct=_pnl_p, pnl_dollar=_pnl_d,
-                                    direction=pos.get("direction"))
+                                    direction=pos.get("direction"),
+                                    exit_reason="closed at broker (reconcile)")
                 clear_open_position()
                 return
         except Exception as _bt_e:
@@ -2968,7 +3738,9 @@ def monitor_open_position():
             clear_open_position()
             record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"),
                                 pnl_pct=pnl_p, pnl_dollar=pnl_d,
-                        direction=pos.get("direction"))
+                        direction=pos.get("direction"),
+                        exit_reason=("target (broker)" if _kind == "target" else
+                                     ("trailing floor (broker)" if exit_px > fill_price else "stop loss (broker)")))
             log.info(f"OCO {_kind} filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
             return
 
@@ -3000,7 +3772,7 @@ def monitor_open_position():
             clear_open_position()
             record_trade_result(win=(exit_px > fill_price), ticker=pos.get("ticker"),
                                 pnl_pct=pnl_p, pnl_dollar=pnl_d,
-                        direction=pos.get("direction"))
+                        direction=pos.get("direction"), exit_reason="stop loss (broker)")
             log.info(f"Broker stop filled — {occ} @ ${exit_px:.2f} ({pnl_p:+.1%})")
             return
 
@@ -3291,7 +4063,7 @@ def monitor_open_position():
         clear_open_position()
         record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"),
                             pnl_pct=pnl_pct_final, pnl_dollar=pnl_dollar,
-                        direction=pos.get("direction"))
+                        direction=pos.get("direction"), exit_reason=reason)
         log.info(f"Position closed — {occ} | {reason} | {pnl_pct_final:+.1%}")
 
 
@@ -3878,6 +4650,9 @@ def _shadow_track(ticker: str, levels: dict | None = None):
         for o in d["open"]:
             mv = (px - o["px"]) / o["px"] * (1 if o["dir"] == "call" else -1)
             o["peak"] = max(o["peak"], mv)
+            o["trough"] = min(float(o.get("trough") or 0), mv)
+            o["mv"] = mv
+            o["exit_px"] = px
             floor = 0.0 if o["peak"] >= tg / 2 else -sl
             if mv >= tg:
                 _shadow_record(o, "W")
@@ -3971,8 +4746,23 @@ def _shadow_track(ticker: str, levels: dict | None = None):
             if name in d["fired"]:
                 continue
             d["fired"].add(name)
+            _sctx = {"hhmm": bt.strftime("%H:%M")}
+            try:
+                if vw:
+                    _sctx["vwap_dist"] = round((px - float(vw)) / float(vw), 4)
+                _vv = [float(c.get("volume") or 0) for c in cs[-21:-1]]
+                if _vv and sum(_vv) > 0:
+                    _sctx["vol_ratio"] = round(float(cs[-1].get("volume") or 0) / (sum(_vv) / len(_vv)), 2)
+                _sp = _mkt_structure.get("SPY") or {}
+                _scs = [c for c in (_sp.get("candles") or []) if c.get("close") is not None]
+                if _scs and _sp.get("vwap"):
+                    _up = float(_scs[-1]["close"]) > float(_sp["vwap"])
+                    _sctx["with_spy"] = _up if direction == "call" else (not _up)
+            except Exception:
+                pass
             d["open"].append({"setup": name, "tk": ticker, "dir": direction, "px": px,
-                              "t": bt.strftime("%H:%M"), "date": today, "peak": 0.0})
+                              "t": bt.strftime("%H:%M"), "date": today, "peak": 0.0,
+                              "trough": 0.0, "ctx": _sctx})
             log.info(f"SHADOW: {name} {ticker} {direction} @ {px:.2f} {bt.strftime('%H:%M')}")
     except Exception as e:
         log.warning(f"shadow track {ticker} failed: {e}")
@@ -3986,6 +4776,35 @@ def _shadow_record(o: dict, result: str):
                    "t": o["t"], "r": result})
         s["shadow_log"] = lg[-300:]
         _commit(s)
+    if not JOURNAL_DAY:
+        return
+    # v14.15 journal: shadow results are scored in OPTION terms using the same
+    # approximation the scorecard uses (target ~ +20%, stop ~ -30% of premium)
+    try:
+        tg, sl = _SHADOW_TS.get(o["tk"], (0.006, 0.009))
+        _scale = 0.20 / tg
+        _mv = float(o.get("mv") or 0)
+        _pct_opt = 0.0 if result == "S" else (0.20 if result == "W" and _mv >= tg else
+                                              max(-0.30, min(0.20, _mv * _scale)))
+        if result == "W" and _pct_opt <= 0:
+            _pct_opt = 0.01
+        if result == "L" and _pct_opt >= 0:
+            _pct_opt = -0.01
+        try:
+            _hh, _mm = (int(x) for x in str(o.get("t") or "0:0").split(":"))
+            _mins = round(datetime.now(ET).hour * 60 + datetime.now(ET).minute - (_hh * 60 + _mm), 1)
+        except Exception:
+            _mins = None
+        journal_add({"kind": "shadow", "ticker": o["tk"], "dir": o["dir"], "setup": o["setup"],
+                     "entry": o.get("px"), "exit": o.get("exit_px"), "pct": round(_pct_opt, 4),
+                     "peak": round(float(o.get("peak") or 0) * _scale, 4),
+                     "trough": round(float(o.get("trough") or 0) * _scale, 4),
+                     "stock_fav": round(_mv, 4), "mins": _mins, "opened": o.get("date"),
+                     "exit_reason": o.get("closed_by") or {"W": "target", "L": "stop",
+                                                           "S": "scratch at break-even"}.get(result, ""),
+                     "result": result, "ctx": o.get("ctx") or {}}, flush=False)
+    except Exception as _sje:
+        log.warning(f"journal (shadow) failed: {_sje}")
 
 
 def _shadow_close_window():
@@ -3998,6 +4817,9 @@ def _shadow_close_window():
         px = float(cs[-1]["close"])
         for o in d["open"]:
             mv = (px - o["px"]) / o["px"] * (1 if o["dir"] == "call" else -1)
+            o["mv"] = mv
+            o["exit_px"] = px
+            o["closed_by"] = "window end"
             _shadow_record(o, "W" if mv > 0 else "L")
         d["open"] = []
 
@@ -4917,6 +5739,16 @@ def _scheduler_loop():
                         swing_paper_monitor()
                     except Exception as _spe:
                         log.error(f"swing paper monitor failed: {_spe}")
+                if (dtime(16, 15) <= t <= dtime(16, 45)
+                        and _next_trading_day(today).isocalendar()[1] != today.isocalendar()[1]
+                        and load_state().get("last_weekly_report") != today_s):
+                    with _state_lock:
+                        _wr = load_state(); _wr["last_weekly_report"] = today_s; _commit(_wr)
+                    try:
+                        _journal_flush()
+                        weekly_report(send=True)
+                    except Exception as _wre:
+                        log.error(f"weekly report failed: {_wre}")
                 if (SWING_MODE == "paper" and dtime(15, 55) <= t <= dtime(16, 10)
                         and load_state().get("last_paper_summary_date") != today_s):
                     with _state_lock:
@@ -5158,6 +5990,10 @@ def _scheduler_loop():
                                 # pullbacks first (higher hit-rate), then strongest trend
                                 _trig.sort(key=lambda lv: (lv["setup"] != "PULLBACK", -lv["strength"]))
                                 for _lv in _trig:
+                                    _pv, _pwhy = swing_setup_proven(_lv.get("setup"))
+                                    if not _pv:
+                                        log.info(f"SWING live entry skipped {_lv['ticker']}: {_pwhy}")
+                                        continue
                                     if swing_execute_entry(
                                             _lv["ticker"], _lv["direction"],
                                             f"{_lv['ticker']} {_lv['setup'].lower()} swing — "
@@ -5288,13 +6124,23 @@ def _scheduler_loop():
                     _sh = load_state(); _sh["last_shadow_close"] = today_s; _commit(_sh)
                 try:
                     _shadow_close_window()
+                    _journal_flush()
                     if _next_trading_day(today).isocalendar()[1] != today.isocalendar()[1]:
-                        _sm = _shadow_summary()
+                        # v14.15: the shadow log now survives midnight, so this
+                        # finally covers the whole week (it used to be Friday only)
+                        _wk_lg = [r for r in (load_state().get("shadow_log") or [])
+                                  if str(r.get("date") or "")[:10] and
+                                  date.fromisoformat(str(r["date"])[:10]).isocalendar()[:2] == today.isocalendar()[:2]]
+                        _sm = {}
+                        for _r in _wk_lg:
+                            _a = _sm.setdefault(_r["setup"], {"W": 0, "L": 0, "S": 0})
+                            _a[_r["r"]] = _a.get(_r["r"], 0) + 1
                         if _sm:
                             send_emergency_dm(
                                 "📊 Weekly SHADOW SCORECARD (paper only — no orders):\n" + "\n".join(
                                     f"{k}: {a['W']}W / {a['L']}L / {a['S']} scratch "
-                                    f"(win {a['win_rate']:.0%} of {a['n']})" for k, a in sorted(_sm.items())),
+                                    f"(win {a['W'] / max(1, a['W'] + a['L'] + a['S']):.0%} of {a['W'] + a['L'] + a['S']})"
+                                    for k, a in sorted(_sm.items())),
                                 prefix="📊 **TPP SCORECARD**")
                 except Exception as _she:
                     log.warning(f"shadow close failed: {_she}")
@@ -5476,7 +6322,7 @@ def flatten():
     clear_open_position()
     record_trade_result(win=(exit_price > fill_price), ticker=pos.get("ticker"),
                         pnl_pct=pnl_pct, pnl_dollar=pnl_dollar,
-                        direction=pos.get("direction"))
+                        direction=pos.get("direction"), exit_reason="manual flatten")
     log.info(f"Flatten complete — {occ} @ ${exit_price:.2f}")
     return jsonify({"status": "flattened", "exit_price": exit_price}), 200
 
@@ -5550,6 +6396,19 @@ def swing_contracts():
     occ, k, ask, exp = swing_select_contract(tk, request.args.get("dir", "call").lower(), dg)
     dg["summary"] = ("picked " + _fmt_occ(occ) + f" @ ${ask:.2f}") if occ else _swing_diag_line(dg)
     return jsonify(dg), 200
+
+
+@app.route("/weekly-report-test")
+def weekly_report_test():
+    """v14.15: build the weekly report now. ?send=1 also DMs it (no orders,
+    no trade data in this response — only counts)."""
+    _send = request.args.get("send") == "1"
+    try:
+        txt = weekly_report(send=_send)
+        return jsonify({"ok": True, "sent": _send, "journal_total": len(_journal()),
+                        "report_chars": len(txt)}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 
 @app.route("/chart-test")
@@ -5658,6 +6517,11 @@ def status():
         "swing_week_used":    _swing_week_count(),
         "swing_mode":         SWING_MODE,
         "swing_paper":        {"open": len(_paper_book()["open"]), **_paper_book()["stats"]},
+        "journal":            {"total": len(_journal()),
+                               "unsaved": sum(1 for _r in _journal() if not _r.get("_p")),
+                               "by_kind": {k: sum(1 for _r in _journal() if _r.get("kind") == k)
+                                           for k in ("day", "shadow", "swing_paper")}},
+        "swing_live_ready":   {_s: swing_setup_proven(_s)[0] for _s in ("BREAKOUT", "BREAKDOWN", "PULLBACK")},
         "key_level_gate":     KEY_LEVEL_GATE,
         "day_trail":          " / ".join(f"+{t:.0%}->+{l:.0%}" for t, l in DAY_LADDER[:10]) + f" ... cap +{DAY_TARGET_PCT:.0%}",
         "quality_gates":      QUALITY_GATES,
@@ -6130,6 +6994,10 @@ def _boot_in_worker():
     _adopt_broker_positions()
     _resync_day_state_from_discord()
     _paper_resync_from_dm()
+    try:
+        _journal_resync()
+    except Exception as _jre:
+        log.warning(f"journal resync failed: {_jre}")
     _ensure_scheduler()
 
 
