@@ -127,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.16"
+APP_VERSION = "v14.17"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -1581,7 +1581,13 @@ SWING_DTE_MIN      = int(os.environ.get("SWING_MIN_DTE", "30"))    # v14.14: fro
 SWING_DTE_MAX      = int(os.environ.get("SWING_DTE_MAX", "365"))   # 12 months
 SWING_MAX_PER_WEEK = int(os.environ.get("SWING_MAX_PER_WEEK", "2"))
 SWING_MAX_ACTIVE   = int(os.environ.get("SWING_MAX_ACTIVE", "3"))
-SWING_STOP_PCT     = 0.30          # initial, 15-min candle-CLOSE rule
+# v14.17 (Oct 27, Junior): losses were bigger than wins (PLTR -34%, JPM -18%
+# vs wins of +1-2%). Tighter risk, faster exit on trades that never work,
+# break-even lock at +10%. New env names so stale Render values can't override.
+SWING_STOP_PCT     = float(os.environ.get("SWING_STOP_V2", "0.20"))       # 15-min candle-CLOSE stop
+SWING_HARD_STOP    = float(os.environ.get("SWING_HARD_STOP_V2", "0.25"))  # resting GTC disaster stop
+SWING_NOTWORK_PEAK = float(os.environ.get("SWING_NOTWORK_PEAK", "0.05"))  # never reached +5% ...
+SWING_NOTWORK_LOSS = float(os.environ.get("SWING_NOTWORK_LOSS", "0.10"))  # ... and down 10% after day 1 -> out
 SWING_TARGET_PCT   = 1.00          # +100% full exit
 SWING_TRIM_AT      = 0.30          # +30% -> auto-sell 50%
 SWING_MAX_OTM      = float(os.environ.get("SWING_OTM_CAP_PCT", "0.25"))   # v14.14: reach further OTM for affordable swings
@@ -1592,7 +1598,7 @@ SWING_WATCHLIST_N  = int(os.environ.get("SWING_WATCHLIST_N", "3"))
 SWING_MAX_SPREAD   = float(os.environ.get("SWING_SPREAD_MAX_MID", "0.07"))  # v14.16: 7% of mid
 
 # step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
-SWING_LADDER = [(0.10, 0.02), (0.15, 0.05), (0.20, 0.15), (0.30, 0.25),
+SWING_LADDER = [(0.10, 0.00), (0.15, 0.05), (0.20, 0.10), (0.30, 0.25),
                 (0.40, 0.35), (0.50, 0.50), (0.60, 0.60), (0.70, 0.70),
                 (0.80, 0.80), (0.90, 0.90)]
 SWING_MILESTONES = [0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 1.00]
@@ -1885,7 +1891,7 @@ def swing_monitor():
         pos["trough_pnl"] = min(float(pos.get("trough_pnl") or 0), pnl)
         peak = pos["peak_pnl"]
 
-        # 15-min candle-close stop (-30%): evaluate only at candle boundaries
+        # 15-min candle-close stop (SWING_STOP_PCT): evaluate only at candle boundaries
         cref = f"{now.hour}:{now.minute // 15}"
         if pos.get("candle_ref") != cref:
             pos["candle_ref"] = cref
@@ -1897,12 +1903,29 @@ def swing_monitor():
                 post_to_discord(
                     SWING_CHANNEL,
                     f"🛑 **SWING {_fmt_occ(occ)} CLOSED** — 15-min candle closed below "
-                    f"-30%\nEntry: ${fill:.2f} → Exit: ${exit_px:.2f}\n"
+                    f"-{SWING_STOP_PCT:.0%}\nEntry: ${fill:.2f} → Exit: ${exit_px:.2f}\n"
                     f"P&L: {pnl_f:+.1%} (${(exit_px - fill) * 100 * qty:+.0f} on {qty}) — "
                     f"loss capped per the plan.")
                 post_to_discord("profits-and-recaps", f"🏁 **SWING {tkr} closed** ({pnl_f:+.1%}) — "
                                 f"full recap in #swing-trade-signals.")
                 continue
+
+        # v14.17 not-working exit: after day 1, never reached +5% and down 10%
+        if (str(pos.get("entry_date") or "") < now.date().isoformat()
+                and peak < SWING_NOTWORK_PEAK and pnl <= -SWING_NOTWORK_LOSS):
+            exit_px = close_position_tt(occ, "SWING NOT-WORKING EXIT", bid, qty) or bid
+            pnl_f = (exit_px - fill) / fill
+            _tt_sweep_closing_orders(occ)
+            post_to_discord(
+                SWING_CHANNEL,
+                f"🚪 **SWING {_fmt_occ(occ)} CLOSED** — trade never worked (never reached "
+                f"+{SWING_NOTWORK_PEAK:.0%}), cut early instead of waiting for the full stop\n"
+                f"Entry: ${fill:.2f} → Exit: ${exit_px:.2f}\n"
+                f"P&L: {pnl_f:+.1%} (${(exit_px - fill) * 100 * qty:+.0f} on {qty}) — small loss, capital kept.")
+            post_to_discord("profits-and-recaps", f"🏁 **SWING {tkr} closed** ({pnl_f:+.1%}) — "
+                            f"full recap in #swing-trade-signals.")
+            changed = True
+            continue
 
         # recovery: dipped <=-15%, back to breakeven -> floor to -15%
         if (not pos.get("recovery") and pos["trough_pnl"] <= -0.15 and pnl >= 0
@@ -1911,7 +1934,7 @@ def swing_monitor():
                 pos["recovery"] = True
                 post_to_discord("profits-and-recaps",
                                 f"🔄 **SWING {_fmt_occ(occ)}** dipped {pos['trough_pnl']:+.1%} and "
-                                f"fought back — floor raised to -15%. A comeback never re-tests -30%.")
+                                f"fought back — floor raised to -15%.")
             changed = True
 
         # +30% trim: sell HALF, once (qty>=2)
@@ -2674,6 +2697,143 @@ def _paper_resync_from_dm():
         log.warning(f"paper resync failed: {e}")
 
 
+# ═══════ v14.17 SWING LEARNING LOOP (Oct 27, Junior) ═══════
+# Winners -> find setups that look like them. Losers -> find what went wrong,
+# turn it into a filter, apply it to the very next trade. Rules-based and
+# visible: every skip and every lesson is DM'd with the numbers behind it.
+SWING_LEARN = os.environ.get("SWING_LEARN", "1") == "1"
+SWING_LEARN_MIN_EACH = int(os.environ.get("SWING_LEARN_MIN_EACH", "2"))  # trades per side before a filter can switch on
+SWING_LEARN_MAX_FILTERS = int(os.environ.get("SWING_LEARN_MAX_FILTERS", "2"))  # never strangle the hunt
+
+_COND_LABEL = {
+    "rs_aligned":   "stock stronger than SPY in the trade's direction",
+    "vol_up":       "volume at or above normal",
+    "delta_40":     "contract delta 0.40+ (moves with the stock)",
+    "not_extended": "entry within 3% of the 20 EMA (not chasing)",
+    "strong_trend": "strong trend (20 SMA up/down 1%+ in 5 days)",
+    "calm_range":   "normal daily range (ATR under 3%)",
+}
+
+
+def _swing_conditions(lv: dict, pk: dict, direction: str) -> dict:
+    """True/False/None per condition for a candidate (or rebuilt from a journal ctx)."""
+    call = direction == "call"
+    rs = lv.get("rs20")
+    vr = lv.get("vol_ratio")
+    dl = (pk or {}).get("delta", lv.get("delta"))
+    atr = lv.get("atr_pct")
+    ts = lv.get("strength", lv.get("trend_str"))
+    ext = None
+    if lv.get("ema20") and lv.get("px"):
+        ext = (float(lv["px"]) - float(lv["ema20"])) / float(lv["ema20"]) * (1 if call else -1)
+    elif lv.get("ext20") is not None:
+        ext = float(lv["ext20"])
+    return {
+        "rs_aligned":   None if rs is None else ((rs > 0) == call),
+        "vol_up":       None if vr is None else vr >= 1.0,
+        "delta_40":     None if dl is None else float(dl) >= 0.40,
+        "not_extended": None if ext is None else ext <= 0.03,
+        "strong_trend": None if ts is None else float(ts) >= 0.01,
+        "calm_range":   None if atr is None else float(atr) < 0.03,
+        "_ext20":       None if ext is None else round(ext, 4),
+    }
+
+
+def _swing_learn_rows() -> list:
+    rows = [r for r in _journal() if r.get("kind") == "swing_paper"][-20:]
+    out = []
+    for r in rows:
+        c = r.get("ctx") or {}
+        conds = c.get("conds") or _swing_conditions(c, {"delta": c.get("delta")}, r.get("dir") or "call")
+        out.append((conds, float(r.get("pct") or 0)))
+    return out
+
+
+def _swing_learned_filters() -> list:
+    """Conditions where trades WITHOUT it lost money on average while trades WITH
+    it made money (2+ trades each side). Returns [(cond, need, text)], strongest first."""
+    if not SWING_LEARN:
+        return []
+    rows = _swing_learn_rows()
+    found = []
+    for cond in _COND_LABEL:
+        yes = [p for c, p in rows if c.get(cond) is True]
+        no = [p for c, p in rows if c.get(cond) is False]
+        if len(yes) < SWING_LEARN_MIN_EACH or len(no) < SWING_LEARN_MIN_EACH:
+            continue
+        ay, an = sum(yes) / len(yes), sum(no) / len(no)
+        if ay > 0 > an:
+            found.append((ay - an, cond, True,
+                          f"WITH '{_COND_LABEL[cond]}': avg {ay:+.1%} over {len(yes)} | "
+                          f"WITHOUT: avg {an:+.1%} over {len(no)}"))
+        elif an > 0 > ay:
+            found.append((an - ay, cond, False,
+                          f"WITHOUT '{_COND_LABEL[cond]}': avg {an:+.1%} over {len(no)} | "
+                          f"WITH: avg {ay:+.1%} over {len(yes)}"))
+    found.sort(reverse=True)
+    return [(c, need, t) for _, c, need, t in found[:SWING_LEARN_MAX_FILTERS]]
+
+
+def _swing_learned_block(conds: dict) -> str:
+    """'' if the candidate passes every learned filter, else the reason."""
+    for cond, need, txt in _swing_learned_filters():
+        v = conds.get(cond)
+        if v is not None and v != need:
+            return f"Lesson from past paper trades — {txt}."
+    return ""
+
+
+def _swing_similarity(conds: dict) -> tuple:
+    """How many conditions this candidate shares with past winners (conditions
+    where winners had that value more often than losers). Returns (score, text)."""
+    rows = _swing_learn_rows()
+    wins = [c for c, p in rows if p > 0]
+    losses = [c for c, p in rows if p <= 0]
+    if not wins:
+        return 0, "no winners on record yet"
+    hits = []
+    for cond, lbl in _COND_LABEL.items():
+        v = conds.get(cond)
+        if v is None:
+            continue
+        rw = sum(1 for c in wins if c.get(cond) is v) / len(wins)
+        rl = (sum(1 for c in losses if c.get(cond) is v) / len(losses)) if losses else 0.0
+        if rw > rl:
+            hits.append(lbl if v else "NOT " + lbl)
+    return len(hits), (f"{len(hits)} match(es) — " + "; ".join(hits)) if hits else "0 matches"
+
+
+def _swing_lesson_text(rec: dict, p: dict) -> str:
+    """What went right/wrong + the fix the system now applies."""
+    jr = {"kind": "swing_paper", "pct": rec["pct"], "peak": p.get("peak"), "trough": p.get("trough"),
+          "exit_reason": rec.get("reason"), "dir": p.get("direction"), "days": rec.get("days"),
+          "ctx": p.get("ctx") or {}}
+    code, why = _journal_why(jr)
+    conds = (p.get("ctx") or {}).get("conds") or {}
+    had = [_COND_LABEL[c] for c, v in conds.items() if v is True and c in _COND_LABEL]
+    missing = [_COND_LABEL[c] for c, v in conds.items() if v is False and c in _COND_LABEL]
+    flt = _swing_learned_filters()
+    if rec["pct"] > 0:
+        out = (f"🧠 **What worked:** {'; '.join(why)}.\n"
+               f"Conditions it had: {', '.join(had) or 'n/a'} — the scan now ranks look-alikes FIRST.")
+    else:
+        fix = {"FAILED_FAST": f"not-working exit (out after day 1 if never +{SWING_NOTWORK_PEAK:.0%} "
+                              f"and down {SWING_NOTWORK_LOSS:.0%}) keeps this to a small loss",
+               "WRONG_WAY": f"stop now -{SWING_STOP_PCT:.0%} + not-working exit cap the damage",
+               "NO_FOLLOW": "not-working exit cuts stalled trades early",
+               "GAVE_BACK": "break-even lock at +10% and +10% locked at +20%",
+               "CONTRACT": "contract picker prefers delta closer to 0.45"}.get(code, _FIX.get(code, "reviewed"))
+        out = (f"🧠 **What went wrong ({code}):** {'; '.join(why)}.\n"
+               f"Missing conditions: {', '.join(missing) or 'none flagged'}\n"
+               f"**Fix in place for the next trade:** {fix}.")
+    if flt:
+        out += "\n**Active learned filters:** " + " || ".join(t for _, _, t in flt)
+    else:
+        out += (f"\nLearned filters: none yet (each condition needs {SWING_LEARN_MIN_EACH}+ trades "
+                f"with AND without it before the system acts on it).")
+    return out
+
+
 def swing_paper_scan():
     """3:45 PM (daily candle essentially closed): paper-enter watchlist setups
     whose trigger is live and aligned with the market. Same caps as live."""
@@ -2694,7 +2854,9 @@ def swing_paper_scan():
             lv = None
         if lv and lv["trigger"] and lv["direction"] and _swing_regime_ok(lv["direction"], spy):
             trig.append(lv)
-    trig.sort(key=lambda lv: (lv["setup"] != "PULLBACK", -lv["strength"]))
+    # v14.17: rank by similarity to past WINNERS first (pre-contract conditions)
+    trig.sort(key=lambda lv: (-_swing_similarity(_swing_conditions(lv, {}, lv["direction"]))[0],
+                              lv["setup"] != "PULLBACK", -lv["strength"]))
     log.info(f"PAPER scan 3:45: {len(trig)} of {len(tickers)} watchlist setups triggered")
     if bo:
         if trig:
@@ -2724,6 +2886,14 @@ def swing_paper_entry(lv: dict) -> bool:
                   f"{lv['setup']}: {lv['plan']}.\nContract search: {_swing_diag_line(dg)}", b)
         return False
     pk = dg.get("pick") or {}
+    _conds = _swing_conditions(lv, pk, direction)
+    _blk = _swing_learned_block(_conds)
+    if _blk:
+        b["stats"]["skips"] = int(b["stats"].get("skips") or 0) + 1
+        _paper_save(b)
+        _paper_dm(f"🧠 **{tk} {direction.upper()} {lv['setup']} skipped — matches a LOSING pattern.**\n"
+                  f"{_blk}\nThe system only takes setups that look like its winners.", b)
+        return False
     pos = {"ticker": tk, "direction": direction, "occ": occ, "strike": k, "exp": exp,
            "entry": float(ask), "entry_date": datetime.now(ET).date().isoformat(),
            "setup": lv["setup"], "plan": lv["plan"], "spot_in": lv["px"],
@@ -2733,6 +2903,8 @@ def swing_paper_entry(lv: dict) -> bool:
                    "atr_pct": lv.get("atr_pct"), "trend_str": round(float(lv.get("strength") or 0), 4),
                    "delta": pk.get("delta"), "dte": pk.get("dte"), "otm": pk.get("otm_pct"),
                    "spread": pk.get("spread_pct"), "with_spy": True,
+                   "ext20": _conds.get("_ext20"), "conds": {c: v for c, v in _conds.items()
+                                                           if not c.startswith("_")},
                    "live_qty": _position_size(ask, scale=0.5)}}
     b["open"].append(pos)
     b["week"] = {wk: int(b["week"].get(wk) or 0) + 1}
@@ -2746,8 +2918,10 @@ def swing_paper_entry(lv: dict) -> bool:
         f"Sim fill: ${ask:.2f} at the ask (bid ${pk.get('bid', 0):.2f}, spread {pk.get('spread_pct', 0):.0%}) "
         + (f"— live sizing would buy {qty_real} contract(s) = ${ask * 100 * qty_real:.0f}\n" if qty_real
            else "— too expensive for the live account today (tracked anyway to prove the setup)\n") +
-        f"Plan: -30% stop on 15-min closes (-40% hard), recovery -15%, half off at +30%, "
-        f"step-trail from +10%, +100% target.\n"
+        f"Plan: -{SWING_STOP_PCT:.0%} stop on 15-min closes (-{SWING_HARD_STOP:.0%} hard), "
+        f"out after day 1 if never +{SWING_NOTWORK_PEAK:.0%} and down {SWING_NOTWORK_LOSS:.0%}, "
+        f"break-even at +10%, +10% locked at +20%, half off at +30%, +100% target.\n"
+        f"Looks like past winners: {_swing_similarity(_conds)[1]}\n"
         f"Week: {b['week'][wk]}/{SWING_PAPER_MAX_WEEK} | open {len(b['open'])}/{SWING_PAPER_MAX_OPEN}", b)
     return True
 
@@ -2782,6 +2956,10 @@ def _paper_close(b: dict, p: dict, bid: float, reason: str) -> dict:
                      "trimmed": bool(p.get("trimmed")), "ctx": p.get("ctx") or {}})
     except Exception as _je:
         log.warning(f"journal (paper) failed: {_je}")
+    try:
+        rec["lesson"] = _swing_lesson_text(rec, p)
+    except Exception as _le:
+        log.warning(f"lesson build failed: {_le}")
     stt = b["stats"]
     stt["n"] = int(stt.get("n") or 0) + 1
     stt["w" if res > 0 else "l"] = int(stt.get("w" if res > 0 else "l") or 0) + 1
@@ -2822,12 +3000,16 @@ def swing_paper_monitor():
         except Exception:
             dte = 99
         reason = None
-        if pnl <= -0.40:
-            reason = "hard stop -40% (resting GTC)"
+        if pnl <= -SWING_HARD_STOP:
+            reason = f"hard stop -{SWING_HARD_STOP:.0%} (resting GTC)"
         elif floor is not None and pnl <= float(floor):
             reason = f"trail floor {float(floor):+.0%} hit"
         elif new_bucket and pnl <= -SWING_STOP_PCT:
-            reason = "15-min close below -30%"
+            reason = f"15-min close below -{SWING_STOP_PCT:.0%}"
+        elif (str(p.get("entry_date") or "") < now.date().isoformat()
+              and p["peak"] < SWING_NOTWORK_PEAK and pnl <= -SWING_NOTWORK_LOSS):
+            reason = (f"not working — never reached +{SWING_NOTWORK_PEAK:.0%}, "
+                      f"down {pnl:.0%} after day 1")
         elif pnl >= SWING_TARGET_PCT:
             reason = "+100% target"
         elif dte <= 7:
@@ -2866,7 +3048,8 @@ def swing_paper_monitor():
                   f"({rec['setup']}) — {rec['reason']}\n"
                   f"${rec['entry']:.2f} → ${rec['exit']:.2f} | result **{rec['pct']:+.1%}** "
                   f"(peak {rec['peak']:+.0%}, {rec['days']} days)\n"
-                  f"Paper record: {stt['w']}W / {stt['l']}L | avg {stt['sum_pct'] / max(stt['n'], 1):+.1%} per trade", b)
+                  f"Paper record: {stt['w']}W / {stt['l']}L | avg {stt['sum_pct'] / max(stt['n'], 1):+.1%} per trade"
+                  + (("\n" + rec["lesson"]) if rec.get("lesson") else ""), b)
     if events:
         _paper_dm("\n".join(events), b)
 
@@ -2932,7 +3115,7 @@ def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
     fill = enter_trade(occ, qty)
     if not fill:
         return False
-    disaster = _tick(fill * (1 - 0.40))
+    disaster = _tick(fill * (1 - SWING_HARD_STOP))
     target   = _tick(fill * (1 + SWING_TARGET_PCT))
     oco_id, _ = place_oco_bracket(occ, fill, qty, trigger_override=disaster,
                                   target_override=target, tif="GTC")
@@ -2954,8 +3137,8 @@ def swing_execute_entry(ticker: str, direction: str, reason: str) -> bool:
         f"**Contract:** {_fmt_occ(occ)} (exp {exp})\n"
         f"✅ **Fill:** ${fill:.2f} × {qty} (${fill * 100 * qty:.0f} total)\n"
         f"**Target:** ${target:.2f} (+100%) — GTC bracket resting at broker\n"
-        f"**Risk plan:** -30% stop on 15-min candle CLOSES (noise-filtered) | "
-        f"recovery rule -15% | step-trail locks from +10% | "
+        f"**Risk plan:** -{SWING_STOP_PCT:.0%} stop on 15-min candle CLOSES | "
+        f"cut early if it never gets going | break-even at +10% | "
         f"**at +30% we auto-sell HALF** and let the rest run\n"
         f"Updates: 9:45 AM check-in + 3:45 PM pre-close + milestone alerts\n\n{reason}",
     )
@@ -6563,6 +6746,7 @@ def status():
         "swing_week_used":    _swing_week_count(),
         "swing_mode":         SWING_MODE,
         "swing_paper":        {"open": len(_paper_book()["open"]), **_paper_book()["stats"]},
+        "swing_learned_filters": [t for _, _, t in _swing_learned_filters()],
         "journal":            {"total": len(_journal()),
                                "unsaved": sum(1 for _r in _journal() if not _r.get("_p")),
                                "by_kind": {k: sum(1 for _r in _journal() if _r.get("kind") == k)
