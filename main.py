@@ -127,7 +127,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.15"
+APP_VERSION = "v14.16"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -310,6 +310,15 @@ DAY_ENGINE = os.environ.get("DAY_ENGINE", "rules").lower()            # rules | 
 DAY_CONTRACT_MODE = os.environ.get("DAY_CONTRACT_MODE", "itm").lower() # itm | cheap
 DAY_ITM_BUDGET_PCT = float(os.environ.get("DAY_ITM_BUDGET_PCT", "0.22"))
 DAY_ITM_MAX_DEPTH = int(os.environ.get("DAY_ITM_MAX_DEPTH", "2"))
+# v14.16 (Oct 27, Junior): AFFORDABLE contracts. Day contracts were running $5+
+# and good setups were skipped because only near-the-money strikes were checked.
+# Rule now: any strike from 2 in-the-money out to MAX_OTM_PCT, ask $1.00-$4.00
+# (hard max $4.00 = $400), IDEAL $1.00-$3.00, spread <= 7% of mid.
+DAY_PRICE_MIN   = float(os.environ.get("DAY_CONTRACT_MIN", "1.00"))
+DAY_PRICE_MAX   = float(os.environ.get("DAY_CONTRACT_MAX", "4.00"))
+DAY_IDEAL_MIN   = float(os.environ.get("DAY_IDEAL_MIN", "1.00"))
+DAY_IDEAL_MAX   = float(os.environ.get("DAY_IDEAL_MAX", "3.00"))
+DAY_SPREAD_MAX  = float(os.environ.get("DAY_SPREAD_MAX_MID", "0.07"))
 # v14.14 (Oct 6, Junior): NO fixed +20% target — winners run. The broker OCO
 # limit leg sits at a far "runner cap" (+100% default) and the step-trail does
 # the exiting. New env names on purpose so stale DAY_TARGET_PCT/DAY_LADDER
@@ -1328,12 +1337,17 @@ def _swing_budget_cap() -> float | None:
     return cap
 
 
-SWING_DELTA_MIN    = float(os.environ.get("SWING_DELTA_MIN", "0.35"))
+SWING_DELTA_MIN    = float(os.environ.get("SWING_AFFORD_DELTA_MIN", "0.25"))  # v14.16: was 0.35 — reach cheaper strikes
 SWING_DELTA_MAX    = float(os.environ.get("SWING_DELTA_MAX", "0.55"))
 SWING_DELTA_TARGET = float(os.environ.get("SWING_DELTA_TARGET", "0.45"))
 SWING_PICK_DTE_MIN = int(os.environ.get("SWING_PICK_DTE_MIN", "30"))
 SWING_PICK_DTE_MAX = int(os.environ.get("SWING_PICK_DTE_MAX", "60"))
-SWING_PAPER_PREMIUM_MAX = float(os.environ.get("SWING_PAPER_PREMIUM_MAX", "15.00"))
+SWING_PAPER_PREMIUM_MAX = float(os.environ.get("SWING_PAPER_PREMIUM_MAX", "15.00"))  # v14.16: no longer used
+# v14.16 (Oct 27, Junior): swing contracts were $11.85 — unaffordable. Hard max
+# $7.00 ($700) for paper AND live; IDEAL $3.00-$5.00 preferred; spread <= 7%.
+SWING_HARD_MAX     = float(os.environ.get("SWING_CONTRACT_MAX", "7.00"))
+SWING_IDEAL_MIN    = float(os.environ.get("SWING_IDEAL_MIN", "3.00"))
+SWING_IDEAL_MAX    = float(os.environ.get("SWING_IDEAL_MAX", "5.00"))
 
 
 def _norm_cdf(x: float) -> float:
@@ -1424,7 +1438,7 @@ def swing_select_contract(ticker: str, direction: str, diag: dict | None = None,
     reasons = {"no_quote": 0, "delta_out": 0, "over_band_max": 0, "over_budget": 0,
                "wide_spread": 0, "under_band_min": 0}
     samples = {k: [] for k in reasons}
-    pmax = SWING_PREMIUM_MAX if enforce_budget else max(SWING_PREMIUM_MAX, SWING_PAPER_PREMIUM_MAX)
+    pmax = SWING_HARD_MAX   # v14.16: $7 cap applies to paper tests too
     d.update(ticker=ticker, direction=direction, reasons=reasons, rejected_samples=samples,
              band=[SWING_PREMIUM_MIN, pmax], max_spread_pct=SWING_MAX_SPREAD,
              delta_band=[SWING_DELTA_MIN, SWING_DELTA_MAX], otm_cap_pct=SWING_MAX_OTM)
@@ -1509,7 +1523,9 @@ def swing_select_contract(ticker: str, direction: str, diag: dict | None = None,
                     if why != "delta_out" or (dl is not None and abs(dl - SWING_DELTA_TARGET) < 0.15):
                         samples[why] = (samples[why] + [row])[-2:]
                     continue
-                score = abs(dl - SWING_DELTA_TARGET) + abs(dte - mid_dte) / 300.0
+                in_ideal = SWING_IDEAL_MIN <= ask <= SWING_IDEAL_MAX
+                score = (0.0 if in_ideal else 1.0) + abs(dl - SWING_DELTA_TARGET) + abs(dte - mid_dte) / 300.0
+                row["band"] = "ideal" if in_ideal else "affordable"
                 if best is None or score < best[0]:
                     best = (score, row)
         if best:
@@ -1532,7 +1548,7 @@ def _swing_diag_line(d: dict) -> str:
     """One readable line explaining a failed contract search."""
     r = d.get("reasons") or {}
     bits = []
-    lbl = {"over_band_max": "over $" + format(SWING_PREMIUM_MAX, ".2f") + " band",
+    lbl = {"over_band_max": "over $" + format(SWING_HARD_MAX, ".2f") + " max",
            "over_budget": "over budget (max ~$" + format(d.get("budget_cap_per_contract") or 0, ".2f") + "/contract)",
            "wide_spread": "spread > " + format(SWING_MAX_SPREAD, ".0%") + " of mid",
            "no_quote": "no quote", "under_band_min": "under $" + format(SWING_PREMIUM_MIN, ".2f"),
@@ -1573,7 +1589,7 @@ SWING_MAX_OTM      = float(os.environ.get("SWING_OTM_CAP_PCT", "0.25"))   # v14.
 # (top 3 only, #daily-watchlist), simulated trades + management by DM only.
 SWING_MODE         = os.environ.get("SWING_MODE", "paper").lower()          # paper | live
 SWING_WATCHLIST_N  = int(os.environ.get("SWING_WATCHLIST_N", "3"))
-SWING_MAX_SPREAD   = float(os.environ.get("SWING_MAX_SPREAD_MID", "0.10"))  # swings hold for weeks: 10% of mid ok
+SWING_MAX_SPREAD   = float(os.environ.get("SWING_SPREAD_MAX_MID", "0.07"))  # v14.16: 7% of mid
 
 # step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
 SWING_LADDER = [(0.10, 0.02), (0.15, 0.05), (0.20, 0.15), (0.30, 0.25),
@@ -3025,41 +3041,71 @@ _last_itm_reason = ""
 
 
 def _select_itm(ticker: str, direction: str, strikes: list, strike_map: dict, spot: float) -> tuple:
-    """v14.13: near-the-money selection. Tries the deepest in-the-money strike
-    (up to DAY_ITM_MAX_DEPTH) that fits the per-trade budget, then shallower,
-    then at-the-money. Liquidity rule (spread <= MAX_SPREAD_MID) kept. Nothing
-    affordable -> pass with an honest reason (TSLA at small balances)."""
+    """v14.16 AFFORDABLE selection (replaces v14.13 near-the-money-only).
+    Scans every strike from DAY_ITM_MAX_DEPTH in-the-money out to MAX_OTM_PCT
+    out-of-the-money. A contract qualifies when: ask DAY_PRICE_MIN-DAY_PRICE_MAX
+    ($1-$4), spread <= DAY_SPREAD_MAX (7%) of mid, and it fits the per-trade
+    budget. Pick order: (1) IDEAL band $1-$3 -> the one closest to the money
+    (moves most with the stock); (2) $3-$4 -> the cheapest. Nothing -> pass."""
     global _last_selection_tier, _last_itm_reason
     _last_selection_tier = None
     _last_itm_reason = ""
     budget = (_sizing_cash() or 0) * DAY_ITM_BUDGET_PCT
-    if direction == "call":
-        near = sorted([k for k in strikes if k <= spot * 1.003], reverse=True)[:DAY_ITM_MAX_DEPTH + 1]
-    else:
-        near = sorted([k for k in strikes if k >= spot * 0.997])[:DAY_ITM_MAX_DEPTH + 1]
-    cheapest = None
-    for k in reversed(near):          # deepest in-the-money first
+    call = direction == "call"
+    itm_side = sorted([k for k in strikes if (k < spot if call else k > spot)],
+                      key=lambda k: abs(k - spot))[:DAY_ITM_MAX_DEPTH]
+    otm_side = [k for k in strikes if (k >= spot if call else k <= spot)
+                and abs(k - spot) / spot <= MAX_OTM_PCT]
+    scan = sorted(set(itm_side + otm_side), key=lambda k: abs(k - spot))
+    quotes = _option_quotes_bulk([strike_map[k] for k in scan]) if scan else {}
+    ideal, upper = [], []
+    n_exp, n_spread, n_cheap, n_budget, n_noq = 0, 0, 0, 0, 0
+    for k in scan:
         occ = strike_map[k]
-        q = _live_option_quote(occ)
+        q = quotes.get(occ.replace(" ", "")) or _live_option_quote(occ)
         if not q:
+            n_noq += 1
             continue
         ask = float(q.get("ask") or 0)
         bid = float(q.get("bid") or 0)
-        if ask <= 0:
+        if ask <= 0 or bid <= 0:
+            n_noq += 1
             continue
         mid = (ask + bid) / 2.0
-        if mid <= 0 or (ask - bid) / mid > MAX_SPREAD_MID:
+        if ask > DAY_PRICE_MAX:
+            n_exp += 1
             continue
-        cheapest = ask if cheapest is None else min(cheapest, ask)
-        if ask * 100 <= budget:
-            itm = (spot - k) if direction == "call" else (k - spot)
-            _last_selection_tier = (f"In-the-money ${itm:.2f}" if itm > 0.01 else "At-the-money")
-            log.info(f"ITM pick {occ} ask {ask} ({_last_selection_tier}, budget ${budget:.0f})")
-            return occ, k, ask
-    _last_itm_reason = (f"cheapest near-the-money {ticker} contract (${(cheapest or 0) * 100:.0f}) is "
-                        f"above the per-trade budget (${budget:.0f})" if cheapest else
-                        f"no liquid near-the-money {ticker} contract")
-    log.info("ITM selection: " + _last_itm_reason)
+        if ask < DAY_PRICE_MIN:
+            n_cheap += 1
+            continue
+        if (ask - bid) / mid > DAY_SPREAD_MAX:
+            n_spread += 1
+            continue
+        if ask * 100 > budget:
+            n_budget += 1
+            continue
+        row = (abs(k - spot), k, occ, ask)
+        (ideal if DAY_IDEAL_MIN <= ask <= DAY_IDEAL_MAX else upper).append(row)
+    pick, band = None, ""
+    if ideal:
+        pick = min(ideal)                       # closest to the money inside $1-$3
+        band = f"Ideal ${DAY_IDEAL_MIN:.2f}-${DAY_IDEAL_MAX:.2f}"
+    elif upper:
+        pick = min(upper, key=lambda r: r[3])   # cheapest $3-$4
+        band = f"Upper ${DAY_IDEAL_MAX:.2f}-${DAY_PRICE_MAX:.2f}"
+    if pick:
+        _, k, occ, ask = pick
+        itm = (spot - k) if call else (k - spot)
+        where = (f"${itm:.2f} in-the-money" if itm > 0.01 else
+                 "at-the-money" if itm > -0.01 else f"{-itm / spot:.1%} out-of-the-money")
+        _last_selection_tier = f"{band} · {where}"
+        log.info(f"DAY pick {occ} ask {ask} ({_last_selection_tier}, budget ${budget:.0f})")
+        return occ, k, ask
+    _last_itm_reason = (f"no {ticker} contract between ${DAY_PRICE_MIN:.2f}-${DAY_PRICE_MAX:.2f} with spread "
+                        f"<= {DAY_SPREAD_MAX:.0%} within {MAX_OTM_PCT:.0%} of the stock "
+                        f"({n_exp} over ${DAY_PRICE_MAX:.2f}, {n_cheap} under ${DAY_PRICE_MIN:.2f}, "
+                        f"{n_spread} wide spread, {n_budget} over ${budget:.0f} budget)")
+    log.info("DAY selection: " + _last_itm_reason)
     return None, None, None
 
 
