@@ -50,6 +50,16 @@ log.info(f"TPP Trading Server v5.0 — PID {os.getpid()}")
 
 ET = pytz.timezone("America/New_York")
 
+
+def _et_utc(day: str, hh: int, mm: int, ss: int = 0) -> str:
+    """v14.18 DST-SAFE: ET wall-clock time on `day` -> UTC ISO 'Z' string.
+    Before v14.18 these were hardcoded EDT offsets (13:30Z = 9:30), so after
+    the Nov 1 clock change the session started at 8:30 AM ET: VWAP/EMAs
+    absorbed an hour of pre-market and the pre-market range stopped at 8:29."""
+    _d = date.fromisoformat(day)
+    _loc = ET.localize(datetime(_d.year, _d.month, _d.day, hh, mm, ss))
+    return _loc.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS & ENV
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.17"
+APP_VERSION = "v14.18"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -388,6 +398,9 @@ CHOP_MAX_EMA_CROSSES = int(os.environ.get("CHOP_MAX_EMA_CROSSES", "2"))  # in la
 
 DROUGHT_DAYS = int(os.environ.get("DROUGHT_DAYS", "2"))
 DROUGHT_SIZE_SCALE = float(os.environ.get("DROUGHT_SIZE_SCALE", "0.5"))
+# v14.18: drought mode used to LOOSEN the setup (shorter trend, chop gate off)
+# to force a trade. Off by default now — a drought only shrinks size.
+DROUGHT_LOOSEN = os.environ.get("DROUGHT_LOOSEN", "0") == "1"
 
 
 def _drought_sessions() -> int:
@@ -707,7 +720,7 @@ def _render_chart_png(ticker: str, highlight: str = "") -> bytes | None:
             try:
                 _day = datetime.now(ET).strftime("%Y-%m-%d")
                 for _feed in ("sip", "iex", None):
-                    _p = {"timeframe": "1Min", "start": _day + "T08:00:00Z", "limit": 1000}
+                    _p = {"timeframe": "1Min", "start": _et_utc(_day, 4, 0), "limit": 1000}
                     if _feed:
                         _p["feed"] = _feed
                     _r = requests.get(
@@ -1595,10 +1608,14 @@ SWING_MAX_OTM      = float(os.environ.get("SWING_OTM_CAP_PCT", "0.25"))   # v14.
 # (top 3 only, #daily-watchlist), simulated trades + management by DM only.
 SWING_MODE         = os.environ.get("SWING_MODE", "paper").lower()          # paper | live
 SWING_WATCHLIST_N  = int(os.environ.get("SWING_WATCHLIST_N", "3"))
+SWING_LEARN_MIN_TRADES = int(os.environ.get("SWING_LEARN_MIN_TRADES", "20"))  # v14.18
+SWING_WL_SCAN_MAX  = int(os.environ.get("SWING_WL_SCAN_MAX", "8"))   # v14.18: ranked names priced for the watchlist
 SWING_MAX_SPREAD   = float(os.environ.get("SWING_SPREAD_MAX_MID", "0.07"))  # v14.16: 7% of mid
 
 # step trail: peak threshold -> locked floor (software cancel-replace on GTC stop)
-SWING_LADDER = [(0.10, 0.00), (0.15, 0.05), (0.20, 0.10), (0.30, 0.25),
+# v14.18: early rungs tightened (+10->+5, +15->+10, +20->+15). Paper winners were
+# giving back nearly everything below +20% (NFLX +20%->+1.2%, AAPL +10%->+1.7%).
+SWING_LADDER = [(0.10, 0.05), (0.15, 0.10), (0.20, 0.15), (0.30, 0.25),
                 (0.40, 0.35), (0.50, 0.50), (0.60, 0.60), (0.70, 0.70),
                 (0.80, 0.80), (0.90, 0.90)]
 SWING_MILESTONES = [0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 1.00]
@@ -2041,7 +2058,24 @@ def swing_watchlist_job():
              and _swing_regime_ok(lv["direction"], spy)]
     cands.sort(key=lambda lv: (lv["proximity"], -lv["strength"]))
     lines = []
-    _top = cands[:SWING_WATCHLIST_N]
+    # v14.18: price contracts while ranking — only names with a usable contract
+    # (paper: $7 max, live: also the account budget) take a watchlist slot.
+    _top, _picks = [], {}
+    for lv in cands[:max(SWING_WL_SCAN_MAX, SWING_WATCHLIST_N)]:
+        if len(_top) >= SWING_WATCHLIST_N:
+            break
+        _dg0 = {}
+        try:
+            _o0, _k0, _a0, _e0 = swing_select_contract(lv["ticker"], lv["direction"], _dg0,
+                                                       enforce_budget=(SWING_MODE != "paper"))
+        except Exception as _se:
+            log.warning(f"SWING watchlist pricing {lv['ticker']} failed: {_se}")
+            _o0 = None
+        if _o0:
+            _top.append(lv)
+            _picks[lv["ticker"]] = (_o0, _a0, _dg0)
+        else:
+            log.info(f"SWING watchlist skip {lv['ticker']}: {_swing_diag_line(_dg0)}")
     with _state_lock:
         _wls = load_state()
         _wls["swing_wl"] = {"date": datetime.now(ET).date().isoformat(),
@@ -2051,7 +2085,11 @@ def swing_watchlist_job():
         tag = "🔥 TRIGGERED" if lv["trigger"] else f"{lv['proximity']:.1%} from trigger"
         lines.append(f"**{lv['ticker']}** ${lv['px']:.2f} — {lv['trend'].upper()}TREND · "
                      f"{lv['setup']} ({tag})\n  {lv['plan']}")
-    if not lines:
+    if not lines and cands:
+        body = (f"{len(cands)} swing setup(s) lined up with the trend today, but none had a "
+                f"contract inside our rules (max ${SWING_HARD_MAX:.2f}, liquid, right delta). "
+                f"We don't force it.")
+    elif not lines:
         trend_n = sum(1 for lv in levels if lv["trend"] != "none")
         body = (f"No clean swing setups today — {trend_n}/{len(levels)} tickers trending, none "
                 f"lined up with the market direction (SPY "
@@ -2064,8 +2102,7 @@ def swing_watchlist_job():
     try:
         _rep = []
         for lv in _top:
-            _dg = {}
-            _o, _k, _a, _e = swing_select_contract(lv["ticker"], lv["direction"], _dg)
+            _o, _a, _dg = _picks.get(lv["ticker"], (None, None, {}))
             if _o:
                 _pk = _dg.get("pick") or {}
                 _rep.append(f"**{lv['ticker']} {lv['direction'].upper()}** → {_fmt_occ(_o)} ask ${_a:.2f} "
@@ -2755,6 +2792,10 @@ def _swing_learned_filters() -> list:
     if not SWING_LEARN:
         return []
     rows = _swing_learn_rows()
+    # v14.18: 3-vs-4-trade "lessons" were blocking setups (AAPL/BAC/NVDA). No
+    # learned filter applies until the journal holds SWING_LEARN_MIN_TRADES trades.
+    if len(rows) < SWING_LEARN_MIN_TRADES:
+        return []
     found = []
     for cond in _COND_LABEL:
         yes = [p for c, p in rows if c.get(cond) is True]
@@ -3890,7 +3931,17 @@ def monitor_open_position():
         try:
             _live_syms = {str(p.get("symbol", "")).replace(" ", "")
                           for p in _tt_open_option_positions()}
+            _explained = False
             if occ.replace(" ", "") not in _live_syms:
+                # v14.18: our own resting stop/OCO filled -> normal exit path below
+                try:
+                    if pos.get("oco_id"):
+                        _explained = bool(_complex_order_fill(pos["oco_id"])[0])
+                    if not _explained and pos.get("stop_order_id"):
+                        _explained = str(_tt_order_status(pos["stop_order_id"])[0]).lower() == "filled"
+                except Exception:
+                    _explained = False
+            if occ.replace(" ", "") not in _live_syms and not _explained:
                 _real_px, _rq = _tt_actual_exit_fill(occ)
                 _bid_now = float((_live_option_quote(occ) or {}).get("bid") or 0)
                 _est_px  = _real_px or _bid_now or float(pos.get("floor_trigger") or fill_price)
@@ -3900,19 +3951,19 @@ def monitor_open_position():
                 log.critical(f"BROKER-TRUTH: {occ} no longer held at broker — "
                              f"reconciling (est exit ~${_est_px:.2f})")
                 _tt_sweep_closing_orders(occ)
+                _hd = ("🔒 **PROFIT LOCKED — " if _pnl_p >= 0 else "🛑 **STOP HIT — ")
                 post_to_discord(
                     "day-trade-signals",
-                    f"⚖️ **{_fmt_occ(occ)} — position closed at the broker.**\n"
-                    f"Our records showed it open; the broker is ground truth and it's "
-                    f"closed. If you followed this trade, confirm your own exit. "
-                    f"Exit ${_est_px:.2f} ({_pnl_p:+.1%}, {_est_tag}). Recap follows.",
+                    f"{_hd}{_fmt_occ(occ)}**\n"
+                    f"Position CLOSED at the broker @ ${_est_px:.2f} ({_pnl_p:+.1%}). "
+                    f"If you followed this trade, close your contracts NOW if you haven't already.",
                 )
                 post_to_discord(
                     "day-trade-signals",
                     f"{'✅' if _pnl_p >= 0 else '❌'} **{_fmt_occ(occ)} CLOSED** — "
-                    f"BROKER RECONCILE (fill detected at broker)\n"
+                    f"{'PROFIT LOCKED' if _pnl_p >= 0 else 'STOP LOSS'} (broker)\n"
                     f"Entry: ${fill_price:.2f} → Exit: ${_est_px:.2f} ({_est_tag})\n"
-                    f"P&L: {_pnl_p:+.1%} (${_pnl_d:+.0f} on {_q} contract(s))",
+                    f"P&L: {_pnl_p:+.1%} ({'+' if _pnl_d >= 0 else '-'}${abs(_pnl_d):.0f} total on {_q} contract(s))",
                 )
                 send_emergency_dm(
                     f"BROKER-TRUTH reconcile: {occ} was closed at the broker while "
@@ -4546,10 +4597,10 @@ def _persist_structure():
 
 
 def _premarket_levels(ticker: str, day: str | None = None) -> dict:
-    """Pre-market high/low from 1-min bars 04:00-09:29 ET (EDT offsets)."""
+    """Pre-market high/low from 1-min bars 04:00-09:29 ET (DST-safe, v14.18)."""
     day = day or datetime.now(ET).strftime("%Y-%m-%d")
-    start = day + "T08:00:00Z"
-    end   = day + "T13:29:59Z"
+    start = _et_utc(day, 4, 0)
+    end   = _et_utc(day, 9, 29, 59)
     for feed in ("sip", "iex", None):
         try:
             params = {"timeframe": "1Min", "start": start, "end": end, "limit": 1000}
@@ -4748,7 +4799,7 @@ def _rules_decision(ticker: str) -> dict | None:
     else:
         e8, e21 = _ema_list(C, 8), _ema_list(C, 21)
     i = len(C) - 1
-    need = max(6, PULLBACK_TREND_BARS - (2 if _drought_mode() else 0))
+    need = max(6, PULLBACK_TREND_BARS - (2 if (DROUGHT_LOOSEN and _drought_mode()) else 0))
     above = sum(1 for k in range(i - 12, i) if C[k] > VW[k])
     below = 12 - above
     direction = None
@@ -4759,7 +4810,9 @@ def _rules_decision(ticker: str) -> dict | None:
         if max(C[i - 2:i]) >= VW[i - 1] * 0.9985 and C[i] < C[i - 1] and C[i] < VW[i]:
             direction = "put"
     if not direction:
-        return _retest_decision(ticker, st, cs, C, VW, e8, e21, i)
+        # v14.18: break & retest is PAPER-ONLY (shadow scorecard) unless RETEST_LIVE=1.
+        # Oct 13-Nov 6 live record: 2W/4L, -$368 of the -$493 total.
+        return _retest_decision(ticker, st, cs, C, VW, e8, e21, i) if RETEST_LIVE else None
     side = "above" if direction == "call" else "below"
     desc = (f"{ticker} trending {side} VWAP all morning, pulled back to VWAP (${VW[i]:.2f}) and "
             f"{'bounced' if direction == 'call' else 'rejected'} — {'calls' if direction == 'call' else 'puts'} "
@@ -4771,6 +4824,7 @@ def _rules_decision(ticker: str) -> dict | None:
 
 
 _RETEST_FIRED: dict = {}
+RETEST_LIVE = os.environ.get("RETEST_LIVE", "0") == "1"   # v14.18: off = paper only
 RETEST_TOUCH = float(os.environ.get("RETEST_TOUCH_PCT", "0.001"))   # retest = within 0.1% of the level
 RETEST_FAIL = float(os.environ.get("RETEST_FAIL_PCT", "0.002"))     # a close 0.2% back through = failed break
 
@@ -5100,7 +5154,7 @@ def _gate_entry_quality(ticker: str, direction: str, now_et=None, skip_chop: boo
         if direction == "put" and e8 >= e21:
             return False, f"trend gate — puts need 8 EMA below 21 EMA ({e8} vs {e21})"
     q = _chop_metrics(cs)
-    if q.get("chop") and not _drought_mode() and not skip_chop:
+    if q.get("chop") and not (DROUGHT_LOOSEN and _drought_mode()) and not skip_chop:
         return False, (f"chop gate — price flipped across VWAP {q.get('vwap_flips')}x (last 20 min) / "
                        f"8-21 EMA crossed {q.get('ema_crosses')}x (last 15 min); no clean trend")
     return True, ""
@@ -5225,7 +5279,7 @@ def _structure_context(ticker: str, pmh, pml) -> str:
                      + ("ABOVE (calls side)" if _lc > st["vwap"] else "BELOW (puts side)")
                      + " | VWAP flips last 20 bars: " + str(_q.get("vwap_flips"))
                      + " | 8/21 EMA crosses last 15 bars: " + str(_q.get("ema_crosses"))
-                     + ((" — CHOP" + ("" if _drought_mode() else ", NO_TRADE")) if _q.get("chop") else ""))
+                     + ((" — CHOP" + ("" if (DROUGHT_LOOSEN and _drought_mode()) else ", NO_TRADE")) if _q.get("chop") else ""))
         except Exception:
             pass
     try:
@@ -5774,7 +5828,7 @@ def _ingest_new_bars(ticker: str, pmh, pml) -> dict | None:
     tick is slow or skipped. Returns the newest candle."""
     st = _mkt_structure.get(ticker)
     day = datetime.now(ET).strftime("%Y-%m-%d")
-    floor = day + "T13:30:00Z"  # 9:30 EDT — session bars only
+    floor = _et_utc(day, 9, 30)  # 9:30 ET, DST-safe (v14.18) — session bars only
     if st and st.get("candles"):
         # purge any pre-open seed candles (e.g. from /structure-test hits)
         st["candles"] = [c for c in st["candles"] if str(c.get("t") or "") >= floor]
@@ -7014,8 +7068,8 @@ def replay_test():
     # Never run replays inside the live scanning window: replay swaps live
     # session state and would race the scanner thread.
     _nw = datetime.now(ET)
-    if _nw.strftime("%Y-%m-%d") != day and (9, 20) <= (_nw.hour, _nw.minute) <= (10, 35) and _nw.weekday() < 5:
-        return jsonify({"error": "replay disabled during live window (9:20-10:35 ET)"}), 409
+    if _nw.strftime("%Y-%m-%d") != day and (9, 20) <= (_nw.hour, _nw.minute) <= (11, 35) and _nw.weekday() < 5:
+        return jsonify({"error": "replay disabled during live window (9:20-11:35 ET)"}), 409
 
     # prior-day PMH/PML for that date
     p_start = (date.fromisoformat(day) - timedelta(days=7)).isoformat()
@@ -7034,7 +7088,7 @@ def replay_test():
         except Exception:
             pass
 
-    bars = _fetch_1min_bars(ticker, day + "T13:24:00Z", day + "T14:31:00Z", limit=200)
+    bars = _fetch_1min_bars(ticker, _et_utc(day, 9, 30), _et_utc(day, 11, 31), limit=200)
     if not bars:
         return jsonify({"error": "no bars for that date/ticker"}), 404
 
@@ -7045,7 +7099,8 @@ def replay_test():
             c = {"open": b["o"], "high": b["h"], "low": b["l"],
                  "close": b["c"], "volume": b["v"], "t": b.get("t")}
             st = _update_structure(ticker, c, pmh, pml, day=day)
-            row = {"t": b.get("t"), "close": b["c"], "volume": b["v"]}
+            row = {"t": b.get("t"), "open": b["o"], "high": b["h"], "low": b["l"],
+                   "close": b["c"], "volume": b["v"], "vwap": c.get("vwap")}
             if use_claude and c_from <= _bi < c_to:
                 alert = {"ticker": ticker, "alert_type": "REPLAY_1MIN",
                          "close": c["close"], "open": c["open"], "high": c["high"],
