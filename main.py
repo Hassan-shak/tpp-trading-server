@@ -137,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.18"
+APP_VERSION = "v14.19"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -230,12 +230,22 @@ def _stop_pct() -> float:
     return _risk()["stop"]
 
 
+ALLOW_TRADE_DATES = {d.strip() for d in os.environ.get("ALLOW_TRADE_DATES", "").split(",") if d.strip()}
+
+
+def _auto_no_trade_dates() -> set:
+    """v14.19: week-ahead scan benches, minus any ALLOW_TRADE_DATES override."""
+    try:
+        return set(load_state().get("auto_no_trade_dates") or []) - ALLOW_TRADE_DATES
+    except Exception:
+        return set()
+
+
 def _no_trade_today() -> bool:
     if datetime.now(ET).date().isoformat() in NO_TRADE_DATES:
         return True
     try:
-        return datetime.now(ET).date().isoformat() in set(
-            load_state().get("auto_no_trade_dates") or [])
+        return datetime.now(ET).date().isoformat() in _auto_no_trade_dates()
     except Exception:
         return False
 
@@ -416,7 +426,7 @@ def _drought_sessions() -> int:
                 _s2.setdefault("last_day_entry_date", _today.isoformat())
                 _commit(_s2)
             return 0
-        _benched = NO_TRADE_DATES | set(_s.get("auto_no_trade_dates") or [])
+        _benched = NO_TRADE_DATES | _auto_no_trade_dates()
         d = date.fromisoformat(_last) + timedelta(days=1)
         n = 0
         while d < _today:
@@ -5415,17 +5425,45 @@ def _extract_json_object(text: str) -> dict:
     raise json.JSONDecodeError("unbalanced JSON object", t[:50] or " ", 0)
 
 
+_FED_RX = re.compile(r"\b(fed|fomc|warsh|powell|chair|minutes|federal reserve)\b", re.I)
+_DATA_RX = re.compile(r"\b(cpi|ppi|pce|gdp|payroll|nfp|jobs report|retail sales|inflation data)\b", re.I)
+
+
+def _scan_week_monday() -> date:
+    """Monday of the trading week the scan covers: next week on Sat/Sun,
+    the current week on Mon-Fri (v14.19: scan can re-run after a restart)."""
+    d = datetime.now(ET).date()
+    return d + timedelta(days=7 - d.weekday()) if d.weekday() >= 5 else d - timedelta(days=d.weekday())
+
+
+def _fed_event_dates(raw) -> list:
+    """v14.19: keep only Fed-event dates. Objects need a Fed event and no
+    data-release wording; bare date strings (old format) are dropped if they
+    are a CPI day. Day trading is only benched for the Fed."""
+    out = []
+    for x in (raw or []):
+        if isinstance(x, dict):
+            d, ev = str(x.get("date") or ""), str(x.get("event") or "")
+            if len(d) == 10 and _FED_RX.search(ev) and not _DATA_RX.search(ev):
+                out.append(d)
+            else:
+                log.info(f"week scan: not benching {d} ({ev[:80]}) — not a Fed event")
+        elif isinstance(x, str) and len(x) == 10 and x not in CPI_DATES:
+            out.append(x)
+    return sorted(set(out))
+
+
 def _week_ahead_scan() -> dict | None:
     """Sunday job: Claude + web search finds the coming week's high-volatility
     calendar — Fed Chair speeches, FOMC events not on the hardcoded list,
     CPI/PPI/PCE/GDP releases, and earnings dates for our tickers. Returns
     parsed JSON or None. Best-effort; failures leave the week unchanged."""
     try:
-        from datetime import timedelta
-        _mon = (datetime.now(ET).date() + timedelta(days=1))
+        _mon = _scan_week_monday()
+        _today_d = datetime.now(ET).date()
         prompt = (
-            f"Today is Sunday {datetime.now(ET).date().isoformat()}. Research the US market "
-            f"week starting Monday {_mon.isoformat()}. Find with web search:\n"
+            f"Today is {_today_d.strftime('%A')} {_today_d.isoformat()}. Research the US market "
+            f"week starting Monday {_mon.isoformat()} (Mon-Fri). Find with web search:\n"
             f"1. Any Federal Reserve Chair (currently Kevin Warsh) speaking engagements, "
             f"testimony, or symposium appearances, with dates.\n"
             f"2. Any FOMC meetings/minutes this week.\n"
@@ -5433,7 +5471,10 @@ def _week_ahead_scan() -> dict | None:
             f"4. Earnings report dates THIS week AND NEXT week for: "
             f"{', '.join(sorted(set(TICKERS) | set(SWING_TICKERS)))}.\n"
             f"Respond with ONLY a JSON object, no prose:\n"
-            f'{{"no_trade_dates": ["YYYY-MM-DD", ...],   // days with Fed-chair speeches or FOMC events\n'
+            f'{{"no_trade_dates": [{{"date": "YYYY-MM-DD", "event": "what Fed event"}}, ...],\n'
+            f"   // ONLY Fed Chair speeches/testimony, FOMC decision days, FOMC minutes.\n"
+            f"   // NEVER list CPI, PPI, PCE, GDP, jobs or other data-release days here —\n"
+            f"   // those are normal trading days for us.\n"
             f' "earnings": ["TICKER:YYYY-MM-DD", ...],   // our tickers only\n'
             f' "week_summary": "2-3 sentences for the community on the week ahead"}}'
         )
@@ -5452,6 +5493,55 @@ def _week_ahead_scan() -> dict | None:
     except Exception as e:
         log.warning(f"week-ahead scan failed (non-fatal): {e}")
         return None
+
+
+_week_rescan_last = [0.0]
+
+
+def _run_week_scan(announce: bool = True):
+    """v14.19: week-ahead scan + apply. announce=True (Sunday 6 PM) also posts the
+    member brief; False (restart re-run) DMs only. Benches ONLY Fed events."""
+    today_s = datetime.now(ET).date().isoformat()
+    log.info(f"JOB: week-ahead scan starting (announce={announce})")
+    _scan = _week_ahead_scan()
+    if not _scan:
+        send_emergency_dm(
+            "Week-ahead scan could not fetch results — set this week's dates "
+            "manually via NO_TRADE_DATES / EARNINGS_BLACKOUT env if needed.",
+            prefix="⚠️ **TPP WEEK-AHEAD SCAN FAILED**",
+        )
+        return
+    _new_dates = _fed_event_dates(_scan.get("no_trade_dates"))
+    _new_earn = [e.strip().upper() for e in (_scan.get("earnings") or [])
+                 if isinstance(e, str) and ":" in e]
+    with _state_lock:
+        _ws = load_state()
+        _ws["auto_no_trade_dates"] = sorted(set(
+            [d for d in (_ws.get("auto_no_trade_dates") or []) if d >= today_s] + _new_dates))
+        _ws["auto_earnings_blackout"] = sorted(set(
+            [e for e in (_ws.get("auto_earnings_blackout") or [])
+             if e.split(":")[-1] >= today_s] + _new_earn))
+        _ws["week_scan_key"] = _scan_week_monday().isoformat()
+        _commit(_ws)
+    if announce:
+        _summary = str(_scan.get("week_summary") or "").strip()
+        post_to_discord(
+            "daily-watchlist",
+            "📅 **Week Ahead — auto-scanned Sunday**\n"
+            + (_summary + "\n" if _summary else "")
+            + (("🛑 No-trade days this week (Fed events): " + ", ".join(_new_dates) + "\n")
+               if _new_dates else "✅ No Fed events this week — day trading every session.\n")
+            + (("📊 Earnings blackouts: " + ", ".join(_new_earn))
+               if _new_earn else "📊 No earnings for our tickers this week."),
+        )
+    send_emergency_dm(
+        ("📅 Week-ahead scan done" if announce else "♻️ Week-ahead scan re-run after a restart")
+        + ". Fed no-trade days: " + (", ".join(_new_dates) or "none")
+        + " | Earnings blackouts: " + (", ".join(_new_earn) or "none")
+        + "\nData-release days (CPI/PPI/etc.) are NOT benched for day trades."
+        + "\nUn-bench a scanned day: ALLOW_TRADE_DATES env. Add one: NO_TRADE_DATES env.",
+        prefix="🗓️ **TPP WEEK-AHEAD SCAN**",
+    )
 
 
 def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: str | None = None) -> dict | None:
@@ -5964,45 +6054,17 @@ def _scheduler_loop():
                     and load_state().get("last_week_scan_date") != today_s):
                 with _state_lock:
                     _ws = load_state(); _ws["last_week_scan_date"] = today_s; _commit(_ws)
-                log.info("JOB: Sunday week-ahead scan starting")
-                _scan = _week_ahead_scan()
-                if _scan:
-                    _new_dates = [d for d in (_scan.get("no_trade_dates") or [])
-                                  if isinstance(d, str) and len(d) == 10]
-                    _new_earn  = [e.strip().upper() for e in (_scan.get("earnings") or [])
-                                  if isinstance(e, str) and ":" in e]
-                    with _state_lock:
-                        _ws = load_state()
-                        _ws["auto_no_trade_dates"] = sorted(set(
-                            [d for d in (_ws.get("auto_no_trade_dates") or [])
-                             if d >= today_s] + _new_dates))
-                        _ws["auto_earnings_blackout"] = sorted(set(
-                            [e for e in (_ws.get("auto_earnings_blackout") or [])
-                             if e.split(":")[-1] >= today_s] + _new_earn))
-                        _commit(_ws)
-                    _summary = str(_scan.get("week_summary") or "").strip()
-                    post_to_discord(
-                        "daily-watchlist",
-                        "📅 **Week Ahead — auto-scanned Sunday**\n"
-                        + (_summary + "\n" if _summary else "")
-                        + (("🛑 No-trade days this week: " + ", ".join(_new_dates) + "\n")
-                           if _new_dates else "✅ No Fed-chair events found this week.\n")
-                        + (("📊 Earnings blackouts: " + ", ".join(_new_earn))
-                           if _new_earn else "📊 No earnings for our tickers this week."),
-                    )
-                    send_emergency_dm(
-                        "📅 Week-ahead scan done. Auto no-trade: "
-                        + (", ".join(_new_dates) or "none")
-                        + " | Earnings blackouts: " + (", ".join(_new_earn) or "none")
-                        + "\nOverride anytime via NO_TRADE_DATES / EARNINGS_BLACKOUT env.",
-                        prefix="🗓️ **TPP WEEK-AHEAD SCAN**",
-                    )
-                else:
-                    send_emergency_dm(
-                        "Week-ahead scan could not fetch results — set this week's dates "
-                        "manually via NO_TRADE_DATES / EARNINGS_BLACKOUT env if needed.",
-                        prefix="⚠️ **TPP WEEK-AHEAD SCAN FAILED**",
-                    )
+                _run_week_scan(announce=True)
+            # v14.19: state lives in /tmp and every deploy/restart wipes it — the
+            # scan's Fed benches + earnings blackouts were silently lost. Re-run
+            # (DM only) when this week's scan is missing, outside market hours.
+            elif (load_state().get("week_scan_key") != _scan_week_monday().isoformat()
+                  and not (today.weekday() < 5 and dtime(9, 0) <= t <= dtime(16, 15))
+                  and not (today.weekday() == 5)
+                  and not (today.weekday() == 6 and t < dtime(20, 0))
+                  and time_module.time() - _week_rescan_last[0] > 1800):
+                _week_rescan_last[0] = time_module.time()
+                _run_week_scan(announce=False)
 
             # Skip everything on weekends and holidays
             is_trading_day = (
