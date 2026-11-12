@@ -137,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.19"
+APP_VERSION = "v14.20"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -452,6 +452,36 @@ def _day_loss_limit_hit() -> bool:
         return False
 
 
+# v14.20 (Nov 11, Junior): REVERSAL EXCEPTION. Nov 11 SPY: puts stopped out,
+# then SPY broke the high of day at 10:48, retested, and ran higher highs /
+# higher lows all morning while the one-loss bench had the scanner switched
+# off. After the first loss, ONE trade is still allowed: same ticker, opposite
+# direction, only on a confirmed break of the session high (calls) / low (puts)
+# as it stood at the moment of the loss, a retest that holds, and a push away
+# above/below VWAP with 8/21 EMA aligned. Normal size, normal window. When
+# that trade closes - win or lose - the day is over (2 losses = hard cap).
+REVERSAL_EXCEPTION = os.environ.get("REVERSAL_EXCEPTION", "1") == "1"
+REVERSAL_RETEST_PCT = float(os.environ.get("REVERSAL_RETEST_PCT", "0.0015"))  # retest zone above/below level
+REVERSAL_FAIL_PCT = float(os.environ.get("REVERSAL_FAIL_PCT", "0.002"))      # close this far back = break failed
+
+
+def _reversal_available(ticker: str | None = None) -> bool:
+    """True while the one reversal shot is armed and unused (and, if given, for this ticker)."""
+    if not REVERSAL_EXCEPTION:
+        return False
+    try:
+        s = load_state()
+        r = s.get("reversal")
+        if not isinstance(r, dict) or r.get("used"):
+            return False
+        if ticker and r.get("ticker") != ticker:
+            return False
+        res = s.get("today_results") or []
+        return sum(1 for x in res if not x.get("win")) == DAY_MAX_LOSSES
+    except Exception:
+        return False
+
+
 def _drought_mode() -> bool:
     return QUALITY_GATES and DROUGHT_DAYS > 0 and _drought_sessions() >= DROUGHT_DAYS
 
@@ -689,7 +719,39 @@ def record_trade_result(win: bool, ticker: str | None = None,
         "result": "win" if win else "loss",
         "time":   datetime.now(ET).isoformat(),
     })
+    _rev_post = None
+    try:
+        _nl = sum(1 for x in (s.get("today_results") or []) if not x.get("win"))
+        if (REVERSAL_EXCEPTION and not win and ticker and direction in ("call", "put")
+                and DAY_MAX_LOSSES > 0 and _nl == DAY_MAX_LOSSES and not s.get("reversal")):
+            _st = _mkt_structure.get(ticker) or {}
+            _rd = "call" if direction == "put" else "put"
+            _lvl = _st.get("day_high") if _rd == "call" else _st.get("day_low")
+            _cs = _st.get("candles") or []
+            if _lvl:
+                s["reversal"] = {"ticker": ticker, "lost_dir": direction, "dir": _rd,
+                                 "level": round(float(_lvl), 2),
+                                 "armed_t": str((_cs[-1].get("t") if _cs else "") or ""),
+                                 "armed_at": datetime.now(ET).strftime("%H:%M"), "used": False}
+                log.info(f"REVERSAL armed: {ticker} {_rd.upper()}S only, level {_lvl}")
+                if _in_window():
+                    _rev_post = (
+                        f"🔄 **Reversal watch — {ticker}**\n"
+                        f"We took the loss on {ticker} {direction.upper()}S. The only trade left today is "
+                        f"**{ticker} {_rd.upper()}S** — and only if {ticker} breaks "
+                        f"{'above the high' if _rd == 'call' else 'below the low'} of the day "
+                        f"(${float(_lvl):.2f}), retests it, and holds. If that doesn't happen by "
+                        f"{_win_end_label()}, we're done for the day.")
+            else:
+                log.warning(f"REVERSAL not armed: no session {'high' if _rd == 'call' else 'low'} for {ticker}")
+    except Exception as _rx:
+        log.warning(f"reversal arm failed: {_rx}")
     _commit(s)
+  if _rev_post:
+    try:
+        post_to_discord("daily-watchlist", _rev_post)
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1226,7 +1288,8 @@ def _gate_broker_flat(signal_type: str) -> tuple[bool, str]:
     return True, "flat"
 
 
-def all_gates_pass(ticker: str, signal_type: str = "entry", direction: str | None = None) -> bool:
+def all_gates_pass(ticker: str, signal_type: str = "entry", direction: str | None = None,
+                   reversal: bool = False) -> bool:
     checks = [
         ("market_day",      _gate_market_day),
         ("window",          _gate_window),
@@ -1238,7 +1301,9 @@ def all_gates_pass(ticker: str, signal_type: str = "entry", direction: str | Non
         ("blackout",        _gate_blackout),
         ("broker_flat",     lambda: _gate_broker_flat(signal_type)),
         ("circuit_breaker", _gate_circuit_breaker),
-        ("max_trades",      _gate_max_trades),
+        ("max_trades",      lambda: ((True, "reversal exception")
+                                     if reversal and _reversal_available(ticker)
+                                     else _gate_max_trades())),
         ("open_position",   _gate_open_position),
         ("cooldown",        lambda: _gate_cooldown(ticker, signal_type)),
     ]
@@ -4908,6 +4973,87 @@ def _retest_decision(ticker: str, st: dict, cs: list, C: list, VW: list, e8: lis
     return None
 
 
+_REV_LAST_T: dict = {}
+
+
+def _reversal_decision(ticker: str) -> dict | None:
+    """v14.20 REVERSAL EXCEPTION setup. Level = session high (calls) / low (puts)
+    snapshotted at the moment of the loss. Only candles AFTER the loss count:
+    1) two straight 1-min closes beyond the level = confirmed break (a close
+       REVERSAL_FAIL_PCT back through resets it, so a later re-break still counts);
+    2) a pullback back into the retest zone (within REVERSAL_RETEST_PCT of the
+       level) without failing;
+    3) the current bar closes beyond the level, beyond the prior close, on the
+       right side of VWAP with 8 EMA vs 21 EMA aligned -> entry."""
+    if not _reversal_available(ticker):
+        return None
+    r = load_state().get("reversal") or {}
+    st = _mkt_structure.get(ticker) or {}
+    cs = [c for c in (st.get("candles") or []) if c.get("vwap") is not None and c.get("close") is not None]
+    if len(cs) < 14:
+        return None
+    t = str(cs[-1].get("t") or "")
+    if _REV_LAST_T.get(ticker) == t:
+        return None
+    _REV_LAST_T[ticker] = t
+    try:
+        _bt = datetime.fromisoformat(t.replace("Z", "+00:00")).astimezone(ET)
+        if (_bt.hour, _bt.minute) < (9, 45):
+            return None
+    except Exception:
+        return None
+    d = r.get("dir")
+    try:
+        L = float(r.get("level"))
+    except Exception:
+        return None
+    up = d == "call"
+    armed_t = str(r.get("armed_t") or "")
+    start = next((k for k, c in enumerate(cs) if str(c.get("t") or "") > armed_t), None) if armed_t else 0
+    if start is None:
+        return None
+    C = [float(c["close"]) for c in cs]
+    VW = [float(c["vwap"]) for c in cs]
+    H = [float(c.get("high") if c.get("high") is not None else c["close"]) for c in cs]
+    Lo = [float(c.get("low") if c.get("low") is not None else c["close"]) for c in cs]
+    if all(c.get("e8") is not None and c.get("e21") is not None for c in cs[-2:]):
+        e8 = [c.get("e8") for c in cs]
+        e21 = [c.get("e21") for c in cs]
+    else:
+        e8, e21 = _ema_list(C, 8), _ema_list(C, 21)
+    i = len(C) - 1
+    beyond = (lambda x: x > L * (1 + KEY_BUFFER_PCT)) if up else (lambda x: x < L * (1 - KEY_BUFFER_PCT))
+    failed = (lambda x: x < L * (1 - REVERSAL_FAIL_PCT)) if up else (lambda x: x > L * (1 + REVERSAL_FAIL_PCT))
+    j = None
+    for k in range(max(start + 1, 1), i):
+        if j is None:
+            if beyond(C[k - 1]) and beyond(C[k]) and k - 1 >= start:
+                j = k
+        elif failed(C[k]):
+            j = None
+    if j is None or j >= i - 1 or failed(C[i]):
+        return None
+    zone = (lambda k: Lo[k] <= L * (1 + REVERSAL_RETEST_PCT)) if up else \
+           (lambda k: H[k] >= L * (1 - REVERSAL_RETEST_PCT))
+    if not any(zone(k) for k in range(j + 1, i)):
+        return None
+    if up:
+        ok = beyond(C[i]) and C[i] > C[i - 1] and C[i] > VW[i] and e8[i] > e21[i]
+    else:
+        ok = beyond(C[i]) and C[i] < C[i - 1] and C[i] < VW[i] and e8[i] < e21[i]
+    if not ok:
+        return None
+    lost = str(r.get("lost_dir") or "").upper()
+    desc = (f"{ticker} reversed on our {lost}S — it broke {'above the high' if up else 'below the low'} "
+            f"of the day ${L:.2f}, came back to retest it, the level held, and it's pushing "
+            f"{'higher' if up else 'lower'} ({'above' if up else 'below'} VWAP ${VW[i]:.2f}, trend aligned). "
+            f"Reversal exception: one shot in the new direction — the day ends when this trade closes.")
+    return {"decision": "APPROVE", "ticker": ticker, "direction": d, "tier": "TIER-1",
+            "setup": "REVERSAL_RETEST", "key_level": L, "setup_description": desc, "reason": desc,
+            "chart_request": {"ticker": ticker, "timeframe": "1m", "indicators": "VWAP,EMA8,EMA21",
+                              "highlight": f"Day {'high' if up else 'low'} {L:.2f} reclaim & retest"}}
+
+
 # ── SHADOW SCORECARD: setups tracked live with NO orders ─────────────────────
 SHADOW_ON = os.environ.get("SHADOW_SCORECARD", "1") == "1"
 # underlying move ~ +20% / -30% on a near-the-money weekly
@@ -5599,7 +5745,8 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     tier  = claude_decision.get("tier", "TIER-1")
     setup = claude_decision.get("setup_description", "")
-    if _day_loss_limit_hit():
+    _is_rev = str(claude_decision.get("setup") or "") == "REVERSAL_RETEST"
+    if _day_loss_limit_hit() and not (_is_rev and _reversal_available(ticker)):
         log.info("BLOCKED: daily loss limit reached — no new day trades today")
         return False
 
@@ -5626,7 +5773,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         return False
 
     _okq, _whyq = _gate_entry_quality(
-        ticker, direction, skip_chop=(str(claude_decision.get("setup") or "") == "VWAP_PULLBACK"))
+        ticker, direction, skip_chop=(str(claude_decision.get("setup") or "") in ("VWAP_PULLBACK", "REVERSAL_RETEST")))
     if not _okq:
         log.info(f"BLOCKED post-decision (v14.12 quality): {_whyq}")
         post_to_discord(
@@ -5636,7 +5783,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         )
         return False
 
-    _okk, _whyk = ((True, "") if str(claude_decision.get("setup") or "") == "KEY_LEVEL_RETEST"
+    _okk, _whyk = ((True, "") if str(claude_decision.get("setup") or "") in ("KEY_LEVEL_RETEST", "REVERSAL_RETEST")
                    else _gate_key_levels(ticker, direction))
     if not _okk:
         # silent to members (no spam) — log only
@@ -5854,6 +6001,14 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "peak_pnl":      0.0,
         "entry_time":    datetime.now(ET).isoformat(),
     })
+    if _is_rev:
+        with _state_lock:
+            _sr = load_state()
+            if isinstance(_sr.get("reversal"), dict):
+                _sr["reversal"]["used"] = True
+                _sr["reversal"]["used_at"] = datetime.now(ET).strftime("%H:%M")
+            _commit(_sr)
+        log.info(f"REVERSAL exception used: {occ}")
     increment_trade_count()
     log.info(f"Trade complete — {occ} live | stop={stop_order_id}")
     return True
@@ -6431,13 +6586,21 @@ def _scheduler_loop():
                             if time_module.time() - _boot_ts < 120:
                                 continue  # boot grace: ingest yes, entries no
                             _shadow_track(ticker, levels)    # v14.13: paper-only scorecard
+                            _rev_mode = False
                             if _day_loss_limit_hit():
-                                continue                     # one-loss day: done trading
-                            if DAY_ENGINE == "rules":
+                                if not _reversal_available(ticker):
+                                    continue                 # one-loss day: done trading
+                                _rd = _reversal_decision(ticker)   # v14.20: one reversal shot
+                                if not _rd:
+                                    continue
+                                _rev_mode = True
+                            elif DAY_ENGINE == "rules":
                                 _rd = _rules_decision(ticker)
                                 if not _rd:
                                     continue
-                            if not all_gates_pass(ticker, signal_type="entry"):
+                            if not all_gates_pass(ticker, signal_type="entry",
+                                                  direction=(_rd.get("direction") if _rev_mode else None),
+                                                  reversal=_rev_mode):
                                 continue
                             alert_data = {
                                 "ticker":     ticker,
@@ -6451,7 +6614,7 @@ def _scheduler_loop():
                                 "pml":        levels.get("pml"),
                             }
                             session  = load_state()
-                            decision = _rd if DAY_ENGINE == "rules" else call_claude(alert_data, session)
+                            decision = _rd if (DAY_ENGINE == "rules" or _rev_mode) else call_claude(alert_data, session)
                             if decision and decision.get("decision") == "APPROVE":
                                 direction = decision.get("direction", "").lower()
                                 if direction in ("call", "put"):
@@ -6518,8 +6681,12 @@ def _scheduler_loop():
                         _wrap = (f"🏁 **Window closed — day recap: {_wins}W / {len(_res) - _wins}L, "
                                  f"{'+' if _tot >= 0 else ''}${abs(_tot):.0f} net.**\n"
                                  + "\n".join(_lines)
-                                 + (("\n🛑 Done for the day after a loss — one losing trade max, "
-                                     "that's how we protect the downside.") if _day_loss_limit_hit()
+                                 + (("\n🔄 After the loss we took our one reversal shot in the new "
+                                     "direction — that's the max. Day's done.")
+                                    if (load_state().get("reversal") or {}).get("used") else
+                                    ("\n🛑 Done for the day after a loss — no confirmed reversal showed up, "
+                                     "and one losing trade max is how we protect the downside.")
+                                    if _day_loss_limit_hit()
                                     else (f"\n🚫 {', '.join(_locked)} benched after a loss — one loss per "
                                           f"ticker per day, that's the rule." if _locked else ""))
                                  + "\nEvery entry, exit, and stop was posted live above. "
@@ -6879,6 +7046,8 @@ def status():
         "window_end":         _win_end_label(),
         "day_max_losses":     DAY_MAX_LOSSES,
         "loss_limit_hit":     _day_loss_limit_hit(),
+        "reversal_exception": REVERSAL_EXCEPTION,
+        "reversal":           s.get("reversal"),
         "shadow_scorecard":   _shadow_summary() if SHADOW_ON else None,
         "alloc_pct":          _risk()["alloc"],
         "stop_pct":           _stop_pct(),
