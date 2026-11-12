@@ -137,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.20"
+APP_VERSION = "v14.21"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -551,7 +551,7 @@ def _save_state(s: dict):
 # blank state and silently erase the swing paper book (the Oct 8 AAPL/XOM
 # paper trades vanished on Oct 9), live swing positions, the swing week
 # counter and the shadow log (so the "weekly" scorecard only held Friday).
-PERSIST_KEYS = ("swing_positions", "swing_week", "swing_paper", "shadow_log",
+PERSIST_KEYS = ("swing_positions", "swing_week", "swing_paper", "rev_paper", "shadow_log",
                 "journal", "journal_seq", "gate_dm")
 
 
@@ -5054,6 +5054,375 @@ def _reversal_decision(ticker: str) -> dict | None:
                               "highlight": f"Day {'high' if up else 'low'} {L:.2f} reclaim & retest"}}
 
 
+# ═══════ v14.21 DAY REVERSAL PAPER TEST (Nov 11, Junior) ═══════
+# Key-level REVERSALS on the day tickers, PAPER ONLY — no orders, members see
+# nothing. Every paper trade is DM'd to Junior exactly like the swing paper
+# test. After REV_PAPER_GATE_N closed trades the exit DM carries a go-live
+# verdict; going live stays Junior's call.
+#   Levels: pre-market high/low, 9:30-9:35 opening-range high/low, prior-day high/low.
+#   CALL at support (mirror = PUT at resistance):
+#   1) price came DOWN to the level (closed above it earlier in the last 30 min)
+#   2) tested it: wick within 0.1% of it or a quick flush through (<= REV_MAX_BELOW closes)
+#   3) reclaimed: every close since the last test is back above the level (2+ closes)
+#   4) confirmation within REV_FRESH_BARS of the test: close above VWAP, 8 EMA > 21 EMA,
+#      close above the prior bar, and reaction volume >= REV_VOL_MULT x average
+#   Once per level per ticker per day. Real contract (live day selector), sim
+#   fill at the ask, exits at the bid, managed with the live day rules.
+REV_PAPER_ON = os.environ.get("REV_PAPER", "1") == "1"
+REV_PAPER_GATE_N = int(os.environ.get("REV_PAPER_GATE_N", "10"))
+REV_PAPER_GATE_WR = float(os.environ.get("REV_PAPER_GATE_WR", "0.50"))
+REV_PAPER_MAX_DAY = int(os.environ.get("REV_PAPER_MAX_DAY", "4"))
+REV_LOOKBACK = int(os.environ.get("REV_LOOKBACK", "30"))
+REV_TOUCH_PCT = float(os.environ.get("REV_TOUCH_PCT", "0.001"))
+REV_MAX_BELOW = int(os.environ.get("REV_MAX_BELOW", "8"))
+REV_FRESH_BARS = int(os.environ.get("REV_FRESH_BARS", "12"))
+REV_VOL_MULT = float(os.environ.get("REV_VOL_MULT", "1.2"))
+_REVBOOK_TAG = "REVBOOK:"
+_REVP_LAST_T: dict = {}
+_PDHL_CACHE: dict = {}
+
+
+def _prior_day_hl(ticker: str) -> tuple:
+    today = datetime.now(ET).date().isoformat()
+    hit = _PDHL_CACHE.get(ticker)
+    if hit and hit[0] == today:
+        return hit[1], hit[2]
+    hi = lo = None
+    try:
+        for b in reversed(_daily_bars(ticker, 5) or []):
+            d = datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00")).astimezone(ET).date().isoformat()
+            if d < today:
+                hi, lo = float(b["h"]), float(b["l"])
+                break
+    except Exception as e:
+        log.warning(f"prior-day levels {ticker}: {e}")
+    if hi:
+        _PDHL_CACHE[ticker] = (today, hi, lo)
+    return hi, lo
+
+
+def _revp_book() -> dict:
+    b = load_state().get("rev_paper") or {}
+    b.setdefault("open", [])
+    b.setdefault("closed", [])
+    b.setdefault("fired", {})
+    b.setdefault("stats", {"n": 0, "w": 0, "l": 0, "sum_pct": 0.0, "skips": 0})
+    return b
+
+
+def _revp_save(b: dict):
+    with _state_lock:
+        st = load_state()
+        st["rev_paper"] = b
+        _commit(st)
+
+
+def _revp_dm(msg: str, b: dict | None = None):
+    import base64, zlib
+    body = msg[:1350]
+    if b is not None:
+        slim = {"open": b.get("open", []), "closed": (b.get("closed") or [])[-6:],
+                "stats": b.get("stats")}
+        foot = "\n-# " + _REVBOOK_TAG + base64.b64encode(
+            zlib.compress(json.dumps(slim, separators=(",", ":"), default=str).encode(), 9)).decode()
+        if len(body) + len(foot) < 1900:
+            body += foot
+    send_emergency_dm(body, prefix="🧪 **DAY REVERSAL PAPER TEST** (no real orders)")
+
+
+def _revp_resync_from_dm():
+    """Boot: rebuild the reversal paper book from the newest REVBOOK footer (Render wipes /tmp)."""
+    import base64, zlib
+    if load_state().get("rev_paper") or not JUNIOR_USER_IDS:
+        return
+    try:
+        hdr = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
+        dm = requests.post(f"{DISCORD_API}/users/@me/channels", headers=hdr,
+                           json={"recipient_id": JUNIOR_USER_IDS[0]}, timeout=10)
+        if dm.status_code not in (200, 201):
+            return
+        r = requests.get(f"{DISCORD_API}/channels/{dm.json()['id']}/messages",
+                         headers=hdr, params={"limit": 100}, timeout=10)
+        if r.status_code != 200:
+            return
+        for m in r.json():                       # newest first
+            c = m.get("content") or ""
+            if _REVBOOK_TAG in c:
+                enc = c.split(_REVBOOK_TAG, 1)[1].strip().split()[0]
+                b = json.loads(zlib.decompress(base64.b64decode(enc)).decode())
+                b.setdefault("open", []); b.setdefault("closed", []); b.setdefault("fired", {})
+                b.setdefault("stats", {"n": 0, "w": 0, "l": 0, "sum_pct": 0.0, "skips": 0})
+                _revp_save(b)
+                log.info(f"REV PAPER book restored from DM: {len(b['open'])} open, {b['stats'].get('n')} closed")
+                return
+    except Exception as e:
+        log.warning(f"rev paper resync failed: {e}")
+
+
+def _revp_levels(ticker: str, st: dict) -> list:
+    """(name, level, direction): supports -> calls, resistances -> puts."""
+    out = []
+    if st.get("pm_low"):
+        out.append(("pre-market low", float(st["pm_low"]), "call"))
+    if st.get("pm_high"):
+        out.append(("pre-market high", float(st["pm_high"]), "put"))
+    if st.get("or_locked"):
+        if st.get("or_low"):
+            out.append(("opening-range low", float(st["or_low"]), "call"))
+        if st.get("or_high"):
+            out.append(("opening-range high", float(st["or_high"]), "put"))
+    pdh, pdl = _prior_day_hl(ticker)
+    if pdl:
+        out.append(("yesterday's low", pdl, "call"))
+    if pdh:
+        out.append(("yesterday's high", pdh, "put"))
+    return out
+
+
+def _revp_detect(ticker: str, st: dict, fired: set) -> dict | None:
+    cs = []
+    for c in (st.get("candles") or []):
+        if c.get("close") is None or c.get("vwap") is None:
+            continue
+        try:
+            _ct = datetime.fromisoformat(str(c.get("t")).replace("Z", "+00:00")).astimezone(ET)
+        except Exception:
+            continue
+        if _ct.hour * 60 + _ct.minute >= 570:          # regular session only
+            cs.append(c)
+    if len(cs) < 8:
+        return None
+    try:
+        _lt = datetime.fromisoformat(str(cs[-1].get("t")).replace("Z", "+00:00")).astimezone(ET)
+        if _lt.hour * 60 + _lt.minute < 580:            # 9:40 earliest
+            return None
+    except Exception:
+        return None
+    C = [float(c["close"]) for c in cs]
+    H = [float(c.get("high") if c.get("high") is not None else c["close"]) for c in cs]
+    Lo = [float(c.get("low") if c.get("low") is not None else c["close"]) for c in cs]
+    VW = [float(c["vwap"]) for c in cs]
+    V = [float(c.get("volume") or 0) for c in cs]
+    if all(c.get("e8") is not None and c.get("e21") is not None for c in cs[-2:]):
+        e8 = [c.get("e8") for c in cs]
+        e21 = [c.get("e21") for c in cs]
+    else:
+        e8, e21 = _ema_list(C, 8), _ema_list(C, 21)
+    i = len(C) - 1
+    lo_k = max(0, i - REV_LOOKBACK)
+    for name, L, d in _revp_levels(ticker, st):
+        if name in fired:
+            continue
+        up = d == "call"
+        buf = KEY_BUFFER_PCT
+        if up:
+            tested = lambda k: Lo[k] <= L * (1 + REV_TOUCH_PCT)
+            back = lambda x: x > L * (1 + buf)
+            beyond = lambda x: x < L * (1 - buf)
+        else:
+            tested = lambda k: H[k] >= L * (1 - REV_TOUCH_PCT)
+            back = lambda x: x < L * (1 - buf)
+            beyond = lambda x: x > L * (1 + buf)
+        ks = next((k for k in range(i - 2, lo_k - 1, -1) if tested(k)), None)   # last test bar
+        if ks is None or i - ks > REV_FRESH_BARS:
+            continue
+        if not all(back(C[k]) for k in range(ks + 1, i + 1)) or i - ks < 2:
+            continue                                        # not reclaimed (2+ closes back)
+        k0 = next((k for k in range(lo_k, ks + 1) if tested(k)), ks)              # first test bar
+        if not any(back(C[k]) for k in range(lo_k, k0)):
+            continue                                        # didn't come TO the level from the right side
+        n_beyond = sum(1 for k in range(k0, ks + 1) if beyond(C[k]))
+        if n_beyond > REV_MAX_BELOW:
+            continue                                        # that was a real breakdown, not a flush
+        if up:
+            conf = C[i] > VW[i] and e8[i] > e21[i] and C[i] > C[i - 1]
+        else:
+            conf = C[i] < VW[i] and e8[i] < e21[i] and C[i] < C[i - 1]
+        if not conf:
+            continue
+        base = [v for v in V[max(0, k0 - 20):k0] if v > 0]
+        react = max(V[ks:i + 1]) if V[ks:i + 1] else 0
+        vr = (react / (sum(base) / len(base))) if (base and len(base) >= 5) else None
+        if vr is not None and vr < REV_VOL_MULT:
+            continue
+        ext = min(Lo[k0:ks + 1]) if up else max(H[k0:ks + 1])
+        kind = "failed breakdown" if (up and n_beyond) else "failed breakout" if n_beyond else \
+               ("bounce" if up else "rejection")
+        return {"name": name, "level": round(L, 2), "dir": d, "kind": kind, "extreme": round(ext, 2),
+                "closes_through": n_beyond, "vol_ratio": round(vr, 2) if vr else None,
+                "px": C[i], "vwap": VW[i]}
+    return None
+
+
+def _revp_scan(ticker: str):
+    """Called on every new 1-min candle in the day window (same loop as the live scanner)."""
+    if not REV_PAPER_ON:
+        return
+    st = _mkt_structure.get(ticker) or {}
+    t = str(((st.get("candles") or [{}])[-1]).get("t") or "")
+    if not t or _REVP_LAST_T.get(ticker) == t:
+        return
+    _REVP_LAST_T[ticker] = t
+    b = _revp_book()
+    today = datetime.now(ET).date().isoformat()
+    if (b.get("fired") or {}).get("_d") != today:
+        b["fired"] = {"_d": today}
+    if any(o["ticker"] == ticker for o in b["open"]):
+        return
+    if sum(1 for k, v in b["fired"].items() if k != "_d" for _ in v) >= REV_PAPER_MAX_DAY:
+        return
+    sig = _revp_detect(ticker, st, set(b["fired"].get(ticker) or []))
+    if not sig:
+        return
+    b["fired"].setdefault(ticker, []).append(sig["name"])
+    up = sig["dir"] == "call"
+    why = (f"{ticker} came {'down' if up else 'up'} to the {sig['name']} ${sig['level']:.2f}, "
+           f"{'flushed through it (' + str(sig['closes_through']) + ' close(s)) and' if sig['closes_through'] else 'tagged it and'} "
+           f"got rejected (extreme ${sig['extreme']:.2f}), reclaimed the level, and is now "
+           f"{'above' if up else 'below'} VWAP ${sig['vwap']:.2f} with the 8/21 EMA turned "
+           f"{'up' if up else 'down'}"
+           + (f", reaction volume {sig['vol_ratio']:.1f}x normal" if sig.get("vol_ratio") else "") + ".")
+    g1, g2 = globals().get("_last_selection_tier"), globals().get("_last_itm_reason")
+    try:
+        occ, strike, _ask = select_contract(ticker, sig["dir"])
+        why_none = globals().get("_last_itm_reason") or "no contract fit the day selection rules"
+    finally:
+        globals()["_last_selection_tier"], globals()["_last_itm_reason"] = g1, g2
+    q = _live_option_quote(occ) if occ else None
+    ask = float((q or {}).get("ask") or 0)
+    bid = float((q or {}).get("bid") or 0)
+    if not occ or ask <= 0:
+        b["stats"]["skips"] = int(b["stats"].get("skips") or 0) + 1
+        _revp_save(b)
+        _revp_dm(f"⏭️ **{ticker} {sig['dir'].upper()} — {sig['kind']} at the {sig['name']} — no paper entry.**\n"
+                 f"{why}\nContract: {why_none}.", b)
+        return
+    bud = (_sizing_cash() or 0) * DAY_ITM_BUDGET_PCT
+    lq = int(bud // (ask * 100)) if ask > 0 else 0
+    if lq == 0 and 0 < ask * 100 <= bud:
+        lq = 1
+    lq = min(lq, MAX_CONTRACTS)
+    pos = {"ticker": ticker, "direction": sig["dir"], "occ": occ, "entry": round(ask, 2),
+           "opened": datetime.now(ET).strftime("%Y-%m-%d %H:%M"), "level": sig["level"],
+           "level_name": sig["name"], "kind": sig["kind"], "spot_in": sig["px"],
+           "live_qty": lq, "peak": 0.0, "trough": 0.0, "floor": None, "trimmed": False,
+           "trim_pct": None, "last_bid": None, "why": why}
+    b["open"].append(pos)
+    _revp_save(b)
+    stt = b["stats"]
+    _revp_dm(
+        f"🟢 **PAPER ENTRY — {ticker} {sig['dir'].upper()}** (key-level reversal: {sig['kind']} at the {sig['name']})\n"
+        f"Why: {why}\n"
+        f"Contract: **{_fmt_occ(occ)}** — sim fill ${ask:.2f} at the ask (bid ${bid:.2f})"
+        + (f" | live sizing would buy {lq} = ${ask * 100 * lq:.0f}\n" if lq else " | too pricey for live sizing today (tracked anyway)\n")
+        + f"Plan (live day rules): -{_stop_pct():.0%} stop, "
+        + (f"half off at +{DAY_TRIM_AT:.0%}, " if lq >= 2 else "")
+        + f"trail +10%→+5%, +15%→+10% …, out by 3:45.\n"
+        f"Paper record so far: {stt['w']}W / {stt['l']}L ({stt['n']}/{REV_PAPER_GATE_N} trades toward the go-live check)", b)
+
+
+def _revp_verdict(stt: dict) -> str:
+    n = int(stt.get("n") or 0)
+    if n < REV_PAPER_GATE_N:
+        return f"{n}/{REV_PAPER_GATE_N} trades toward the go-live check."
+    wr = stt["w"] / n
+    avg = stt["sum_pct"] / n
+    ok = wr >= REV_PAPER_GATE_WR and avg > 0
+    return (f"📊 **{n}-trade check: {stt['w']}W / {stt['l']}L ({wr:.0%} win), avg {avg:+.1%} per trade — "
+            + ("PASSES the bar (wins outweigh losses). Ready to go live when you say so.**" if ok else
+               f"NOT ready (needs {REV_PAPER_GATE_WR:.0%}+ win rate and positive average). Keep testing.**"))
+
+
+def _revp_close(b: dict, p: dict, bid: float, reason: str) -> dict:
+    fill = float(p["entry"])
+    pnl = (bid - fill) / fill
+    res = (0.5 * float(p["trim_pct"]) + 0.5 * pnl) if (p.get("trimmed") and p.get("trim_pct") is not None) else pnl
+    rec = {"ticker": p["ticker"], "dir": p["direction"], "kind": p.get("kind"), "level_name": p.get("level_name"),
+           "occ": p["occ"], "entry": fill, "exit": round(bid, 2), "pct": round(res, 4),
+           "peak": round(float(p.get("peak") or 0), 4), "trough": round(float(p.get("trough") or 0), 4),
+           "reason": reason, "opened": p.get("opened"), "closed": datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
+           "live_qty": p.get("live_qty")}
+    b["closed"] = ((b.get("closed") or []) + [rec])[-40:]
+    stt = b["stats"]
+    stt["n"] = int(stt.get("n") or 0) + 1
+    stt["w" if res > 0 else "l"] = int(stt.get("w" if res > 0 else "l") or 0) + 1
+    stt["sum_pct"] = round(float(stt.get("sum_pct") or 0) + res, 4)
+    return rec
+
+
+def revp_monitor():
+    """Manage open reversal paper trades with the live day rules (throttled 30s)."""
+    b = _revp_book()
+    if not b["open"]:
+        return
+    st0 = load_state()
+    if time_module.time() - float(st0.get("revp_mon_ts") or 0) < 30:
+        return
+    with _state_lock:
+        st1 = load_state(); st1["revp_mon_ts"] = time_module.time(); _commit(st1)
+    now = datetime.now(ET)
+    flat_time = (now.hour, now.minute) >= _flatten_time(now.date())
+    quotes = _option_quotes_bulk([p["occ"] for p in b["open"]])
+    keep, closes = [], []
+    for p in b["open"]:
+        q = quotes.get(p["occ"].replace(" ", "")) or {}
+        bid = float(q.get("bid") or 0)
+        if bid <= 0:
+            if flat_time and p.get("last_bid"):
+                closes.append(_revp_close(b, p, float(p["last_bid"]), "end-of-day flatten (last bid)"))
+            else:
+                keep.append(p)
+            continue
+        fill = float(p["entry"])
+        pnl = (bid - fill) / fill
+        p["last_bid"] = bid
+        p["peak"] = max(float(p.get("peak") or 0), pnl)
+        p["trough"] = min(float(p.get("trough") or 0), pnl)
+        if int(p.get("live_qty") or 0) >= 2 and not p.get("trimmed") and pnl >= DAY_TRIM_AT:
+            p["trimmed"] = True
+            p["trim_pct"] = round(pnl, 4)
+        want = None
+        for thr, lock in DAY_LADDER:
+            if p["peak"] >= thr:
+                want = lock
+        if want is not None and (p.get("floor") is None or want > float(p["floor"])):
+            p["floor"] = want
+        floor = p.get("floor")
+        reason = None
+        if pnl <= -_stop_pct():
+            reason = f"stop -{_stop_pct():.0%}"
+        elif floor is not None and pnl <= float(floor):
+            reason = f"trail floor {float(floor):+.0%} hit"
+        elif pnl >= DAY_TARGET_PCT:
+            reason = f"runner cap +{DAY_TARGET_PCT:.0%}"
+        elif flat_time:
+            reason = "end-of-day flatten"
+        if reason:
+            closes.append(_revp_close(b, p, bid, reason))
+        else:
+            keep.append(p)
+    b["open"] = keep
+    _revp_save(b)
+    for rec in closes:
+        stt = b["stats"]
+        _revp_dm(f"{'✅' if rec['pct'] > 0 else '❌'} **PAPER EXIT — {rec['ticker']} {rec['dir'].upper()}** "
+                 f"({rec['kind']} at the {rec['level_name']}) — {rec['reason']}\n"
+                 f"${rec['entry']:.2f} → ${rec['exit']:.2f} | result **{rec['pct']:+.1%}** "
+                 f"(peak {rec['peak']:+.0%}, worst {rec['trough']:+.0%}) | in {rec['opened'][11:]} → out {rec['closed'][11:]}\n"
+                 f"Paper record: {stt['w']}W / {stt['l']}L | avg {stt['sum_pct'] / max(stt['n'], 1):+.1%} per trade\n"
+                 + _revp_verdict(stt), b)
+
+
+def _revp_summary() -> dict:
+    b = _revp_book()
+    stt = b["stats"]
+    n = int(stt.get("n") or 0)
+    return {"on": REV_PAPER_ON, "n": n, "w": stt.get("w", 0), "l": stt.get("l", 0),
+            "sum_pct": stt.get("sum_pct", 0.0), "open": len(b["open"]), "skips": stt.get("skips", 0),
+            "ready": bool(n >= REV_PAPER_GATE_N and stt["w"] / n >= REV_PAPER_GATE_WR
+                          and float(stt.get("sum_pct") or 0) > 0) if n else False}
+
+
 # ── SHADOW SCORECARD: setups tracked live with NO orders ─────────────────────
 SHADOW_ON = os.environ.get("SHADOW_SCORECARD", "1") == "1"
 # underlying move ~ +20% / -30% on a near-the-money weekly
@@ -6239,6 +6608,10 @@ def _scheduler_loop():
                         swing_paper_monitor()
                     except Exception as _spe:
                         log.error(f"swing paper monitor failed: {_spe}")
+                    try:
+                        revp_monitor()                       # v14.21 reversal paper test
+                    except Exception as _rpe:
+                        log.error(f"rev paper monitor failed: {_rpe}")
                 if (dtime(16, 15) <= t <= dtime(16, 45)
                         and _next_trading_day(today).isocalendar()[1] != today.isocalendar()[1]
                         and load_state().get("last_weekly_report") != today_s):
@@ -6586,6 +6959,10 @@ def _scheduler_loop():
                             if time_module.time() - _boot_ts < 120:
                                 continue  # boot grace: ingest yes, entries no
                             _shadow_track(ticker, levels)    # v14.13: paper-only scorecard
+                            try:
+                                _revp_scan(ticker)           # v14.21: reversal PAPER test (DM only)
+                            except Exception as _rve:
+                                log.warning(f"rev paper scan {ticker}: {_rve}")
                             _rev_mode = False
                             if _day_loss_limit_hit():
                                 if not _reversal_available(ticker):
@@ -7048,6 +7425,7 @@ def status():
         "loss_limit_hit":     _day_loss_limit_hit(),
         "reversal_exception": REVERSAL_EXCEPTION,
         "reversal":           s.get("reversal"),
+        "reversal_paper":     _revp_summary(),
         "shadow_scorecard":   _shadow_summary() if SHADOW_ON else None,
         "alloc_pct":          _risk()["alloc"],
         "stop_pct":           _stop_pct(),
@@ -7510,6 +7888,7 @@ def _boot_in_worker():
     _adopt_broker_positions()
     _resync_day_state_from_discord()
     _paper_resync_from_dm()
+    _revp_resync_from_dm()
     try:
         _journal_resync()
     except Exception as _jre:
