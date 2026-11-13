@@ -137,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.21"
+APP_VERSION = "v14.22"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -2214,7 +2214,7 @@ SETUP_FAIL_WIN = float(os.environ.get("SETUP_FAIL_WIN", "0.45"))
 _KIND_LABEL = {"day": "LIVE DAY", "shadow": "SHADOW DAY", "swing_paper": "SWING PAPER",
                "swing": "LIVE SWING"}
 _journal_chan_cache: dict = {}
-JOURNAL_DAY = os.environ.get("JOURNAL_DAY", "0") == "1"   # swings only by default
+JOURNAL_DAY = os.environ.get("JOURNAL_DAY", "1") == "1"   # v14.22: day trades journaled too
 
 
 def _journal_channel() -> str | None:
@@ -6107,6 +6107,21 @@ def call_claude(alert_data: dict, session: dict, replay: bool = False, as_of: st
 # ══════════════════════════════════════════════════════════════════════════════
 #  EXECUTION ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
+# v14.22 (Nov 13, Junior): QUIET BENCH. Unlike NO_TRADE_DATES (which posts the
+# @everyone "Fed day / sitting in cash" notice), a quiet-bench date runs the
+# normal member day - watchlist, scanning updates, charts, wrap - but takes NO
+# entries. A triggered signal posts one "Setup we passed on" line per
+# ticker+direction so members see the system working. Env SILENT_BENCH_DATES
+# (comma list) adds dates; 2026-11-13 is built in (setup rebuild day).
+SILENT_BENCH_DATES = {"2026-11-13"} | {d.strip() for d in
+                      os.environ.get("SILENT_BENCH_DATES", "").split(",") if d.strip()}
+_QUIET_PASSED: set = set()
+
+
+def _quiet_bench_today() -> bool:
+    return datetime.now(ET).date().isoformat() in SILENT_BENCH_DATES
+
+
 def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     log.info(f"{'='*50}")
     log.info(f"EXECUTE: {ticker} {direction.upper()}")
@@ -6114,6 +6129,21 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
 
     tier  = claude_decision.get("tier", "TIER-1")
     setup = claude_decision.get("setup_description", "")
+    if _quiet_bench_today():
+        _qk = (datetime.now(ET).date().isoformat(), ticker, direction)
+        log.info(f"BLOCKED: quiet bench today — {ticker} {direction} not taken")
+        if _qk not in _QUIET_PASSED:
+            _QUIET_PASSED.add(_qk)
+            try:
+                post_to_discord(
+                    "daily-watchlist",
+                    f"📚 **Setup we passed on — {ticker} {direction.upper()}**\n"
+                    f"{setup}\n**Passed:** didn't meet today's full confirmation criteria. "
+                    f"No forced trades.",
+                )
+            except Exception as _qe:
+                log.warning(f"quiet-bench post failed: {_qe}")
+        return False
     _is_rev = str(claude_decision.get("setup") or "") == "REVERSAL_RETEST"
     if _day_loss_limit_hit() and not (_is_rev and _reversal_available(ticker)):
         log.info("BLOCKED: daily loss limit reached — no new day trades today")
@@ -7430,6 +7460,7 @@ def status():
         "alloc_pct":          _risk()["alloc"],
         "stop_pct":           _stop_pct(),
         "no_trade_today":     _no_trade_today(),
+        "quiet_bench_today":  _quiet_bench_today(),
         "time_et":            now.strftime("%Y-%m-%d %H:%M:%S ET"),
         "trade_count":        s["trade_count"],
         "circuit_breaker":    s["circuit_breaker"],
@@ -7653,6 +7684,111 @@ def fill_test():
     return jsonify({"tested": len(rows), "passed": ok,
                     "verdict": "CERTIFIED" if ok == len(rows) else "FAILING",
                     "rows": rows}), 200
+
+
+def _lab_bars(ticker: str, start_iso: str, end_iso: str, timeframe: str = "1Min") -> list:
+    """Paginated Alpaca bars (SIP first: full volume) for the setup lab."""
+    for feed in ("sip", "iex"):
+        out, tok = [], None
+        try:
+            for _pg in range(12):
+                params = {"timeframe": timeframe, "start": start_iso, "end": end_iso,
+                          "limit": 10000, "sort": "asc", "feed": feed, "adjustment": "raw"}
+                if tok:
+                    params["page_token"] = tok
+                r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/bars",
+                                 headers=_alpaca_headers(), params=params, timeout=15)
+                if r.status_code != 200:
+                    log.warning(f"lab bars {ticker} {feed} -> {r.status_code}")
+                    out = []
+                    break
+                j = r.json()
+                out += j.get("bars") or []
+                tok = j.get("next_page_token")
+                if not tok:
+                    break
+            if out:
+                return out
+        except Exception as e:
+            log.warning(f"lab bars {ticker} {feed}: {e}")
+    return []
+
+
+def run_setup_lab(days: int = 30, tickers: list | None = None) -> dict:
+    """v14.22 SETUP LAB: replay the last `days` sessions through setup_lab and
+    score BREAKOUT / REVERSAL / CONTINUATION against the current live logic."""
+    import setup_lab as SL
+    tickers = tickers or list(TICKERS)
+    end_d = datetime.now(ET).date()
+    start_d = end_d - timedelta(days=int(days * 1.5) + 10)
+    def _to_et_min(t):
+        dt = datetime.fromisoformat(str(t).replace("Z", "+00:00")).astimezone(ET)
+        return dt.hour * 60 + dt.minute
+    def _et_day(t):
+        return datetime.fromisoformat(str(t).replace("Z", "+00:00")).astimezone(ET).date().isoformat()
+    rows, sessions = [], set()
+    for tk in tickers:
+        daily = _lab_bars(tk, start_d.isoformat() + "T00:00:00Z", end_d.isoformat() + "T00:00:00Z", "1Day")
+        dmap = {_et_day(b["t"]) if "T" in str(b["t"]) else str(b["t"])[:10]: b for b in daily}
+        dlist = sorted(dmap)
+        mins = _lab_bars(tk, _et_utc(start_d.isoformat(), 4, 0), _et_utc(end_d.isoformat(), 0, 0))
+        byday = {}
+        for b in mins:
+            byday.setdefault(_et_day(b["t"]), []).append(b)
+        use = [d for d in sorted(byday) if d < end_d.isoformat()][-days:]
+        for d in use:
+            prior = [x for x in dlist if x < d]
+            pd = dmap[prior[-1]] if prior else None
+            day = SL.prepare_day(byday[d], _to_et_min, (pd["h"], pd["l"]) if pd else None)
+            if len(day["rth"]) < 60:
+                continue
+            sessions.add(d)
+            for tr in SL.run_day(day):
+                tr.update({"ticker": tk, "date": d})
+                tr.pop("end_i", None)
+                rows.append(tr)
+    rows.sort(key=lambda r: (r["date"], r["time"]))
+    card = SL.scorecard(rows)
+    text = SL.report_text(card, len(sessions), tickers)
+    return {"sessions": len(sessions), "trades": rows, "card": card, "text": text}
+
+
+@app.route("/setup-lab", methods=["GET"])
+def setup_lab_route():
+    """/setup-lab?days=30&send=1 - score the new setups on past sessions.
+    Never places orders, never posts to member channels. send=1 DMs the
+    scorecard + a CSV of every simulated trade."""
+    _nw = datetime.now(ET)
+    if _nw.weekday() < 5 and (9, 20) <= (_nw.hour, _nw.minute) <= (11, 35):
+        return jsonify({"error": "lab disabled during live window (9:20-11:35 ET)"}), 409
+    try:
+        days = max(5, min(int(request.args.get("days", "30")), 60))
+    except ValueError:
+        days = 30
+    try:
+        res = run_setup_lab(days)
+    except Exception as e:
+        log.error(f"setup lab failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 200
+    if request.args.get("send") == "1":
+        try:
+            _dm_send_chunks(res["text"], prefix="🧪 **TPP SETUP LAB**")
+            import csv, io
+            buf = io.StringIO()
+            cols = ["date", "time", "ticker", "setup", "dir", "entry", "stop", "exit", "r", "usd",
+                    "win", "reason", "mins", "risk_pct", "peak_r", "trough_r", "why"]
+            w = csv.writer(buf); w.writerow(cols)
+            for r in res["trades"]:
+                w.writerow([r.get(c) for c in cols])
+            _dm_upload(f"tpp_setup_lab_{days}d.csv", buf.getvalue().encode(),
+                       f"📎 Every simulated trade ({len(res['trades'])}) — open in Excel/Google Sheets.")
+        except Exception as e:
+            log.warning(f"lab DM failed: {e}")
+    if request.args.get("format") == "json":
+        return jsonify({"ok": True, "sessions": res["sessions"], "card": res["card"],
+                        "trades": res["trades"]}), 200
+    return (res["text"] + "\n\n(DM sent)" if request.args.get("send") == "1" else res["text"]), 200, \
+        {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/replay-test", methods=["GET"])
