@@ -137,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.22"
+APP_VERSION = "v14.23"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -326,7 +326,19 @@ def _parse_ladder(raw: str) -> list:
 # Cheap ~$1 contracts lost on EVERY setup (spread + decay eat the move); near-
 # the-money contracts track the stock. VWAP pullback was the only setup with a
 # positive result; opening-range breakouts lost in every version tested.
-DAY_ENGINE = os.environ.get("DAY_ENGINE", "rules").lower()            # rules | ai
+DAY_ENGINE = os.environ.get("DAY_ENGINE", "lab").lower()              # lab | rules | ai
+# v14.23 LAB ENGINE: live trades the setup-lab signals that held up on 60 sessions
+# AFTER option costs (Aug 21-Nov 13): TSLA only, BREAKOUT + CONTINUATION, first
+# signal per day, stop at the chart level on the STOCK, out at +1R (1 contract) or
+# half at +1R / rest +2R (2+), 11:30 time limit. -20% option stop stays at the
+# broker as a backstop. SPY/NVDA/REVERSAL stay paper (they lost after costs).
+LAB_TICKERS = {t.strip().upper() for t in os.environ.get("LAB_TICKERS", "TSLA").split(",") if t.strip()}
+LAB_SETUPS = {s.strip().upper() for s in os.environ.get("LAB_SETUPS", "BREAKOUT,CONTINUATION").split(",") if s.strip()}
+LAB_PRICE_MAX = float(os.environ.get("LAB_PRICE_MAX", "6.00"))     # Junior Nov 16: $6 max
+LAB_BUDGET_PCT = float(os.environ.get("LAB_BUDGET_PCT", "0.30"))
+LAB_MAX_OTM = float(os.environ.get("LAB_MAX_OTM_PCT", "0.015"))    # near the money only
+LAB_MAX_ITM = float(os.environ.get("LAB_MAX_ITM_PCT", "0.02"))
+LAB_SINGLE_EXIT_R = float(os.environ.get("LAB_SINGLE_EXIT_R", "1.0"))
 DAY_CONTRACT_MODE = os.environ.get("DAY_CONTRACT_MODE", "itm").lower() # itm | cheap
 DAY_ITM_BUDGET_PCT = float(os.environ.get("DAY_ITM_BUDGET_PCT", "0.22"))
 DAY_ITM_MAX_DEPTH = int(os.environ.get("DAY_ITM_MAX_DEPTH", "2"))
@@ -3408,6 +3420,48 @@ def _select_itm(ticker: str, direction: str, strikes: list, strike_map: dict, sp
     return None, None, None
 
 
+def _select_lab(ticker: str, direction: str, strikes: list, strike_map: dict, spot: float) -> tuple:
+    """v14.23: the lab's edge needs a contract that MOVES with the stock (~0.4-0.6
+    delta). Closest-to-the-money strike within LAB_MAX_ITM in / LAB_MAX_OTM out
+    whose ask is <= LAB_PRICE_MAX ($6), fits the budget, spread <= DAY_SPREAD_MAX."""
+    global _last_selection_tier, _last_itm_reason
+    _last_selection_tier, _last_itm_reason = None, ""
+    budget = (_sizing_cash() or 0) * LAB_BUDGET_PCT
+    call = direction == "call"
+    mny = lambda k: ((spot - k) if call else (k - spot)) / spot      # + = in the money
+    scan = sorted([k for k in strikes if -LAB_MAX_OTM <= mny(k) <= LAB_MAX_ITM], key=lambda k: abs(k - spot))
+    quotes = _option_quotes_bulk([strike_map[k] for k in scan]) if scan else {}
+    n_exp = n_spread = n_budget = n_noq = 0
+    for k in scan:
+        occ = strike_map[k]
+        q = quotes.get(occ.replace(" ", "")) or _live_option_quote(occ)
+        ask = float((q or {}).get("ask") or 0)
+        bid = float((q or {}).get("bid") or 0)
+        if ask <= 0 or bid <= 0:
+            n_noq += 1
+            continue
+        if ask > LAB_PRICE_MAX or ask < DAY_PRICE_MIN:
+            n_exp += 1
+            continue
+        if (ask - bid) / ((ask + bid) / 2.0) > DAY_SPREAD_MAX:
+            n_spread += 1
+            continue
+        if ask * 100 > budget:
+            n_budget += 1
+            continue
+        m_ = mny(k)
+        _last_selection_tier = ("at-the-money" if abs(m_) < 0.001 else
+                                f"{m_:.1%} in-the-money" if m_ > 0 else f"{-m_:.1%} out-of-the-money")
+        _last_selection_tier = f"Near-the-money (max ${LAB_PRICE_MAX:.2f}) · {_last_selection_tier}"
+        log.info(f"LAB pick {occ} ask {ask} ({_last_selection_tier}, budget ${budget:.0f})")
+        return occ, k, ask
+    _last_itm_reason = (f"no near-the-money {ticker} contract at or under ${LAB_PRICE_MAX:.2f} "
+                        f"({n_exp} over the price cap, {n_spread} wide spread, {n_budget} over the "
+                        f"${budget:.0f} budget, {n_noq} no quote)")
+    log.info("LAB selection: " + _last_itm_reason)
+    return None, None, None
+
+
 def select_contract(ticker: str, direction: str) -> tuple:
     """ATM->OTM walk. Parses nested chain data.items[].expirations[].strikes[], uses strike own OCC."""
     expiry   = _next_friday()
@@ -3447,6 +3501,8 @@ def select_contract(ticker: str, direction: str) -> tuple:
     atm     = min(strikes, key=lambda s: abs(s - spot))
     ai      = strikes.index(atm)
     ordered = strikes[ai:] if direction == "call" else list(reversed(strikes[:ai + 1]))
+    if DAY_ENGINE == "lab" and ticker in LAB_TICKERS:
+        return _select_lab(ticker, direction, strikes, strike_map, spot)
     if DAY_CONTRACT_MODE == "itm":
         return _select_itm(ticker, direction, strikes, strike_map, spot)
 
@@ -3985,6 +4041,58 @@ def cancel_resting_stop(stop_order_id: str | None):
 #  POSITION MONITOR
 #  Runs past 10:30 AM if position open — no forced flatten at window close
 # ══════════════════════════════════════════════════════════════════════════════
+def _lab_exit_reason(pos: dict, occ: str, current_bid: float, fill_price: float) -> str | None:
+    """v14.23: manage a lab trade on the STOCK exactly like setup_lab._manage:
+    stop at the chart level; +1R -> 1 contract exits (LAB_SINGLE_EXIT_R), 2+
+    contracts sell half and move the stop to break-even, rest exits at +2R;
+    11:30 time limit. Returns an exit reason or None."""
+    lab = dict(pos.get("lab") or {})
+    tk, d = pos.get("ticker") or "", pos.get("direction")
+    try:
+        ue, us0 = float(lab["u_entry"]), float(lab["u_stop"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    risk = abs(ue - us0)
+    spot = _spot_price(tk)
+    if not spot or risk <= 0:
+        return None
+    sgn = 1 if d == "call" else -1
+    cur = float(lab.get("cur_stop") or us0)
+    move_r = sgn * (spot - ue) / risk
+    if move_r > float(lab.get("peak_r") or 0):
+        lab["peak_r"] = round(move_r, 2)
+    if (sgn > 0 and spot <= cur) or (sgn < 0 and spot >= cur):
+        return (f"{'BREAK-EVEN STOP' if lab.get('be') else 'CHART STOP'} — "
+                f"{tk} ${spot:.2f} through ${cur:.2f}")
+    if lab.get("be") and move_r >= 2.0:
+        return f"TARGET +2R — {tk} ${spot:.2f}"
+    if not lab.get("be") and move_r >= LAB_SINGLE_EXIT_R:
+        q = int(pos.get("qty") or 1)
+        if q < 2:
+            return f"TARGET +{LAB_SINGLE_EXIT_R:g}R — {tk} ${spot:.2f} hit the planned exit"
+        half = q // 2
+        _clear_closing_orders(occ)
+        tx = close_position_tt(occ, "+1R half", current_bid, half)
+        rem = q - (half if tx else 0)
+        _bo, _ = place_oco_bracket(occ, fill_price, rem, trigger_override=_tick(fill_price * (1 - _stop_pct())))
+        pos["oco_id"] = _bo
+        pos["stop_order_id"] = None if _bo else place_stop_loss(occ, fill_price, rem)
+        if tx:
+            pos["qty"] = rem
+            lab["be"], lab["cur_stop"] = True, round(ue, 2)
+            post_to_discord(
+                "profits-and-recaps",
+                f"✂️ **{_fmt_occ(occ)} — {tk} hit ${lab.get('t1')}: sold {half} of {q} @ ${tx:.2f}** "
+                f"(+${(tx - fill_price) * 100 * half:.0f} banked). Stop on the rest moved to break-even "
+                f"({tk} ${ue:.2f}); final target {tk} ${lab.get('t2')}.")
+    _nw = datetime.now(ET)
+    if (_nw.hour, _nw.minute) >= (11, 30):
+        return "WINDOW END 11:30 (setup time limit)"
+    pos["lab"] = lab
+    set_open_position(pos)
+    return None
+
+
 def monitor_open_position():
     pos = get_open_position()
     if not pos:
@@ -4154,7 +4262,7 @@ def monitor_open_position():
         _trough = pnl_pct
         pos["trough_pnl"] = _trough
         set_open_position(pos)
-    if (_trough <= -RECOVERY_DIP and pnl_pct > 0.0
+    if (_trough <= -RECOVERY_DIP and pnl_pct > 0.0 and not pos.get("lab")
             and int(pos.get("ratchet_stage") or 0) == 0
             and not pos.get("recovery_locked")):
         _rec_floor = _tick(fill_price * (1 - RECOVERY_DIP))
@@ -4207,7 +4315,7 @@ def monitor_open_position():
 
     # v14.13 TRIM: 2+ contracts -> sell half at +DAY_TRIM_AT, remainder's stop to
     # break-even. 1 contract -> the ladder's first rung (break-even) does the job.
-    if (DAY_CONTRACT_MODE == "itm" and not pos.get("trimmed") and _q >= 2
+    if (DAY_CONTRACT_MODE == "itm" and not pos.get("trimmed") and _q >= 2 and not pos.get("lab")
             and pnl_pct >= DAY_TRIM_AT):
         _half = _q // 2
         pos["trimmed"] = True
@@ -4256,7 +4364,7 @@ def monitor_open_position():
     for _k, (_thr, _lock, _msg) in enumerate(_LADDER, start=1):
         if peak_pnl >= _thr:
             _want = _k
-    if _want > _stage:
+    if _want > _stage and not pos.get("lab"):
         _thr, _lock, _msg = _LADDER[_want - 1]
         _desired = _tick(fill_price * (1 + _lock))
         _ok = False
@@ -4337,7 +4445,10 @@ def monitor_open_position():
             f"📊 **Open trade update — {_fmt_occ(occ)}**\n"
             f"Bid ${current_bid:.2f} | P&L {pnl_pct:+.1%} (entry ${fill_price:.2f}) | "
             f"peak {peak_pnl:+.1%} | protective floor ${float(pos.get('floor_trigger') or fill_price * (1 - _stop_pct())):.2f}\n"
-            f"No fixed target — stop trails 5 pts behind up to +40%, then 10 pts behind every +10% (+50% → +40%). Exit call posts the moment anything fires."
+            + ((f"Plan on {pos.get('ticker')}: target ${float((pos.get('lab') or {}).get('t1') or 0):.2f} · "
+                f"stop ${float((pos.get('lab') or {}).get('cur_stop') or 0):.2f} · out by 11:30. Exit call posts the moment anything fires.")
+               if pos.get("lab") else
+               "No fixed target — stop trails 5 pts behind up to +40%, then 10 pts behind every +10% (+50% → +40%). Exit call posts the moment anything fires.")
             + ("\n💰 Green — taking profits early is always allowed. Your gains are yours."
                if pnl_pct >= 0.10 else ""),
         )
@@ -4360,13 +4471,17 @@ def monitor_open_position():
     elif pnl_pct <= -_stop_pct():
         reason = f"HARD STOP {-_stop_pct():+.0%} (software)"
 
+    # v14.23 lab trades: chart stop / +1R / +2R / 11:30, all on the stock price
+    elif pos.get("lab") and (_lab_r := _lab_exit_reason(pos, occ, current_bid, fill_price)):
+        reason = _lab_r
+
     # 2. Runner cap (v14.14: far cap, default +100%)
     elif pnl_pct >= DAY_TARGET_PCT:
         reason = f"PROFIT TARGET +{DAY_TARGET_PCT:.0%} (runner cap)"
 
     # 2b. Trailing stop — software backup of the broker stop: once the ladder
     #     has raised the floor, a bid under the floor exits.
-    elif (int(pos.get("ratchet_stage") or 0) >= 1 and pos.get("floor_trigger")
+    elif (not pos.get("lab") and int(pos.get("ratchet_stage") or 0) >= 1 and pos.get("floor_trigger")
           and current_bid < float(pos.get("floor_trigger"))):
         reason = (f"TRAILING STOP (peak {peak_pnl:+.1%}, floor "
                   f"${float(pos.get('floor_trigger')):.2f})")
@@ -4378,9 +4493,9 @@ def monitor_open_position():
             reason = "CHOP CIRCUIT (stagnant or -15%)"
 
     if reason:
-        _tag = ("🎯 TAKE PROFIT" if "PROFIT TARGET" in reason
+        _tag = ("🎯 TAKE PROFIT" if ("PROFIT TARGET" in reason or "TARGET +" in reason)
                 else "🔒 LOCK IT IN" if "TRAILING" in reason
-                else "🛑 STOP" if "HARD STOP" in reason
+                else "🛑 STOP" if ("HARD STOP" in reason or "CHART STOP" in reason or "BREAK-EVEN STOP" in reason)
                 else "⏰ CLOSING" )
         post_to_discord(
             "day-trade-signals",
@@ -4843,6 +4958,78 @@ def _ema_list(xs: list, p: int) -> list:
 
 
 _RULES_LAST_T: dict = {}
+
+
+_LAB_LAST_T: dict = {}
+_LAB_PRIOR: dict = {}
+
+
+def _lab_prior_day(ticker: str, today: str):
+    """Prior regular session (high, low) — cached per day."""
+    c = _LAB_PRIOR.get(ticker)
+    if c and c[0] == today:
+        return c[1]
+    start = (date.fromisoformat(today) - timedelta(days=10)).isoformat() + "T00:00:00Z"
+    hl = None
+    try:
+        daily = _lab_bars(ticker, start, today + "T00:00:00Z", "1Day")
+        rows = []
+        for b in daily:
+            d = datetime.fromisoformat(str(b["t"]).replace("Z", "+00:00")).astimezone(ET).date().isoformat()
+            if d < today:
+                rows.append((d, b))
+        if rows:
+            b = sorted(rows)[-1][1]
+            hl = (float(b["h"]), float(b["l"]))
+    except Exception as e:
+        log.warning(f"lab prior day {ticker}: {e}")
+    _LAB_PRIOR[ticker] = (today, hl)
+    return hl
+
+
+def _lab_decision(ticker: str) -> dict | None:
+    """v14.23 LAB ENGINE (live). Rebuilds today's 1-min bars (pre-market + RTH)
+    and asks setup_lab for a signal on the newest COMPLETED bar — identical to
+    the replay that produced the backtest. One lab trade per day."""
+    if ticker not in LAB_TICKERS:
+        return None
+    import setup_lab as SL
+    now = datetime.now(ET)
+    today = now.date().isoformat()
+    if load_state().get("lab_trade_date") == today:
+        return None
+    end_iso = now.astimezone(timezone.utc).replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bars = [b for b in _lab_bars(ticker, _et_utc(today, 4, 0), end_iso) if str(b.get("t")) < end_iso]
+    if not bars:
+        return None
+    to_m = lambda t: (lambda d: d.hour * 60 + d.minute)(
+        datetime.fromisoformat(str(t).replace("Z", "+00:00")).astimezone(ET))
+    day = SL.prepare_day(bars, to_m, _lab_prior_day(ticker, today))
+    if not day["rth"]:
+        return None
+    last_t = str(day["rth"][-1]["t"])
+    if _LAB_LAST_T.get(ticker) == last_t:
+        return None
+    _LAB_LAST_T[ticker] = last_t
+    sigs = SL.lab_signal(day, LAB_SETUPS)
+    if not sigs:
+        return None
+    s = sigs[0]
+    d, px, st = s["dir"], float(s["entry"]), float(s["stop"])
+    risk = abs(px - st)
+    sgn = 1 if d == "call" else -1
+    t1, t2 = px + sgn * risk, px + sgn * 2 * risk
+    label = "BREAKOUT" if s["setup"] == "BREAKOUT" else "TREND CONTINUATION"
+    desc = (f"{ticker} {label}: {s['why']}. Plan on the stock: stop if {ticker} goes "
+            f"{'below' if d == 'call' else 'above'} ${st:.2f}, take profit at ${t1:.2f}.")
+    log.info(f"LAB signal {ticker} {s['setup']} {d} @ {px:.2f} stop {st:.2f} t1 {t1:.2f}")
+    return {"decision": "APPROVE", "ticker": ticker, "direction": d, "tier": "TIER-1",
+            "setup": "LAB_" + s["setup"], "setup_description": desc, "reason": desc,
+            "lab": {"setup": s["setup"], "u_entry": round(px, 2), "u_stop": round(st, 2),
+                    "t1": round(t1, 2), "t2": round(t2, 2), "cur_stop": round(st, 2),
+                    "be": False, "peak_r": 0.0},
+            "chart_request": {"ticker": ticker, "timeframe": "1m", "indicators": "VWAP,EMA8,EMA21",
+                              "highlight": f"{label} — stop ${st:.2f} / target ${t1:.2f}"}}
 
 
 def _rules_decision(ticker: str) -> dict | None:
@@ -6171,7 +6358,10 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         )
         return False
 
-    _okq, _whyq = _gate_entry_quality(
+    # v14.23: lab signals carry their own level + multi-timeframe logic (that is
+    # what was backtested) — the VWAP-era quality/key-level gates don't apply.
+    _is_lab = bool(claude_decision.get("lab"))
+    _okq, _whyq = (True, "") if _is_lab else _gate_entry_quality(
         ticker, direction, skip_chop=(str(claude_decision.get("setup") or "") in ("VWAP_PULLBACK", "REVERSAL_RETEST")))
     if not _okq:
         log.info(f"BLOCKED post-decision (v14.12 quality): {_whyq}")
@@ -6182,7 +6372,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         )
         return False
 
-    _okk, _whyk = ((True, "") if str(claude_decision.get("setup") or "") in ("KEY_LEVEL_RETEST", "REVERSAL_RETEST")
+    _okk, _whyk = ((True, "") if (_is_lab or str(claude_decision.get("setup") or "") in ("KEY_LEVEL_RETEST", "REVERSAL_RETEST"))
                    else _gate_key_levels(ticker, direction))
     if not _okk:
         # silent to members (no spam) — log only
@@ -6226,7 +6416,7 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         _scale_label += " · DROUGHT-RELIEF SIZE"
     if DAY_CONTRACT_MODE == "itm":
         # v14.13: budget-based sizing; 1 contract minimum when one fits the budget
-        _bud = (_sizing_cash() or 0) * DAY_ITM_BUDGET_PCT
+        _bud = (_sizing_cash() or 0) * (LAB_BUDGET_PCT if (isinstance(claude_decision, dict) and claude_decision.get("lab")) else DAY_ITM_BUDGET_PCT)
         _sc = (0.5 if (_dte_e is not None and _dte_e <= 1) else 1.0) * \
               (DROUGHT_SIZE_SCALE if _drought_mode() else 1.0)
         qty = int((_bud * _sc) // (_entry_ask * 100)) if _entry_ask > 0 else 0
@@ -6334,22 +6524,34 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
     stop_lbl   = f"-{int(_stop_pct()*100)}%"
     entry_time = datetime.now(ET).strftime("%H:%M ET")
 
+    _labp = claude_decision.get("lab") if isinstance(claude_decision, dict) else None
+    if _labp:
+        _w = "below" if direction == "call" else "above"
+        _target_line = (f"**Plan (on {ticker} stock):** take profit when {ticker} hits ${_labp['t1']:.2f}"
+                        + (f" — sell half there, rest at ${_labp['t2']:.2f}" if qty >= 2 else "")
+                        + f" · stop if {ticker} trades {_w} ${_labp['u_stop']:.2f} · out by 11:30 either way\n")
+        _prot_line = (f"Backstop: -{int(_stop_pct() * 100)}% stop resting at the broker. "
+                      f"Members: use the same {ticker} levels whatever contract you hold. ")
+    else:
+        _target_line = (f"**Target:** no fixed target — winners run; stop trails 5 pts behind to +40%, "
+                        f"then 10 pts behind (runner cap ${target:.2f})\n")
+        _prot_line = (f"Protection: recovery rule (dip ≤-{RECOVERY_DIP:.0%} then back green → stop -{RECOVERY_DIP:.0%}) | "
+                      + " / ".join(("+" + format(_t, ".0%") + "→" + ("BE" if abs(_l) < 1e-9 else format(_l, "+.0%"))) for _t, _l in DAY_LADDER[:5])
+                      + " … +40%→+35% | +50%→+40%, +60%→+50% … (10-pt room above +50%)"
+                      + (f" | **members: take half off at +{DAY_TRIM_AT:.0%}**" if DAY_CONTRACT_MODE == "itm" else "")
+                      + ". ")
     post_to_discord(
         "day-trade-signals",
         f"@everyone\n\n"
         f"{arrow} **{ticker} {type_label}** [{tier}]{_scale_label}\n\n"
         f"**Contract:** {_fmt_occ(occ)}\n"
         f"✅ **Fill confirmed:** ${fill_price:.2f}/share × {qty} contract(s) (${cost:.0f} total) @ {entry_time}\n"
-        f"**Target:** no fixed target — winners run; stop trails 5 pts behind to +40%, then 10 pts behind (runner cap ${target:.2f})\n"
+        + _target_line
         + (f"**Stop resting at broker ✅** — ${stop:.2f} ({stop_lbl})\n"
            + (f"Contract band: {_last_selection_tier}\n" if _last_selection_tier else "")
            if oco_id else
            f"**Stop:** ${stop:.2f} ({stop_lbl}) — resting at broker ✅\n")
-        + (f"Protection: recovery rule (dip ≤-{RECOVERY_DIP:.0%} then back green → stop -{RECOVERY_DIP:.0%}) | "
-           + " / ".join(("+" + format(_t, ".0%") + "→" + ("BE" if abs(_l) < 1e-9 else format(_l, "+.0%"))) for _t, _l in DAY_LADDER[:5])
-           + " … +40%→+35% | +50%→+40%, +60%→+50% … (10-pt room above +50%)"
-           + (f" | **members: take half off at +{DAY_TRIM_AT:.0%}**" if DAY_CONTRACT_MODE == "itm" else "")
-           + ". ")
+        + _prot_line
         + 
           "Take profits early whenever you're comfortable — the gains are yours\n\n"
         f"{setup}",
@@ -6399,7 +6601,12 @@ def execute_trade(ticker: str, direction: str, claude_decision: dict) -> bool:
         "target_price":  round(fill_price * (1 + DAY_TARGET_PCT), 2),
         "peak_pnl":      0.0,
         "entry_time":    datetime.now(ET).isoformat(),
+        "lab":           (dict(claude_decision["lab"]) if isinstance(claude_decision, dict)
+                          and claude_decision.get("lab") else None),
     })
+    if isinstance(claude_decision, dict) and claude_decision.get("lab"):
+        with _state_lock:
+            _sl = load_state(); _sl["lab_trade_date"] = datetime.now(ET).date().isoformat(); _commit(_sl)
     if _is_rev:
         with _state_lock:
             _sr = load_state()
@@ -7001,6 +7208,10 @@ def _scheduler_loop():
                                 if not _rd:
                                     continue
                                 _rev_mode = True
+                            elif DAY_ENGINE == "lab":
+                                _rd = _lab_decision(ticker)
+                                if not _rd:
+                                    continue
                             elif DAY_ENGINE == "rules":
                                 _rd = _rules_decision(ticker)
                                 if not _rd:
@@ -7021,7 +7232,7 @@ def _scheduler_loop():
                                 "pml":        levels.get("pml"),
                             }
                             session  = load_state()
-                            decision = _rd if (DAY_ENGINE == "rules" or _rev_mode) else call_claude(alert_data, session)
+                            decision = _rd if (DAY_ENGINE in ("rules", "lab") or _rev_mode) else call_claude(alert_data, session)
                             if decision and decision.get("decision") == "APPROVE":
                                 direction = decision.get("direction", "").lower()
                                 if direction in ("call", "put"):
