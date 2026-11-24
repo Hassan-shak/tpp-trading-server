@@ -137,7 +137,7 @@ FOMC_DECISION_DAYS_2026 = {
 # ══════════════════════════════════════════════════════════════════════════════
 _TMP_PATH = "/tmp/tpp_v5_session.json"
 
-APP_VERSION = "v14.23"
+APP_VERSION = "v14.24"
 
 # ── v11: boot identity, single-scheduler election, heartbeat ──────────────────
 import uuid as _uuid
@@ -331,13 +331,21 @@ DAY_ENGINE = os.environ.get("DAY_ENGINE", "lab").lower()              # lab | ru
 # AFTER option costs (Aug 21-Nov 13): TSLA only, BREAKOUT + CONTINUATION, first
 # signal per day, stop at the chart level on the STOCK, out at +1R (1 contract) or
 # half at +1R / rest +2R (2+), 11:30 time limit. -20% option stop stays at the
-# broker as a backstop. SPY/NVDA/REVERSAL stay paper (they lost after costs).
-LAB_TICKERS = {t.strip().upper() for t in os.environ.get("LAB_TICKERS", "TSLA").split(",") if t.strip()}
+# broker as a backstop. SPY/REVERSAL stay paper. v14.24: NVDA live too (Junior).
+# v14.24 (Nov 24, Junior): trade NVDA live alongside TSLA — don't limit to one ticker.
+LAB_TICKERS = {t.strip().upper() for t in os.environ.get("LAB_TICKERS", "TSLA,NVDA").split(",") if t.strip()}
 LAB_SETUPS = {s.strip().upper() for s in os.environ.get("LAB_SETUPS", "BREAKOUT,CONTINUATION").split(",") if s.strip()}
 LAB_PRICE_MAX = float(os.environ.get("LAB_PRICE_MAX", "6.00"))     # Junior Nov 16: $6 max
 LAB_BUDGET_PCT = float(os.environ.get("LAB_BUDGET_PCT", "0.30"))
 LAB_MAX_OTM = float(os.environ.get("LAB_MAX_OTM_PCT", "0.015"))    # near the money only
 LAB_MAX_ITM = float(os.environ.get("LAB_MAX_ITM_PCT", "0.02"))
+# v14.24 (Nov 24, Junior): a good setup must not be skipped just because the
+# near-the-money contracts cost more than $6. Fallback: walk further out of the
+# money (up to LAB_FALLBACK_MAX_OTM) and take the CLOSEST strike that is <= $6,
+# spread OK and inside budget — i.e. the priciest one that fits, which still
+# moves the most with the stock. Floor LAB_FALLBACK_MIN keeps us out of lottery tickets.
+LAB_FALLBACK_MAX_OTM = float(os.environ.get("LAB_FALLBACK_MAX_OTM_PCT", "0.05"))
+LAB_FALLBACK_MIN = float(os.environ.get("LAB_FALLBACK_MIN", "1.50"))
 LAB_SINGLE_EXIT_R = float(os.environ.get("LAB_SINGLE_EXIT_R", "1.0"))
 DAY_CONTRACT_MODE = os.environ.get("DAY_CONTRACT_MODE", "itm").lower() # itm | cheap
 DAY_ITM_BUDGET_PCT = float(os.environ.get("DAY_ITM_BUDGET_PCT", "0.22"))
@@ -3455,9 +3463,42 @@ def _select_lab(ticker: str, direction: str, strikes: list, strike_map: dict, sp
         _last_selection_tier = f"Near-the-money (max ${LAB_PRICE_MAX:.2f}) · {_last_selection_tier}"
         log.info(f"LAB pick {occ} ask {ask} ({_last_selection_tier}, budget ${budget:.0f})")
         return occ, k, ask
-    _last_itm_reason = (f"no near-the-money {ticker} contract at or under ${LAB_PRICE_MAX:.2f} "
-                        f"({n_exp} over the price cap, {n_spread} wide spread, {n_budget} over the "
-                        f"${budget:.0f} budget, {n_noq} no quote)")
+    # v14.24 CHEAPER FALLBACK: nothing near the money fit -> go further out of
+    # the money for a cheaper contract instead of passing on the setup.
+    near = set(scan)
+    fb_scan = sorted([k for k in strikes if k not in near and -LAB_FALLBACK_MAX_OTM <= mny(k) < -LAB_MAX_OTM],
+                     key=lambda k: abs(k - spot))
+    fb_quotes = _option_quotes_bulk([strike_map[k] for k in fb_scan]) if fb_scan else {}
+    f_exp = f_cheap = f_spread = f_budget = f_noq = 0
+    for k in fb_scan:
+        occ = strike_map[k]
+        q = fb_quotes.get(occ.replace(" ", "")) or _live_option_quote(occ)
+        ask = float((q or {}).get("ask") or 0)
+        bid = float((q or {}).get("bid") or 0)
+        if ask <= 0 or bid <= 0:
+            f_noq += 1
+            continue
+        if ask > LAB_PRICE_MAX:
+            f_exp += 1
+            continue
+        if ask < LAB_FALLBACK_MIN:
+            f_cheap += 1
+            break          # walking further out only gets cheaper — stop here
+        if (ask - bid) / ((ask + bid) / 2.0) > DAY_SPREAD_MAX:
+            f_spread += 1
+            continue
+        if ask * 100 > budget:
+            f_budget += 1
+            continue
+        _last_selection_tier = (f"Cheaper fallback (near-the-money over ${LAB_PRICE_MAX:.2f}) · "
+                                f"{-mny(k):.1%} out-of-the-money")
+        log.info(f"LAB fallback pick {occ} ask {ask} ({_last_selection_tier}, budget ${budget:.0f})")
+        return occ, k, ask
+    _last_itm_reason = (f"no {ticker} contract at or under ${LAB_PRICE_MAX:.2f} within "
+                        f"{LAB_FALLBACK_MAX_OTM:.0%} of the stock (near the money: {n_exp} over the price cap, "
+                        f"{n_spread} wide spread, {n_budget} over the ${budget:.0f} budget, {n_noq} no quote; "
+                        f"further out: {f_exp} over cap, {f_cheap} under ${LAB_FALLBACK_MIN:.2f}, "
+                        f"{f_spread} wide spread, {f_budget} over budget)")
     log.info("LAB selection: " + _last_itm_reason)
     return None, None, None
 
